@@ -406,6 +406,7 @@ class DashboardAuthTests(unittest.TestCase):
         expected_paths = {
             '/',
             '/practice',
+            '/watchlist',
             '/indices',
             '/industry-flow',
             '/dragon-tiger',
@@ -2682,15 +2683,16 @@ console.log(JSON.stringify([
             ROOT / 'web' / 'src' / 'components' / 'DashboardPage.vue'
         ).read_text(encoding='utf-8')
 
-        for route in ('/practice', '/indices', '/industry-flow', '/dragon-tiger', '/market-monitor', '/x-monitor', '/us-ratings'):
+        for route in ('/practice', '/watchlist', '/indices', '/industry-flow', '/dragon-tiger', '/market-monitor', '/x-monitor', '/us-ratings'):
             self.assertIn(f"'{route}'", router_source)
-        self.assertIn("const CATEGORY_ORDER = ['practice', 'indices', 'market_monitor', 'dragon_tiger', 'x_monitor', 'us_ratings']", tabs_source)
+        self.assertIn("const CATEGORY_ORDER = ['practice', 'watchlist', 'indices', 'market_monitor', 'dragon_tiger', 'x_monitor', 'us_ratings']", tabs_source)
         self.assertIn("industry_flow: '/industry-flow'", tabs_source)
         self.assertIn("const LEGACY_CATEGORY_ALIASES = { b1_screen: 'practice' }", tabs_source)
         self.assertIn("fetch(`/api/iwencai/dragon-tiger${query}`", dragon_source)
         self.assertIn("const SORT_FIELDS = new Set(['name', 'sector', 'change_pct', 'net_amount_yuan'])", dragon_source)
         self.assertIn("record?.seat_category === 'institution'", dragon_source)
         self.assertIn('<PracticePanel />', dashboard_page)
+        self.assertIn('<WatchlistPanel />', dashboard_page)
         self.assertIn('<DragonTigerPanel />', dashboard_page)
         self.assertIn('subscribePublicProjection(handleProjection)', PRACTICE_CANDIDATE_DATA)
         self.assertIn("fetchJson('/api/v2/public/latest'", PUBLIC_PROJECTION_DATA)

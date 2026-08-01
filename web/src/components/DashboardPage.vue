@@ -13,6 +13,7 @@ const IndicesPanel = defineAsyncComponent(() => import('./IndicesPanel.vue'))
 const MarketMonitorPanel = defineAsyncComponent(() => import('./MarketMonitorPanel.vue'))
 const PracticePanel = defineAsyncComponent(() => import('./PracticePanel.vue'))
 const UsRatingsPanel = defineAsyncComponent(() => import('./UsRatingsPanel.vue'))
+const WatchlistPanel = defineAsyncComponent(() => import('./WatchlistPanel.vue'))
 const XMonitorPanel = defineAsyncComponent(() => import('./XMonitorPanel.vue'))
 
 document.title = '牛牛1号'
@@ -61,7 +62,10 @@ const { activeCategory } = useDashboardTabs()
     <section v-else-if="activeCategory === 'practice'" class="feed">
       <PracticePanel />
     </section>
-    <section v-show="!['dragon_tiger', 'indices', 'industry_flow', 'market_monitor', 'us_ratings', 'x_monitor', 'practice'].includes(activeCategory)" class="feed">
+    <section v-else-if="activeCategory === 'watchlist'" class="feed">
+      <WatchlistPanel />
+    </section>
+    <section v-show="!['dragon_tiger', 'indices', 'industry_flow', 'market_monitor', 'us_ratings', 'x_monitor', 'practice', 'watchlist'].includes(activeCategory)" class="feed">
       <div class="loading">加载中…</div>
     </section>
   </main>

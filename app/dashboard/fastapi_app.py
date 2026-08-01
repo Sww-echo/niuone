@@ -29,6 +29,7 @@ from app.dashboard.routers import (
     create_messages_router,
     create_practice_router,
     create_system_router,
+    create_watchlist_tracker_router,
 )
 
 
@@ -38,6 +39,7 @@ GZIP_MIN_BYTES = int(os.environ.get("DASHBOARD_GZIP_MIN_BYTES", "1024") or "1024
 SPA_DASHBOARD_PATHS = (
     "/",
     "/practice",
+    "/watchlist",
     "/indices",
     "/industry-flow",
     "/dragon-tiger",
@@ -390,6 +392,13 @@ def create_app(
                 legacy,
                 **kwargs,
             ),
+            json_response=_canonical_json_response,
+        )
+    )
+    app.include_router(
+        create_watchlist_tracker_router(
+            enforce_api_limits=enforce_native_api_limits,
+            require_admin_action=admin_access.require_action,
             json_response=_canonical_json_response,
         )
     )

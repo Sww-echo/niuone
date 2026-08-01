@@ -5,6 +5,7 @@ from .market import create_market_router
 from .messages import create_messages_router
 from .practice import create_practice_router
 from .system import create_system_router
+from .watchlist_tracker import create_watchlist_tracker_router
 
 __all__ = [
     "AdminAccess",
@@ -13,4 +14,5 @@ __all__ = [
     "create_messages_router",
     "create_practice_router",
     "create_system_router",
+    "create_watchlist_tracker_router",
 ]
