@@ -27,6 +27,10 @@ class PublicProjectionTests(unittest.TestCase):
             candidates={
                 "generated_at": "2026-07-21 10:00:00",
                 "running": True,
+                "strategy_suite": "niuone",
+                "strategy_cache_stale": True,
+                "refresh_required": True,
+                "status_message": "等待牛牛战法重新扫描",
                 "strategy_meta": {
                     "trend_pullback": {
                         "label": "趋势回踩",
@@ -55,6 +59,23 @@ class PublicProjectionTests(unittest.TestCase):
                 "stage": "completed",
                 "model_error": "private provider detail",
             },
+            niuone_mainline={
+                "generated_at": "2026-07-21 10:00:06",
+                "niuone_context": {
+                    "as_of_date": "2026-07-21",
+                    "mainline": {"primary": "银行", "mode": "confirmed"},
+                    "market": {"state": "balanced", "allow_new_buys": True},
+                    "themes": {
+                        "银行": {
+                            "industry": "银行",
+                            "score": 80,
+                            "mainline_confirmed": True,
+                            "private_rule": "secret",
+                        }
+                    },
+                },
+                "secret_path": "/private/runtime/niuone.json",
+            },
         )
 
         self.assertEqual(sections["metadata"]["schema_version"], PUBLIC_SCHEMA_VERSION)
@@ -68,6 +89,10 @@ class PublicProjectionTests(unittest.TestCase):
         self.assertNotIn("db_path", sections["messages"])
         self.assertNotIn("raw_payload", sections["messages"]["records"][0])
         self.assertTrue(sections["candidates"]["running"])
+        self.assertEqual(sections["candidates"]["strategy_suite"], "niuone")
+        self.assertTrue(sections["candidates"]["strategy_cache_stale"])
+        self.assertTrue(sections["candidates"]["refresh_required"])
+        self.assertEqual(sections["candidates"]["status_message"], "等待牛牛战法重新扫描")
         self.assertEqual(sections["candidates"]["items"][0]["best_score"], 8.5)
         self.assertEqual(sections["candidates"]["items"][0]["industry_flow_rank"], 2)
         self.assertEqual(sections["candidates"]["items"][0]["industry_flow_adjustment"], 0.55)
@@ -86,6 +111,8 @@ class PublicProjectionTests(unittest.TestCase):
         self.assertEqual(sections["market_summary"]["generated_at"], "2026-07-21 10:00:05")
         self.assertEqual(sections["market_summary"]["status"], "completed")
         self.assertNotIn("model_error", sections["market_summary"])
+        self.assertEqual(sections["niuone_mainline"]["mainline"]["primary"], "银行")
+        self.assertNotIn("private_rule", sections["niuone_mainline"]["themes"][0])
         serialized = repr(sections)
         self.assertNotIn("/private/runtime", serialized)
         self.assertNotIn("token=secret", serialized)

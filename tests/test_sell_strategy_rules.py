@@ -412,6 +412,39 @@ class SellStrategyRuleTests(unittest.TestCase):
         self.assertNotIn("600000", state["positions"])
         self.assertIn("仅暂停BUY", decision["execution_blocked_reasons"][0])
 
+    def test_daily_loss_budget_uses_today_change_instead_of_lifetime_loss(self):
+        historical_loss = {
+            "initial_cash": 100000.0,
+            "cash": 90000.0,
+            "positions": {
+                "600000": {
+                    "qty": 1000,
+                    "avg_cost": 10.0,
+                    "last_price": 6.0,
+                    "prev_close": 6.1,
+                    "buy_date_lots": {"2000-01-01": 1000},
+                }
+            },
+            "trade_log": [],
+        }
+        intraday_crash = {
+            **historical_loss,
+            "positions": {
+                "600000": {
+                    **historical_loss["positions"]["600000"],
+                    "prev_close": 10.0,
+                }
+            },
+        }
+
+        historical_blocked, historical_pct = trader.check_daily_loss_budget(historical_loss)
+        crash_blocked, crash_pct = trader.check_daily_loss_budget(intraday_crash)
+
+        self.assertFalse(historical_blocked)
+        self.assertAlmostEqual(historical_pct, -100 / 96100 * 100, places=6)
+        self.assertTrue(crash_blocked)
+        self.assertAlmostEqual(crash_pct, -4.0, places=6)
+
     def test_execute_actions_marks_sell_rule_on_remaining_position(self):
         original_execution_time = trader.is_a_share_execution_time
         original_quote = trader.execution_quote
@@ -578,6 +611,19 @@ class SellStrategyRuleTests(unittest.TestCase):
                 os.environ.pop(trader.STOCK_UNIVERSE_ENV, None)
             else:
                 os.environ[trader.STOCK_UNIVERSE_ENV] = saved_universe
+            if saved_active is None:
+                os.environ.pop(trader.ACTIVE_STRATEGY_ENV, None)
+            else:
+                os.environ[trader.ACTIVE_STRATEGY_ENV] = saved_active
+
+    def test_candidate_matches_active_strategy(self):
+        saved_active = os.environ.get(trader.ACTIVE_STRATEGY_ENV)
+        try:
+            os.environ[trader.ACTIVE_STRATEGY_ENV] = "niuone"
+            self.assertTrue(trader.candidate_matches_active_strategy({"best_strategy": "niu_leader"}))
+            self.assertFalse(trader.candidate_matches_active_strategy({"best_strategy": "shaofu_b1"}))
+            self.assertTrue(trader.candidate_matches_active_strategy({}))
+        finally:
             if saved_active is None:
                 os.environ.pop(trader.ACTIVE_STRATEGY_ENV, None)
             else:
@@ -1608,6 +1654,25 @@ class SellStrategyRuleTests(unittest.TestCase):
         self.assertEqual(state["decision_log"][-1]["market_decision_context"]["tone_label"], "防守")
         self.assertEqual(state["decision_log"][-1]["decision"]["market_guidance"]["max_new_buys_per_decision"], 1)
         self.assertEqual(result["portfolio"]["market_decision_context"]["tone"], "defensive")
+
+    def test_decision_candidates_preserve_explicit_empty_trade_pool(self):
+        display_candidate = {
+            "code": "600000",
+            "best_strategy": "niu_leader",
+            "best_score": 9.0,
+            "entry_threshold": 8.0,
+            "actionable": True,
+            "hard_blockers": [],
+        }
+
+        candidates = trader.decision_candidate_rows({
+            "items": [display_candidate],
+            "trade_items": [],
+        })
+        legacy_candidates = trader.decision_candidate_rows({"items": [display_candidate]})
+
+        self.assertEqual(candidates, [])
+        self.assertEqual(legacy_candidates, [display_candidate])
 
     def test_morning_schedule_completed_during_lunch_defers_to_13(self):
         due_at = trader.deferred_execution_due_at(

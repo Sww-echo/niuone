@@ -82,7 +82,7 @@ class FastApiDashboardTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_vue_dashboard_and_admin_share_the_fastapi_port(self):
-        for path in ("/", "/practice", "/admin", "/admin/settings/notifications"):
+        for path in ("/", "/practice", "/niuone-mainline", "/admin", "/admin/settings/notifications"):
             with self.subTest(path=path):
                 response = self.client.get(path)
                 self.assertEqual(response.status_code, 200)
@@ -136,6 +136,20 @@ class FastApiDashboardTests(unittest.TestCase):
         self.assertEqual(head.content, b"")
         version.assert_called_once_with()
 
+    def test_version_route_can_force_an_upstream_refresh(self):
+        payload = {
+            "current_version": "1.2.3",
+            "latest_version": "1.2.4",
+            "update_available": True,
+            "check_ok": True,
+        }
+        with patch.object(self.legacy, "get_version_status", return_value=payload) as version:
+            response = self.client.get("/api/version?refresh=1")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), payload)
+        version.assert_called_once_with(True)
+
     def test_dashboard_bootstrap_is_native_and_reuses_the_visitor_cookie(self):
         message_payload = {
             "categories": {
@@ -157,6 +171,11 @@ class FastApiDashboardTests(unittest.TestCase):
         self.assertEqual(first.status_code, 200)
         self.assertEqual(first.json()["visits"], 1)
         self.assertEqual(first.json()["unique"], 1)
+        self.assertEqual(first.json()["current_version"], self.legacy.CURRENT_VERSION)
+        self.assertEqual(
+            first.json()["auto_version_check_enabled"],
+            self.legacy.auto_version_check_enabled(),
+        )
         self.assertEqual(
             first.json()["message_counts"],
             {"market_monitor": 6, "x_monitor": 108, "us_ratings": 4},
@@ -228,6 +247,7 @@ class FastApiDashboardTests(unittest.TestCase):
                 ),
                 ("/api/practice_candidates", "practice_candidates"),
                 ("/api/b1_screen", "practice_candidates"),
+                ("/api/niuone/mainline", "niuone_mainline"),
                 ("/api/niuniu_practice?fast=1", "niuniu_practice_fast:v2"),
                 ("/api/niuniu_practice", "niuniu_practice"),
                 ("/api/practice_benchmarks", "practice_benchmarks"),
@@ -277,6 +297,7 @@ class FastApiDashboardTests(unittest.TestCase):
             "iwencai_dragon_tiger:2026-07-16:2:10:0:0:0",
             "practice_candidates",
             "practice_candidates",
+            "niuone_mainline",
             "niuniu_practice_fast:v2",
             "niuniu_practice",
             "practice_benchmarks",
@@ -888,6 +909,43 @@ class FastApiDashboardTests(unittest.TestCase):
         invalidate.assert_any_call(self.legacy.PRACTICE_CANDIDATES_CACHE_KEY)
         invalidate.assert_any_call("niuniu_practice", self.legacy.PRACTICE_FAST_CACHE_KEY)
 
+    def test_niuone_mainline_manual_refresh_requires_admin(self):
+        action_headers = {"X-NiuOne-Action": "1"}
+        payload = {"available": True, "generated_at": "2026-07-29 10:00:00"}
+
+        with patch.object(self.legacy, "validate_admin_session", return_value=False):
+            unauthorized = self.client.post(
+                "/api/niuone/mainline/refresh",
+                headers=action_headers,
+            )
+
+        with patch.object(self.legacy, "validate_admin_session", return_value=True):
+            missing_action = self.client.post("/api/niuone/mainline/refresh")
+
+        with (
+            patch.object(self.legacy, "validate_admin_session", return_value=True),
+            patch.object(
+                self.legacy,
+                "load_niuone_mainline_view",
+                return_value=payload,
+            ) as load_view,
+            patch.object(self.legacy, "invalidate_api_cache") as invalidate,
+        ):
+            refreshed = self.client.post(
+                "/api/niuone/mainline/refresh",
+                headers=action_headers,
+            )
+
+        self.assertEqual(unauthorized.status_code, 403)
+        self.assertEqual(unauthorized.json(), {"error": "admin_password_required"})
+        self.assertEqual(missing_action.status_code, 403)
+        self.assertEqual(missing_action.json(), {"error": "action_header_required"})
+        self.assertEqual(refreshed.status_code, 200)
+        self.assertEqual(refreshed.json(), payload)
+        self.assertEqual(refreshed.headers["Cache-Control"], "no-store")
+        invalidate.assert_called_once_with(self.legacy.NIUONE_MAINLINE_CACHE_KEY)
+        load_view.assert_called_once_with()
+
     def test_missing_vue_build_has_diagnostic_503(self):
         app = create_app(
             legacy_module=self.legacy,
@@ -902,6 +960,12 @@ class FastApiDashboardTests(unittest.TestCase):
     def test_market_breadth_chart_uses_compact_responsive_dimensions(self):
         component = (
             ROOT / "web" / "src" / "components" / "indices" / "MarketBreadthChart.vue"
+        ).read_text(encoding="utf-8")
+        industry_component = (
+            ROOT / "web" / "src" / "components" / "IndustryFlowPanel.vue"
+        ).read_text(encoding="utf-8")
+        mainline_component = (
+            ROOT / "web" / "src" / "components" / "NiuOneMainlinePanel.vue"
         ).read_text(encoding="utf-8")
         stylesheet = (ROOT / "frontend" / "dashboard.css").read_text(encoding="utf-8")
 
@@ -932,7 +996,41 @@ class FastApiDashboardTests(unittest.TestCase):
         self.assertIn("window.addEventListener('resize', syncChartSize", component)
         self.assertIn("watch(chartWrapElement, element =>", component)
         self.assertIn('ref="chartWrapElement"', component)
+        self.assertIn("@touchmove.prevent", component)
+        self.assertIn(
+            ".market-breadth-chart-wrap { position:relative; width:100%; "
+            "margin-top:6px; overflow-x:hidden; overscroll-behavior:contain; "
+            "touch-action:none; }",
+            stylesheet,
+        )
         self.assertIn("chartWidth.value = Math.max(300, availableWidth)", component)
+        self.assertIn("const activeSample = computed(() =>", component)
+        self.assertIn("|| current.samples.at(-1)", component)
+        self.assertIn('v-if="activeSample"', component)
+        self.assertIn("label: '较昨日同期差', compactLabel: '同期差'", component)
+        self.assertNotIn("同时点量能差", component)
+        self.assertIn("group: 'volume', emphasized: true", component)
+        self.assertIn("'market-breadth-line-emphasized': series.emphasized", component)
+        self.assertIn(".market-breadth-line-emphasized { stroke-width:2.25; }", stylesheet)
+        self.assertIn("--market-breadth-same-time-delta:#f472b6;", stylesheet)
+        self.assertIn("--market-breadth-same-time-delta:#be185d;", stylesheet)
+        self.assertIn("--market-breadth-previous-turnover:#64748b;", stylesheet)
+        self.assertIn("? { top: showVolume.value ? 74 : 42, right: 38", component)
+        self.assertIn("compactDisplayValue: formatCompactSeriesValue", component)
+        self.assertIn("...rows.filter(row => row.group === 'breadth')", component)
+        self.assertIn("compactVolumeRows: rows.filter(row => row.group === 'volume')", component)
+        self.assertIn('v-if="!chart.compact"', component)
+        self.assertIn('v-if="chart.compact && activeSample"', component)
+        self.assertIn('v-for="row in activeSample.compactVolumeRows"', component)
+        self.assertIn("market-breadth-compact-tooltip-count-item", component)
+        self.assertIn("market-breadth-compact-tooltip-volume-item", component)
+        self.assertIn(".market-breadth-compact-tooltip { position:absolute;", stylesheet)
+        self.assertIn("grid-template-columns:44px repeat(5,minmax(0,1fr));", stylesheet)
+        self.assertNotIn("market-breadth-compact-tooltip-row", component + stylesheet)
+        self.assertNotIn("spreadEndLabels", component)
+        self.assertNotIn("chart.endLabels", component)
+        self.assertNotIn("market-breadth-end-label", component)
+        self.assertNotIn("market-breadth-end-label", stylesheet)
         self.assertNotIn("Math.min(720", component)
         self.assertIn(
             ".market-breadth-chart { display:block; width:100%; max-width:none; min-width:0;",
@@ -951,10 +1049,27 @@ class FastApiDashboardTests(unittest.TestCase):
         self.assertIn(".market-breadth-info-popover { position:absolute;", stylesheet)
         self.assertNotIn("cursor:help", stylesheet)
         self.assertNotIn("outline:2px solid rgba(129,140,248,.42)", stylesheet)
+        self.assertIn(".market-breadth-info-popover.open {", stylesheet)
+        self.assertNotIn(".market-breadth-info:focus-within", stylesheet)
+        self.assertIn('ref="marketInfoRoot"', component)
+        self.assertIn(':aria-expanded="marketInfoOpen"', component)
+        self.assertIn('@click="toggleMarketInfo"', component)
+        self.assertNotIn('aria-label="关闭市场情绪数据说明"', component)
+        self.assertNotIn('market-breadth-info-close', stylesheet)
+        self.assertIn("document.addEventListener('pointerdown', handleMarketInfoPointerDown)", component)
+        self.assertIn("document.addEventListener('keydown', handleMarketInfoKeydown)", component)
+        for info_component in (component, industry_component, mainline_component):
+            self.assertIn("dashboard-info-trigger", info_component)
+        self.assertIn(".dashboard-info-trigger { --dashboard-info-color:#c7d2fe;", stylesheet)
+        self.assertIn(".dashboard-info-trigger:hover { color:#eef2ff;", stylesheet)
+        self.assertIn(".dashboard-info-trigger:focus-visible {", stylesheet)
         self.assertIn(
-            ".market-breadth-info:hover .market-breadth-info-popover, .market-breadth-info:focus-within .market-breadth-info-popover",
+            'html:not([data-theme="dark"]) .dashboard-info-trigger { --dashboard-info-color:#315aa8;',
             stylesheet,
         )
+        self.assertIn('html[data-theme="dark"] .dashboard-info-trigger {', stylesheet)
+        self.assertIn("--dashboard-info-color:#c7d2fe;", stylesheet)
+        self.assertIn(".dashboard-info-trigger:focus-visible {\n        color:var(--dashboard-info-color);", stylesheet)
         self.assertIn("header { position:sticky; top:0; z-index:20;", stylesheet)
         self.assertIn(
             "box-shadow:inset 0 1px 0 rgba(255,255,255,.035), 0 10px 28px rgba(0,0,0,.14); -webkit-user-select:none; user-select:none;",
@@ -975,7 +1090,7 @@ class FastApiDashboardTests(unittest.TestCase):
         stylesheet = (ROOT / "frontend" / "dashboard.css").read_text(encoding="utf-8")
 
         self.assertIn(
-            ".compliance-dialog-backdrop { place-items:center; padding:12px; }",
+            ".compliance-dialog-backdrop { place-items:center; padding:16px; }",
             stylesheet,
         )
         self.assertNotIn(
@@ -1035,11 +1150,41 @@ class FastApiDashboardTests(unittest.TestCase):
         component = (
             ROOT / "web" / "src" / "components" / "DragonTigerPanel.vue"
         ).read_text(encoding="utf-8")
+        stylesheet = (ROOT / "frontend" / "dashboard.css").read_text(
+            encoding="utf-8"
+        )
 
         self.assertIn('aria-label="涨停原因"', component)
         self.assertIn("item.limit_up_reason || item.limit_up_reason_category", component)
         self.assertIn("同花顺问财归纳，仅供研究参考", component)
         self.assertIn('aria-label="上榜理由"', component)
+        self.assertIn(
+            'html:not([data-theme="dark"]) .dragon-tiger-limit-up-reason '
+            "{ border-color:#efc9c5; border-left-color:#c43d35; "
+            "background:#fff7f6; }",
+            stylesheet,
+        )
+        self.assertIn(
+            'html:not([data-theme="dark"]) .dragon-tiger-limit-up-reason p '
+            "{ color:#344054; }",
+            stylesheet,
+        )
+        self.assertIn(
+            'html:not([data-theme="dark"]) .dragon-tiger-limit-up-reason > small '
+            "{ color:#667085; }",
+            stylesheet,
+        )
+        self.assertIn(
+            'html:not([data-theme="dark"]) .dragon-tiger-status.querying '
+            "{ border-color:#b9c9ea; background:#edf3ff; color:#214b9c; }",
+            stylesheet,
+        )
+        self.assertIn(
+            'html:not([data-theme="dark"]) '
+            ".dragon-tiger-continuous-tooltip-head em.negative "
+            "{ border-color:#b9dfd0; background:#eff9f5; color:#087052; }",
+            stylesheet,
+        )
 
     def test_dragon_tiger_collapsed_rows_color_limit_up_reason_names(self):
         component = (

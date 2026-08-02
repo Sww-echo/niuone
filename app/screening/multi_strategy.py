@@ -58,6 +58,16 @@ from market_data.news_precheck import (
     NewsPrecheckConfig,
     fetch_candidate_news_records,
 )
+from market_data.tencent_kline_cache import (
+    DEFAULT_KLINE_COUNT,
+    DEFAULT_PREWARM_WORKERS,
+    fetch_tencent_daily_klines,
+    kline_cache_path,
+    load_kline_series_map,
+    merge_live_quote,
+    prewarm_kline_cache,
+    store_kline_series,
+)
 from screening.stock_universe import (
     DEFAULT_STOCK_UNIVERSE,
     FULL_SUPPORTED_NON_ST_UNIVERSE,
@@ -70,6 +80,10 @@ from screening.stock_universe import (
     stock_name_is_st,
     stock_universe_metadata,
 )
+from screening.niuone_mainline_cache import (
+    load_cached_niuone_context,
+    write_niuone_mainline_cache,
+)
 from strategies.registry import (
     ACTIVE_STRATEGY_ENV,
     DISPLAY_STRATEGY_ORDER,
@@ -78,6 +92,7 @@ from strategies.registry import (
     STRATEGY_DEFINITIONS,
     STRATEGY_META,
     STRATEGY_SCORE_PROFILES,
+    active_strategy_suite,
     enabled_persona_strategy_ids,
     enabled_strategy_ids,
     enabled_strategy_meta,
@@ -146,6 +161,8 @@ DASHBOARD_ENV_FILE = get_dashboard_env_file(Path(__file__).resolve().parents[1])
 B1_OUTPUT_DIR = DASHBOARD_HOME / "cron" / "output"
 B1_CACHE_FILE = B1_OUTPUT_DIR / "b1_screen_latest.json"
 MULTI_STRATEGY_CACHE = B1_OUTPUT_DIR / "multi_strategy_latest.json"
+NIUONE_MAINLINE_CACHE = B1_OUTPUT_DIR / "niuone_mainline_latest.json"
+NIUONE_MAINLINE_MINUTE_CACHE = B1_OUTPUT_DIR / "niuone_mainline_minute_latest.json"
 STOCK_INDUSTRY_CACHE = B1_OUTPUT_DIR / "stock_industry_cache.json"
 B1_HISTORY_DIR = B1_OUTPUT_DIR / "b1_history"
 MULTI_STRATEGY_HISTORY = B1_OUTPUT_DIR / "multi_strategy_history"
@@ -153,6 +170,8 @@ DISPLAY_CANDIDATE_LIMIT = 16
 DISPLAY_HEAD_LIMIT = 8
 TRADE_CANDIDATE_LIMIT = 8
 SECTOR_TIDE_NEWS_PRECHECK_LIMIT = 5
+NIUONE_MAINLINE_ONLY_FLAG = "--niuone-mainline-only"
+KLINE_PREWARM_ONLY_FLAG = "--prewarm-kline-cache"
 HIGH_LIQUIDITY_MIN_AMOUNT = 8e8
 MAX_TRADE_ANALYSIS_COUNT = 500
 SW_STOCK_CLASSIFICATION_URL = (
@@ -264,9 +283,37 @@ def active_strategy_setting() -> str | None:
     return dashboard_env_value(ACTIVE_STRATEGY_ENV)
 
 
+def dashboard_env_enabled(name: str, default: bool = True) -> bool:
+    raw = dashboard_env_value(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+
 def active_strategy_scorers() -> dict[str, Callable[[list[dict[str, Any]]], dict[str, Any] | None]]:
     enabled = enabled_strategy_ids(enabled_persona_strategy_setting(), strategy_source_setting(), active_strategy_setting())
     return {strategy_id: scorer for strategy_id, scorer in STRATEGY_SCORERS.items() if strategy_id in enabled}
+
+
+def niuone_mainline_only_mode(argv: list[str] | None = None) -> bool:
+    """Return whether this process only refreshes the independent theme view."""
+    return NIUONE_MAINLINE_ONLY_FLAG in (sys.argv[1:] if argv is None else argv)
+
+
+def kline_prewarm_only_mode(argv: list[str] | None = None) -> bool:
+    """Return whether this process only refreshes the local daily-K-line cache."""
+    return KLINE_PREWARM_ONLY_FLAG in (sys.argv[1:] if argv is None else argv)
+
+
+def strategy_scorers_for_run(*, niuone_mainline_only: bool = False) -> dict[str, Callable[..., Any]]:
+    """Keep research-only scans independent from the configured trading suite."""
+    if niuone_mainline_only:
+        return {
+            strategy_id: scorer
+            for strategy_id, scorer in STRATEGY_SCORERS.items()
+            if strategy_id in NIUONE_STRATEGY_IDS
+        }
+    return active_strategy_scorers()
 
 
 def active_strategy_meta() -> dict[str, dict[str, Any]]:
@@ -355,6 +402,7 @@ def _parse_tencent_batch_quote(text: str) -> dict[str, dict[str, Any]]:
             "name": parts[1],
             "price": price,
             "prev_close": prev_close,
+            "open": safe_float(parts[5]),
             "change_pct": change_pct,
             "amount": amount,
             "volume": safe_float(parts[6]),
@@ -579,28 +627,8 @@ def build_index_risk_snapshot(
 
 
 def tencent_klines(symbol, count=120):
-    url = f"{TENCENT_KLINE}?param={symbol},day,,,{count},qfq"
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    try:
-        with urllib.request.urlopen(req, timeout=15) as r:
-            data = json.loads(r.read().decode("utf-8", "ignore"))
-    except Exception:
-        return []
-    try:
-        kdata = (data.get("data", {}).get(symbol, {}).get("day", []) or
-                 data.get("data", {}).get(symbol, {}).get("qfqday", []))
-    except Exception:
-        return []
-    rows = []
-    for item in kdata:
-        if len(item) >= 6:
-            rows.append({
-                "date": item[0],
-                "open": float(item[1]), "close": float(item[2]),
-                "high": float(item[3]), "low": float(item[4]),
-                "volume": float(item[5]),
-            })
-    return rows
+    """Backward-compatible Tencent loader now owned by market_data."""
+    return fetch_tencent_daily_klines(symbol, count)
 
 
 # ========== Multi-Strategy Analysis ==========
@@ -612,12 +640,20 @@ def prepare_strategy_rows(
     quote: dict[str, Any] | None = None,
     name: str = "",
     industry: str = "",
+    historical_rows: list[dict[str, Any]] | None = None,
+    kline_loader: Callable[[str, int], list[dict[str, Any]]] | None = None,
+    fetched_callback: Callable[[str, list[dict[str, Any]]], None] | None = None,
 ) -> list[dict[str, Any]] | None:
     """Fetch and enrich a stock once so cross-sectional suites can reuse it."""
-    try:
-        rows = tencent_klines(tencent_key, 120)
-    except Exception:
-        return None
+    rows = [dict(row) for row in historical_rows] if historical_rows else []
+    if not rows:
+        try:
+            rows = (kline_loader or tencent_klines)(tencent_key, DEFAULT_KLINE_COUNT)
+        except Exception:
+            return None
+        if rows and fetched_callback is not None:
+            fetched_callback(tencent_key, rows)
+    rows = merge_live_quote(rows, quote)
     if len(rows) < 30:
         return None
 
@@ -644,6 +680,8 @@ def analyze_all_strategies(
     *,
     industry: str = "",
     rows: list[dict[str, Any]] | None = None,
+    historical_rows: list[dict[str, Any]] | None = None,
+    fetched_callback: Callable[[str, list[dict[str, Any]]], None] | None = None,
     context: dict[str, Any] | None = None,
     scorers: dict[str, Callable[..., dict[str, Any] | None]] | None = None,
 ):
@@ -654,6 +692,8 @@ def analyze_all_strategies(
         quote=quote,
         name=name,
         industry=industry,
+        historical_rows=historical_rows,
+        fetched_callback=fetched_callback,
     )
     if not prepared:
         return None
@@ -673,13 +713,78 @@ def load_previous_sector_tide_market() -> dict[str, Any] | None:
 
 
 def load_previous_niuone_context() -> dict[str, Any] | None:
-    """Load the prior 牛牛战法 state used for mainline confirmation."""
+    """Load the prior 牛牛战法 state and retain its persisted market date."""
+    candidates: list[tuple[str, int, dict[str, Any]]] = []
+    for path in (
+        NIUONE_MAINLINE_MINUTE_CACHE,
+        NIUONE_MAINLINE_CACHE,
+        MULTI_STRATEGY_CACHE,
+    ):
+        context = load_cached_niuone_context(path)
+        if context is None:
+            continue
+        try:
+            modified_ns = int(path.stat().st_mtime_ns)
+        except OSError:
+            modified_ns = 0
+        context_time = re.sub(
+            r"\D",
+            "",
+            str(context.get("sample_at") or context.get("as_of_date") or ""),
+        )[:14].ljust(14, "0")
+        candidates.append((context_time, modified_ns, context))
+    return max(candidates, key=lambda item: (item[0], item[1]))[2] if candidates else None
+
+
+def resolve_niuone_trading_dates(
+    prepared_items: list[dict[str, Any]],
+    *,
+    now: datetime | None = None,
+    status_loader: Callable[..., dict[str, Any]] | None = None,
+) -> tuple[str, str]:
+    """Resolve the quote/K-line market date and its exact prior trading day."""
+    date_counts: dict[str, int] = {}
+    for item in prepared_items:
+        quote = item.get("quote") if isinstance(item.get("quote"), dict) else {}
+        quote_date = re.search(r"(?P<year>\d{4})(?P<month>\d{2})(?P<day>\d{2})", str(quote.get("quote_time") or ""))
+        if quote_date:
+            value = f"{quote_date.group('year')}-{quote_date.group('month')}-{quote_date.group('day')}"
+            date_counts[value] = date_counts.get(value, 0) + 1
+            continue
+        rows = item.get("rows") if isinstance(item.get("rows"), list) else []
+        latest = rows[-1] if rows and isinstance(rows[-1], dict) else {}
+        matched = re.search(r"\d{4}-\d{2}-\d{2}", str(latest.get("date") or ""))
+        if matched:
+            value = matched.group(0)
+            date_counts[value] = date_counts.get(value, 0) + 1
+    if date_counts:
+        as_of_date = max(date_counts, key=lambda value: (date_counts[value], value))
+    else:
+        as_of_date = (now or datetime.now()).strftime("%Y-%m-%d")
+    if status_loader is None:
+        from a_share_calendar import trading_day_status
+
+        status_loader = trading_day_status
     try:
-        payload = json.loads(MULTI_STRATEGY_CACHE.read_text(encoding="utf-8"))
+        status = status_loader(as_of_date, allow_refresh=False)
+        previous_trading_day = str(status.get("previous_trading_day") or "")[:10]
     except Exception:
-        return None
-    context = payload.get("niuone_context") if isinstance(payload, dict) else None
-    return context if isinstance(context, dict) else None
+        previous_trading_day = ""
+    return as_of_date, previous_trading_day
+
+
+def resolve_quote_trading_dates(
+    quotes: Mapping[str, Mapping[str, Any]],
+    *,
+    now: datetime | None = None,
+    status_loader: Callable[..., dict[str, Any]] | None = None,
+) -> tuple[str, str]:
+    """Resolve the current and previous market dates before K-line preparation."""
+    return resolve_niuone_trading_dates(
+        [{"quote": quote} for quote in (quotes or {}).values() if isinstance(quote, Mapping)],
+        now=now,
+        status_loader=status_loader,
+    )
 
 
 def fetch_industry_money_flow() -> dict[str, Any]:
@@ -871,6 +976,43 @@ def fetch_sector_tide_news_precheck(
         "records": records,
         "error": "" if any(record.get("available") for record in records) else "all_records_unavailable",
     }
+
+
+def niuone_news_shortlist(
+    context: Mapping[str, Any] | None,
+    limit: int = SECTOR_TIDE_NEWS_PRECHECK_LIMIT,
+) -> list[dict[str, Any]]:
+    """Select the strongest NiuOne names without using the active trade suite."""
+    themes = context.get("themes") if isinstance(context, Mapping) else {}
+    if not isinstance(themes, Mapping):
+        return []
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for theme in themes.values():
+        if not isinstance(theme, Mapping):
+            continue
+        industry = str(theme.get("industry") or "").strip()
+        for stock in theme.get("strong_stocks") or []:
+            if not isinstance(stock, Mapping):
+                continue
+            code = normalize_stock_code(stock.get("code"))
+            if not code or code in seen:
+                continue
+            seen.add(code)
+            candidates.append({
+                "code": code,
+                "name": str(stock.get("name") or "").strip(),
+                "industry": industry,
+                "strong_score": float(stock.get("strong_score") or 0.0),
+            })
+    candidates.sort(
+        key=lambda item: (
+            float(item.get("strong_score") or 0.0),
+            str(item.get("code") or ""),
+        ),
+        reverse=True,
+    )
+    return candidates[:max(0, int(limit))]
 
 
 def load_a_share_code_pool(stock_universe: object | None = None):
@@ -1675,12 +1817,66 @@ def write_outputs(json_str: str, generated_at: str) -> None:
         ft.replace(f)
 
 
+def prewarm_full_market_klines(
+    *,
+    workers: int | None = None,
+    target_date: str = "",
+    fetcher: Callable[[str, int], list[dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
+    """Populate the private SQLite cache for every supported non-ST A share."""
+    candidates = load_a_share_code_pool(FULL_SUPPORTED_NON_ST_UNIVERSE)
+    symbols = [
+        ("sh" if code.startswith(("6", "9")) else "sz") + code
+        for code, _name in candidates
+    ]
+    if workers is None:
+        try:
+            workers = int(
+                dashboard_env_value("DASHBOARD_KLINE_PREWARM_WORKERS")
+                or DEFAULT_PREWARM_WORKERS
+            )
+        except (TypeError, ValueError):
+            workers = DEFAULT_PREWARM_WORKERS
+
+    def progress(completed: int, total: int, failures: int) -> None:
+        print(
+            f"  ... {completed}/{total} daily K-line series prepared; failures={failures}",
+            file=sys.stderr,
+        )
+
+    return prewarm_kline_cache(
+        symbols,
+        path=kline_cache_path(),
+        target_date=target_date,
+        workers=workers,
+        fetcher=fetcher,
+        progress=progress,
+    )
+
+
 def main():
+    if kline_prewarm_only_mode():
+        print("Pre-market task: warming full-market daily K-line SQLite cache...", file=sys.stderr)
+        result = prewarm_full_market_klines()
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        print(
+            "  K-line cache prewarm completed: "
+            f"success={result.get('success_count', 0)}/"
+            f"{result.get('requested_count', 0)} "
+            f"failures={result.get('failure_count', 0)} "
+            f"duration={result.get('duration_seconds', 0)}s",
+            file=sys.stderr,
+        )
+        return
+
     print("Step 1: Loading A-share code pool...", file=sys.stderr)
-    scorers = active_strategy_scorers()
+    niuone_mainline_only = niuone_mainline_only_mode()
+    scorers = strategy_scorers_for_run(niuone_mainline_only=niuone_mainline_only)
     sector_tide_enabled = bool(SECTOR_TIDE_STRATEGY_IDS.intersection(scorers))
     niuone_enabled = bool(NIUONE_STRATEGY_IDS.intersection(scorers))
     zettaranc_enabled = bool(ZETTARANC_STRATEGY_IDS.intersection(scorers))
+    if niuone_mainline_only:
+        print("  Independent theme-strength research mode; trading suite is ignored", file=sys.stderr)
     configured_universe = configured_stock_universe()
     stock_universe, reference_stock_universe = scan_stock_universes(scorers, configured_universe)
     candidates = load_a_share_code_pool(stock_universe)
@@ -1778,6 +1974,67 @@ def main():
         f"Step 3: Multi-strategy scoring (registered strategy profiles, {scan_workers} workers)...",
         file=sys.stderr,
     )
+    kline_cache_enabled = dashboard_env_enabled("DASHBOARD_KLINE_CACHE_ENABLED", True)
+    cached_klines_by_symbol: dict[str, list[dict[str, Any]]] = {}
+    pending_kline_cache: dict[str, list[dict[str, Any]]] = {}
+    pending_kline_cache_lock = threading.Lock()
+    needed_kline_symbols = list(dict.fromkeys(
+        tencent_keys[code]
+        for code, _name, _quote in [*context_candidates, *to_analyze]
+        if code in tencent_keys
+    ))
+    scan_as_of_date, scan_previous_trading_day = resolve_quote_trading_dates(
+        reference_quotes if niuone_enabled else quotes
+    )
+    if kline_cache_enabled:
+        accepted_cache_dates = {
+            value
+            for value in (scan_as_of_date, scan_previous_trading_day)
+            if value
+        }
+        try:
+            cached_klines_by_symbol = load_kline_series_map(
+                needed_kline_symbols,
+                path=kline_cache_path(),
+                accepted_last_dates=accepted_cache_dates,
+                min_rows=30,
+                count=DEFAULT_KLINE_COUNT,
+            )
+        except Exception as exc:
+            print(
+                f"[WARN] local K-line cache unavailable: {type(exc).__name__}; using network fallback",
+                file=sys.stderr,
+            )
+        print(
+            "  Daily K-line SQLite cache: "
+            f"hits={len(cached_klines_by_symbol)}/{len(needed_kline_symbols)} "
+            f"as_of={scan_as_of_date or 'unknown'} "
+            f"previous={scan_previous_trading_day or 'unknown'}",
+            file=sys.stderr,
+        )
+
+    def remember_fetched_klines(symbol: str, rows: list[dict[str, Any]]) -> None:
+        if not kline_cache_enabled or not rows:
+            return
+        with pending_kline_cache_lock:
+            pending_kline_cache[symbol] = rows
+
+    def flush_fetched_klines() -> int:
+        if not kline_cache_enabled:
+            return 0
+        with pending_kline_cache_lock:
+            pending = dict(pending_kline_cache)
+            pending_kline_cache.clear()
+        if not pending:
+            return 0
+        try:
+            stored = store_kline_series(pending, path=kline_cache_path())
+            print(f"  Daily K-line SQLite cache filled from fallback: {stored}", file=sys.stderr)
+            return stored
+        except Exception as exc:
+            print(f"[WARN] local K-line cache write failed: {type(exc).__name__}", file=sys.stderr)
+            return 0
+
     sector_tide_context: dict[str, Any] | None = None
     niuone_context: dict[str, Any] | None = None
     strategy_context: dict[str, Any] | None = None
@@ -1787,6 +2044,8 @@ def main():
     sector_tide_flow_rows: dict[str, Any] = {"inflow": [], "outflow": []}
     previous_sector_tide_market: dict[str, Any] | None = None
     previous_niuone_context: dict[str, Any] | None = None
+    niuone_as_of_date = ""
+    niuone_previous_trading_day = ""
     dragon_tiger_snapshot: dict[str, Any] | None = None
     overnight_us_snapshot: dict[str, Any] | None = None
 
@@ -1835,6 +2094,8 @@ def main():
                 quote=quote,
                 name=name,
                 industry=industry,
+                historical_rows=cached_klines_by_symbol.get(tencent_keys[code]),
+                fetched_callback=remember_fetched_klines,
             )
             return item, rows
 
@@ -1868,6 +2129,9 @@ def main():
         finally:
             if context_pool is not None:
                 context_pool.shutdown(wait=True)
+        flush_fetched_klines()
+        if niuone_enabled:
+            niuone_as_of_date, niuone_previous_trading_day = resolve_niuone_trading_dates(prepared_items)
         dragon_tiger_snapshot = load_previous_sector_tide_dragon_tiger()
         if sector_tide_enabled:
             previous_sector_tide_market = load_previous_sector_tide_market()
@@ -1900,10 +2164,14 @@ def main():
             previous_niuone_context = load_previous_niuone_context()
             niuone_context = build_niuone_context(
                 prepared_items,
+                reference_pool_count=len(reference_candidates),
                 market_snapshot=market_snapshot,
                 flow_rows=sector_tide_flow_rows,
                 previous_context=previous_niuone_context,
                 dragon_tiger_snapshot=dragon_tiger_snapshot,
+                as_of_date=niuone_as_of_date,
+                previous_trading_day=niuone_previous_trading_day,
+                sample_at=str(market_snapshot.get("captured_at") or ""),
             )
             niuone_context["industry_money_flow"] = sector_tide_flow_rows
             niuone_context["reference_stock_universe"] = list(reference_stock_universe)
@@ -1918,11 +2186,58 @@ def main():
                 "  牛牛主线 context: "
                 f"market={market.get('state')} score={market.get('score')} "
                 f"mode={mainline.get('mode')} primary={mainline.get('primary') or 'none'} "
+                f"intraday={mainline.get('intraday_primary') or 'none'} "
+                f"as_of={niuone_as_of_date or 'unknown'} "
                 f"themes={niuone_context.get('theme_count')} "
                 f"strong_stocks={niuone_context.get('strong_stock_count')} "
                 f"coverage={niuone_context.get('data_coverage')}",
                 file=sys.stderr,
             )
+
+    if niuone_mainline_only:
+        if niuone_context is None:
+            raise RuntimeError("independent NiuOne mainline context was not generated")
+        news_shortlist = niuone_news_shortlist(niuone_context)
+        news_snapshot = fetch_sector_tide_news_precheck(news_shortlist)
+        niuone_context = build_niuone_context(
+            prepared_items,
+            reference_pool_count=len(reference_candidates),
+            market_snapshot=market_snapshot,
+            flow_rows=sector_tide_flow_rows,
+            previous_context=previous_niuone_context,
+            dragon_tiger_snapshot=dragon_tiger_snapshot,
+            news_snapshot=news_snapshot,
+            as_of_date=niuone_as_of_date,
+            previous_trading_day=niuone_previous_trading_day,
+            sample_at=str(market_snapshot.get("captured_at") or ""),
+        )
+        niuone_context["industry_money_flow"] = sector_tide_flow_rows
+        niuone_context["reference_stock_universe"] = list(reference_stock_universe)
+        niuone_context["reference_stock_universe_label"] = friendly_stock_universe(reference_stock_universe)
+        niuone_context["reference_pool_count"] = len(reference_candidates)
+        niuone_context["reference_prefilter_count"] = len(context_candidates)
+        niuone_context["reference_analysis_count"] = len(context_candidates)
+        generated_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        output = {
+            "generated_at": generated_at,
+            "reference_stock_universe": list(reference_stock_universe),
+            "reference_stock_universe_label": friendly_stock_universe(reference_stock_universe),
+            "reference_pool_count": len(reference_candidates),
+            "reference_prefilter_count": len(context_candidates),
+            "reference_analysis_count": len(context_candidates),
+            "niuone_context": niuone_context,
+        }
+        write_niuone_mainline_cache(NIUONE_MAINLINE_CACHE, output)
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+        news_meta = niuone_context.get("news") or {}
+        print(
+            "  Independent theme-strength cache updated: "
+            f"generated_at={generated_at} themes={niuone_context.get('theme_count')} "
+            f"news_configured={news_meta.get('configured')} "
+            f"news_available={news_meta.get('available')}",
+            file=sys.stderr,
+        )
+        return
 
     def analyze_candidate(candidate):
         code, name, q = candidate
@@ -1935,6 +2250,8 @@ def main():
                 name=name,
                 industry=industry_by_code.get(code, ""),
                 rows=prepared_by_code.get(code),
+                historical_rows=cached_klines_by_symbol.get(tencent_key),
+                fetched_callback=remember_fetched_klines,
                 context=strategy_context,
                 scorers=scorers,
             )
@@ -1994,21 +2311,58 @@ def main():
             "theme_basis": best.get("theme_basis"),
             "mainline_state": best.get("mainline_state"),
             "mainline_raw_state": best.get("mainline_raw_state"),
+            "mainline_intraday_state": best.get("mainline_intraday_state"),
             "mainline_score": best.get("mainline_score"),
             "mainline_mode": best.get("mainline_mode"),
             "mainline_primary": best.get("mainline_primary"),
             "mainline_secondary": best.get("mainline_secondary"),
             "mainline_selected": best.get("mainline_selected"),
             "mainline_confirmation_count": best.get("mainline_confirmation_count"),
+            "mainline_intraday_confirmation_count": best.get("mainline_intraday_confirmation_count"),
+            "mainline_cross_day_persistent": best.get("mainline_cross_day_persistent"),
+            "mainline_cross_day_confirmed": best.get("mainline_cross_day_confirmed"),
+            "mainline_confirmed": best.get("mainline_confirmed"),
+            "mainline_core_overlap_count": best.get("mainline_core_overlap_count"),
+            "mainline_core_overlap_ratio": best.get("mainline_core_overlap_ratio"),
+            "mainline_continued_core_codes": best.get("mainline_continued_core_codes"),
+            "mainline_as_of_date": best.get("mainline_as_of_date"),
+            "mainline_previous_as_of_date": best.get("mainline_previous_as_of_date"),
             "mainline_state_streak": best.get("mainline_state_streak"),
             "mainline_score_change": best.get("mainline_score_change"),
+            "today_eligible_data": best.get("today_eligible_data"),
+            "today_up_count": best.get("today_up_count"),
+            "today_1_5pct_count": best.get("today_1_5pct_count"),
+            "today_breadth_pct": best.get("today_breadth_pct"),
+            "today_median_change_pct": best.get("today_median_change_pct"),
+            "today_median_rebound_pct": best.get("today_median_rebound_pct"),
+            "today_prior_median_ret5_pct": best.get("today_prior_median_ret5_pct"),
+            "today_strength_score": best.get("today_strength_score"),
+            "today_leadership_score": best.get("today_leadership_score"),
+            "reversal_candidate": best.get("reversal_candidate"),
+            "reversal_confirmed": best.get("reversal_confirmed"),
+            "reversal_confirmation_count": best.get("reversal_confirmation_count"),
+            "reversal_min_sample_gap_minutes": best.get("reversal_min_sample_gap_minutes"),
+            "reversal_sample_gap_minutes": best.get("reversal_sample_gap_minutes"),
+            "reversal_origin_weak": best.get("reversal_origin_weak"),
+            "reversal_quote_coverage_ok": best.get("reversal_quote_coverage_ok"),
+            "reversal_flow_available": best.get("reversal_flow_available"),
+            "reversal_flow_positive": best.get("reversal_flow_positive"),
+            "reversal_flow_flip": best.get("reversal_flow_flip"),
+            "reversal_flow_improving": best.get("reversal_flow_improving"),
+            "reversal_score": best.get("reversal_score"),
             "strong_stock_count": best.get("strong_stock_count"),
             "effective_strong_count": best.get("effective_strong_count"),
             "leader_concentration": best.get("leader_concentration"),
             "single_stock_dominated": best.get("single_stock_dominated"),
             "stock_role": best.get("stock_role"),
+            "stock_leader_rank": best.get("stock_leader_rank"),
+            "stock_leader_tier": best.get("stock_leader_tier"),
             "stock_strong": best.get("stock_strong"),
             "stock_strong_score": best.get("stock_strong_score"),
+            "stock_reversal_leader_rank": best.get("stock_reversal_leader_rank"),
+            "stock_reversal_leader_tier": best.get("stock_reversal_leader_tier"),
+            "stock_reversal_strong": best.get("stock_reversal_strong"),
+            "stock_today_rank_score": best.get("stock_today_rank_score"),
             "sector_rank_acceleration": best.get("sector_rank_acceleration"),
             "sector_breadth20": best.get("sector_breadth20"),
             "stock_sector_rank": best.get("stock_sector_rank"),
@@ -2075,11 +2429,17 @@ def main():
             "news_positive_suppressed": best.get("news_positive_suppressed"),
             "ema20": best.get("ema20"),
             "ema50": best.get("ema50"),
+            "atr": best.get("atr"),
+            "atr_period": best.get("atr_period"),
             "atr20": best.get("atr20"),
             "stop_price": best.get("stop_price"),
             "stop_source": best.get("stop_source"),
             "stop_distance_pct": best.get("stop_distance_pct"),
             "stop_atr": best.get("stop_atr"),
+            "max_stop_distance_pct": best.get("max_stop_distance_pct"),
+            "max_stop_atr": best.get("max_stop_atr"),
+            "max_entry_change_pct": best.get("max_entry_change_pct"),
+            "max_entry_extension_atr": best.get("max_entry_extension_atr"),
             "gap_buffer_pct": best.get("gap_buffer_pct"),
             "execution_buffer_pct": best.get("execution_buffer_pct"),
             "effective_loss_distance_pct": best.get("effective_loss_distance_pct"),
@@ -2104,6 +2464,7 @@ def main():
                 results.append(item)
             if completed % 50 == 0:
                 print(f"  ... {completed}/{len(to_analyze)} analyzed", file=sys.stderr)
+    flush_fetched_klines()
 
     # Sort: best_score desc, above_bbi bonus, closer to BBI better
     def sort_key(item):
@@ -2158,18 +2519,19 @@ def main():
             file=sys.stderr,
         )
     elif niuone_enabled and niuone_context is not None:
-        news_shortlist = [
-            item for item in results
-            if str(item.get("best_strategy") or "") in NIUONE_STRATEGY_IDS
-        ][:SECTOR_TIDE_NEWS_PRECHECK_LIMIT]
+        news_shortlist = niuone_news_shortlist(niuone_context)
         news_snapshot = fetch_sector_tide_news_precheck(news_shortlist)
         niuone_context = build_niuone_context(
             prepared_items,
+            reference_pool_count=len(reference_candidates),
             market_snapshot=market_snapshot,
             flow_rows=sector_tide_flow_rows,
             previous_context=previous_niuone_context,
             dragon_tiger_snapshot=dragon_tiger_snapshot,
             news_snapshot=news_snapshot,
+            as_of_date=niuone_as_of_date,
+            previous_trading_day=niuone_previous_trading_day,
+            sample_at=str(market_snapshot.get("captured_at") or ""),
         )
         niuone_context["industry_money_flow"] = sector_tide_flow_rows
         niuone_context["reference_stock_universe"] = list(reference_stock_universe)
@@ -2228,6 +2590,12 @@ def main():
     
     output = {
         "generated_at": generated_at,
+        "strategy_suite": active_strategy_suite(
+            active_strategy_setting(),
+            strategy_source_setting(),
+            enabled_persona_strategy_setting(),
+        ),
+        "enabled_strategy_ids": sorted(scorers),
         "configured_stock_universe": list(configured_universe),
         "configured_stock_universe_label": friendly_stock_universe(configured_universe),
         "stock_universe": list(stock_universe),
@@ -2258,6 +2626,8 @@ def main():
         }
     json_str = json.dumps(output, ensure_ascii=False, indent=2)
     print(json_str)
+    if niuone_context is not None:
+        write_niuone_mainline_cache(NIUONE_MAINLINE_CACHE, output)
     write_outputs(json_str, generated_at)
 
 

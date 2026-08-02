@@ -26,6 +26,7 @@ from a_share_calendar import is_a_share_trading_day as calendar_is_a_share_tradi
 from dashboard_json_cache import read_json_cache, write_json_cache
 from dashboard import practice_payload as practice_payload_impl
 from dashboard import practice_market_summary as practice_market_summary_impl
+from dashboard.niuone_mainline import build_niuone_mainline_view
 from dashboard import response_cache as response_cache_impl
 from dashboard import security as security_impl
 from dashboard import visit_stats as visit_stats_impl
@@ -85,9 +86,16 @@ from market_data.iwencai_client import (
     DEFAULT_BASE_URL as IWENCAI_DEFAULT_BASE_URL,
     normalize_base_url as normalize_iwencai_base_url,
 )
+from market_data.eastmoney_turnover import (
+    fetch_market_turnover_estimate,
+    fetch_turnover_profile,
+)
 from market_data.tencent_market_breadth import fetch_tencent_market_breadth
+from market_data.tencent_kline_cache import kline_cache_path, prewarm_completed_for_date
 from niuone_paths import apply_container_runtime_overrides, get_dashboard_env_file, get_dashboard_home, get_local_data_dir
 import push_history
+from screening.niuone_mainline_cache import write_niuone_mainline_cache
+from screening.niuone_minute import NiuOneMinuteEngine
 from screening.stock_universe import (
     DEFAULT_STOCK_UNIVERSE,
     STOCK_UNIVERSE_ENV,
@@ -111,6 +119,8 @@ from strategies.registry import (
     decode_trade_discipline_text,
     default_trade_discipline_text,
     default_enabled_persona_strategies_value,
+    enabled_strategy_ids,
+    enabled_strategy_meta,
     normalize_preset_strategy_text_update,
     normalize_trade_discipline_text_update,
     normalize_strategy_source_update,
@@ -119,6 +129,7 @@ from strategies.registry import (
     strategy_suite_options,
     strategy_settings_options,
 )
+from strategies.selection import sort_candidates_by_score
 from us_market_summary import fetch_us_market_summary, fetch_us_sector_snapshot, load_cached_summary_for_today
 
 try:
@@ -132,6 +143,12 @@ ENTRYPOINT_DIR = SCRIPT_DIR / "entrypoints"
 COMPAT_DIR = SCRIPT_DIR / "compat"
 VERSION_PATTERN = re.compile(r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 CURRENT_VERSION = str(os.environ.get("NIUONE_VERSION") or "dev").strip() or "dev"
+PROJECT_AUTHOR = "kunkundi"
+PROJECT_AUTHOR_URL = "https://github.com/kunkundi"
+PROJECT_REPOSITORY = "kunkundi/niuone"
+PROJECT_REPOSITORY_URL = f"https://github.com/{PROJECT_REPOSITORY}"
+PROJECT_LICENSE = "Apache License 2.0"
+PROJECT_LICENSE_URL = f"{PROJECT_REPOSITORY_URL}/blob/main/LICENSE"
 DOCKER_HUB_REPOSITORY = "kunkundi/niuone"
 DOCKER_HUB_REPOSITORY_URL = f"https://hub.docker.com/r/{DOCKER_HUB_REPOSITORY}"
 DOCKER_HUB_TAGS_API = (
@@ -159,7 +176,11 @@ IWENCAI_DRAGON_TIGER_SNAPSHOT_FILE = Path(
     or CRON_OUTPUT_DIR / "iwencai_dragon_tiger_latest.json"
 ).expanduser()
 B1_CACHE_FILE = CRON_OUTPUT_DIR / "b1_screen_latest.json"
+NIUONE_MAINLINE_CACHE_FILE = CRON_OUTPUT_DIR / "niuone_mainline_latest.json"
+NIUONE_MAINLINE_MINUTE_CACHE_FILE = CRON_OUTPUT_DIR / "niuone_mainline_minute_latest.json"
+STOCK_INDUSTRY_CACHE_FILE = CRON_OUTPUT_DIR / "stock_industry_cache.json"
 MONEY_FLOW_SNAPSHOT_FILE = CRON_OUTPUT_DIR / "industry_main_money_flow_cache.json"
+TURNOVER_PROFILE_CACHE_FILE = CRON_OUTPUT_DIR / "turnover_profile_cache.json"
 # Main-net samples use a new history file so legacy total-flow observations
 # remain recoverable but can never be replayed under the new metric label.
 INDUSTRY_FLOW_HISTORY_FILE = CRON_OUTPUT_DIR / "industry_main_flow_history.json"
@@ -174,7 +195,7 @@ ACTION_HEADER_NAME = "X-NiuOne-Action"
 ACTION_HEADER_VALUES = {"1", "true", "yes", "on"}
 TRUTHY_VALUES = {"1", "true", "yes", "on"}
 US_FEATURE_CATEGORIES = {"x_monitor", "us_ratings"}
-INDUSTRY_FLOW_PLAYBACK_SPEED_OPTIONS = (0.5, 0.75, 1.0, 1.5, 2.0)
+INDUSTRY_FLOW_PLAYBACK_SPEED_OPTIONS = (0.5, 0.75, 1.0, 1.5, 2.0, 5.0, 10.0)
 INDUSTRY_FLOW_WINDOW_CONFIG_NAMES = (
     "DASHBOARD_INDUSTRY_FLOW_MORNING_START",
     "DASHBOARD_INDUSTRY_FLOW_MORNING_END",
@@ -271,6 +292,27 @@ B1_SCHEDULE_STALE_SECONDS = int(os.environ.get("DASHBOARD_B1_SCHEDULE_STALE_SECO
 B1_SCHEDULE_RUN_KEYS: set[str] = set()
 B1_SCHEDULE_LOCK = threading.RLock()
 B1_SCHEDULE_THREAD: threading.Thread | None = None
+NIUONE_MAINLINE_SCAN_LOCK = threading.Lock()
+NIUONE_MAINLINE_SCAN_THREAD: threading.Thread | None = None
+DEFAULT_KLINE_PREWARM_TIME = "09:10"
+KLINE_CACHE_ENABLED = os.environ.get("DASHBOARD_KLINE_CACHE_ENABLED", "1").lower() not in {"0", "false", "no", "off"}
+KLINE_PREWARM_ENABLED = KLINE_CACHE_ENABLED and os.environ.get("DASHBOARD_KLINE_PREWARM_ENABLED", "1").lower() not in {"0", "false", "no", "off"}
+KLINE_PREWARM_TIME = os.environ.get("DASHBOARD_KLINE_PREWARM_TIME", DEFAULT_KLINE_PREWARM_TIME).strip() or DEFAULT_KLINE_PREWARM_TIME
+KLINE_PREWARM_CATCHUP_MINUTES = int(os.environ.get("DASHBOARD_KLINE_PREWARM_CATCHUP_MINUTES", "15") or "15")
+KLINE_PREWARM_TIMEOUT_SECONDS = int(os.environ.get("DASHBOARD_KLINE_PREWARM_TIMEOUT_SECONDS", "600") or "600")
+KLINE_PREWARM_RETRY_SECONDS = int(os.environ.get("DASHBOARD_KLINE_PREWARM_RETRY_SECONDS", "300") or "300")
+KLINE_PREWARM_LOCK = threading.Lock()
+KLINE_PREWARM_RUN_THREAD: threading.Thread | None = None
+KLINE_PREWARM_SCHEDULER_THREAD: threading.Thread | None = None
+KLINE_PREWARM_LAST_ATTEMPT_TS = 0.0
+NIUONE_MAINLINE_MINUTE_REFRESH_ENABLED = str(
+    os.environ.get("DASHBOARD_NIUONE_MAINLINE_MINUTE_REFRESH_ENABLED", "1") or "1"
+).strip().lower() not in {"0", "false", "no", "off"}
+NIUONE_MAINLINE_MINUTE_STATE_LOCK = threading.Lock()
+NIUONE_MAINLINE_MINUTE_PENDING: dict[str, Any] | None = None
+NIUONE_MAINLINE_MINUTE_THREAD: threading.Thread | None = None
+NIUONE_MAINLINE_MINUTE_ENGINE: NiuOneMinuteEngine | None = None
+NIUONE_MAINLINE_MINUTE_ENGINE_PATHS: tuple[str, str] = ("", "")
 PENDING_DECISION_THREAD: threading.Thread | None = None
 PENDING_DECISION_POLL_SECONDS = float(os.environ.get("DASHBOARD_PENDING_DECISION_POLL_SECONDS", "5") or "5")
 PRACTICE_EQUITY_HEARTBEAT_LOCK = threading.Lock()
@@ -282,7 +324,15 @@ MARKET_BREADTH_HISTORY_LOCK = threading.RLock()
 MARKET_BREADTH_REFRESH_LOCK = threading.Lock()
 MARKET_BREADTH_SAMPLER_THREAD: threading.Thread | None = None
 DAILY_MARKET_HISTORY_RESET_THREAD: threading.Thread | None = None
-MARKET_BREADTH_SAMPLE_INTERVAL_SECONDS = MARKET_BREADTH_DEFAULT_SAMPLE_INTERVAL_SECONDS
+MARKET_BREADTH_SAMPLE_INTERVAL_SECONDS = _bounded_int_value(
+    os.environ.get(
+        "DASHBOARD_MARKET_BREADTH_SAMPLE_INTERVAL_SECONDS",
+        str(MARKET_BREADTH_DEFAULT_SAMPLE_INTERVAL_SECONDS),
+    ),
+    MARKET_BREADTH_DEFAULT_SAMPLE_INTERVAL_SECONDS,
+    30,
+    600,
+)
 INDUSTRY_FLOW_SAMPLE_INTERVAL_SECONDS = _bounded_int_value(
     os.environ.get("DASHBOARD_INDUSTRY_FLOW_SAMPLE_INTERVAL_SECONDS"),
     INDUSTRY_FLOW_DEFAULT_SAMPLE_INTERVAL_SECONDS,
@@ -405,6 +455,7 @@ VISIT_STATS_LOCK = threading.RLock()
 VISIT_STATS_INIT_SIGNATURE: tuple[Any, ...] | None = None
 ENV_FILE_WRITE_LOCK = threading.RLock()
 PRACTICE_CANDIDATES_CACHE_KEY = "practice_candidates"
+NIUONE_MAINLINE_CACHE_KEY = "niuone_mainline"
 PRACTICE_CANDIDATES_API_PATHS = frozenset({"/api/practice_candidates", "/api/b1_screen"})
 PRACTICE_CANDIDATES_REFRESH_API_PATHS = frozenset({"/api/practice_candidates/refresh", "/api/b1_screen/trigger"})
 PRACTICE_MANUAL_CYCLE_API_PATH = "/api/niuniu_practice/manual-cycle"
@@ -417,10 +468,11 @@ API_TTLS = {
         or os.environ.get("DASHBOARD_B1_SCREEN_TTL_SECONDS")
         or "15"
     ),
+    "niuone_mainline": int(os.environ.get("DASHBOARD_NIUONE_MAINLINE_TTL_SECONDS", "15") or "15"),
     "niuniu_practice": int(os.environ.get("DASHBOARD_PRACTICE_TTL_SECONDS", "15") or "15"),
     "practice_benchmarks": 30,
     "indices": int(os.environ.get("DASHBOARD_INDICES_TTL_SECONDS", "60") or "60"),
-    "market_breadth": MARKET_BREADTH_DEFAULT_SAMPLE_INTERVAL_SECONDS,
+    "market_breadth": MARKET_BREADTH_SAMPLE_INTERVAL_SECONDS,
     "sectors": 60,
     "us_sectors": int(os.environ.get("DASHBOARD_US_SECTORS_TTL_SECONDS", "300") or "300"),
     "hot_stocks": 60,
@@ -445,7 +497,7 @@ SECRET_KEY_RE = re.compile(
 DEFAULT_MODEL_CONTEXT_LENGTH = "128000"
 DEFAULT_MODEL_MAX_TOKENS = "4096"
 
-ENV_CONFIG_SCHEMA: list[dict[str, str]] = [
+ENV_CONFIG_SCHEMA: list[dict[str, Any]] = [
     {"name": "DASHBOARD_HOME", "label": "运行数据目录", "group": "基础路径", "kind": "path", "default": str(LOCAL_DATA_DIR / "runtime"), "effect": "restart"},
     {"name": "DASHBOARD_HOST", "label": "监听地址", "group": "基础路径", "kind": "text", "default": "127.0.0.1", "effect": "restart"},
     {"name": "DASHBOARD_PORT", "label": "监听端口", "group": "基础路径", "kind": "int", "default": "8787", "effect": "restart"},
@@ -477,6 +529,34 @@ ENV_CONFIG_SCHEMA: list[dict[str, str]] = [
     {"name": "DASHBOARD_X_MEDIA_CACHE_TTL_SECONDS", "label": "X 图片缓存 TTL 秒数", "group": "限流与缓存", "kind": "int", "default": str(7 * 24 * 3600), "effect": "restart"},
     {"name": "DASHBOARD_X_MEDIA_MAX_BYTES", "label": "X 图片代理最大字节", "group": "限流与缓存", "kind": "int", "default": str(8 * 1024 * 1024), "effect": "restart"},
     {"name": "DASHBOARD_PUBLIC_REFRESH_SECONDS", "label": "公开快照刷新秒数", "group": "行情与资金流设置", "kind": "int", "default": "15", "effect": "restart"},
+    {"name": "DASHBOARD_NIUONE_MAINLINE_MINUTE_REFRESH_ENABLED", "label": "题材强度跟随全市场行情更新", "group": "行情与资金流设置", "kind": "bool", "default": "1", "effect": "restart"},
+    {
+        "name": "DASHBOARD_MARKET_BREADTH_SAMPLE_INTERVAL_SECONDS",
+        "label": "全市场行情采样间隔（秒）",
+        "group": "行情与资金流设置",
+        "kind": "int",
+        "default": "30",
+        "effect": "restart",
+        "min": "30",
+        "max": "600",
+        "help_title": "影响范围",
+        "help_summary": "控制交易时段内共享的腾讯沪深 A 股全市场逐股行情采样频率。",
+        "help_items": [
+            {
+                "label": "题材强度",
+                "description": "决定获取最新逐股价格并重新计算题材强度的频率；复用同一批行情，不会再向腾讯重复抓取。",
+            },
+            {
+                "label": "市场情绪",
+                "description": "决定红盘、绿盘、涨跌停、炸板和腾讯兜底成交额等聚合曲线的真实采样频率。",
+            },
+            {
+                "label": "请求负载",
+                "description": "间隔越短，全市场分片请求越频繁；请求不完整、超时或计算失败时继续保留上一份有效结果。",
+            },
+        ],
+        "help_footer": "仅在 A 股交易日 09:30–11:30、13:00–15:00 生效；允许 30–600 秒，保存后需重启 Dashboard。",
+    },
 
     {"name": "DASHBOARD_B1_SCHEDULE_ENABLED", "label": "启用实战定时运行", "group": "任务调度", "kind": "bool", "default": "1", "effect": "restart"},
     {"name": PRACTICE_SCHEDULE_TIMES_ENV, "label": "实战盘面总结、选股及交易时间点", "group": "选股与买卖设置", "kind": "time_list", "default": DEFAULT_PRACTICE_SCHEDULE_TIMES, "effect": "runtime"},
@@ -489,6 +569,12 @@ ENV_CONFIG_SCHEMA: list[dict[str, str]] = [
     {"name": PRESET_STRATEGY_TEXT_ENV, "label": "预设文字策略", "group": "选股与交易策略", "kind": "preset_strategy_text", "default": "", "effect": "runtime"},
     {"name": "DASHBOARD_B1_SCAN_TIMEOUT_SECONDS", "label": "实战选股扫描超时秒数", "group": "任务调度", "kind": "int", "default": "480", "effect": "restart"},
     {"name": "DASHBOARD_B1_SCAN_WORKERS", "label": "实战选股并发数", "group": "任务调度", "kind": "int", "default": "6", "effect": "restart"},
+    {"name": "DASHBOARD_KLINE_CACHE_ENABLED", "label": "启用本地日K缓存", "group": "任务调度", "kind": "bool", "default": "1", "effect": "restart"},
+    {"name": "DASHBOARD_KLINE_PREWARM_ENABLED", "label": "启用盘前日K预热", "group": "任务调度", "kind": "bool", "default": "1", "effect": "restart"},
+    {"name": "DASHBOARD_KLINE_PREWARM_TIME", "label": "盘前日K预热时间", "group": "任务调度", "kind": "time", "default": DEFAULT_KLINE_PREWARM_TIME, "effect": "restart"},
+    {"name": "DASHBOARD_KLINE_PREWARM_WORKERS", "label": "盘前日K预热并发数", "group": "任务调度", "kind": "int", "default": "12", "effect": "restart"},
+    {"name": "DASHBOARD_KLINE_PREWARM_TIMEOUT_SECONDS", "label": "盘前日K预热超时秒数", "group": "任务调度", "kind": "int", "default": "600", "effect": "restart"},
+    {"name": "DASHBOARD_KLINE_PREWARM_CATCHUP_MINUTES", "label": "盘前日K预热补跑窗口分钟", "group": "任务调度", "kind": "int", "default": "15", "effect": "restart"},
     {"name": "DASHBOARD_MANUAL_SCAN_REUSE_SECONDS", "label": "手动选股复用候选秒数", "group": "任务调度", "kind": "int", "default": "0", "effect": "restart"},
     {"name": "DASHBOARD_B1_SCHEDULE_CATCHUP_MINUTES", "label": "实战选股漏触发补跑窗口分钟", "group": "任务调度", "kind": "int", "default": "35", "effect": "restart"},
     {"name": "DASHBOARD_B1_SCHEDULE_STALE_SECONDS", "label": "实战选股运行中陈旧秒数", "group": "任务调度", "kind": "int", "default": "900", "effect": "restart"},
@@ -606,11 +692,15 @@ ENV_CONFIG_SCHEMA: list[dict[str, str]] = [
     {"name": "X_WATCHLIST_SENT_CONTEXT_REPAIR_MAX_ATTEMPTS", "label": "X 已发修复最大尝试", "group": "X 监控", "kind": "int", "default": "8", "effect": "next_run"},
     {"name": "X_WATCHLIST_SENT_CONTEXT_REPAIR_COOLDOWN_MINUTES", "label": "X 已发修复冷却分钟", "group": "X 监控", "kind": "int", "default": "20", "effect": "next_run"},
     {"name": "X_WATCHLIST_SENT_CONTEXT_REPAIR_ITEMS", "label": "X 已发修复条数", "group": "X 监控", "kind": "int", "default": "2", "effect": "next_run"},
+
+    {"name": "DASHBOARD_AUTO_VERSION_CHECK_ENABLED", "label": "开启自动检测新版本", "group": "关于", "kind": "bool", "default": "1", "effect": "runtime"},
 ]
 ENV_CONFIG_BY_NAME = {item["name"]: item for item in ENV_CONFIG_SCHEMA}
 ADMIN_VISIBLE_ENV_NAMES = [
     "DASHBOARD_ADMIN_PASSWORD",
     "DASHBOARD_PUBLIC_REFRESH_SECONDS",
+    "DASHBOARD_NIUONE_MAINLINE_MINUTE_REFRESH_ENABLED",
+    "DASHBOARD_MARKET_BREADTH_SAMPLE_INTERVAL_SECONDS",
     "DASHBOARD_US_FEATURES_ENABLED",
     "DASHBOARD_GROK_MODEL",
     "DASHBOARD_GROK_API_MODE",
@@ -705,6 +795,7 @@ ADMIN_VISIBLE_ENV_NAMES = [
     "DASHBOARD_INDUSTRY_FLOW_MORNING_END",
     "DASHBOARD_INDUSTRY_FLOW_AFTERNOON_START",
     "DASHBOARD_INDUSTRY_FLOW_AFTERNOON_END",
+    "DASHBOARD_AUTO_VERSION_CHECK_ENABLED",
 ]
 TRADER_RUNTIME_ENV_NAMES = {
     STOCK_UNIVERSE_ENV,
@@ -760,6 +851,7 @@ ENV_GROUP_ORDER = [
     "上游模型覆盖",
     "X 监控",
     "其他",
+    "关于",
 ]
 
 
@@ -1322,8 +1414,22 @@ def get_practice_payload_fast() -> dict[str, Any]:
         annotate_practice_snapshot(payload, mode="fast", history_scope="unavailable")
         return annotate_practice_payload_clock(payload)
 
+def _candidate_rows(payload: dict[str, Any], *keys: str) -> list[Any]:
+    """Return the first explicitly supplied candidate list, preserving empties.
+
+    Older caches may not contain ``trade_items`` and still need to fall back to
+    their display candidates. A present empty list, however, means the scanner
+    intentionally found no trade-ready candidates and must not be widened.
+    """
+    for key in keys:
+        if key in payload:
+            value = payload.get(key)
+            return value if isinstance(value, list) else []
+    return []
+
+
 def normalize_b1_payload_for_trader(b1_payload: dict[str, Any]) -> dict[str, Any]:
-    items = b1_payload.get("trade_items") or b1_payload.get("items") or b1_payload.get("candidates") or []
+    items = _candidate_rows(b1_payload, "trade_items", "items", "candidates")
     payload = {"items": items, "generated_at": b1_payload.get("generated_at", "")}
     if isinstance(b1_payload.get("market_snapshot"), dict):
         payload["market_snapshot"] = b1_payload.get("market_snapshot")
@@ -1489,12 +1595,22 @@ def refresh_b1_candidate_cache_from_current_pool() -> dict[str, Any]:
                 "theme_basis": best.get("theme_basis"),
                 "mainline_state": best.get("mainline_state"),
                 "mainline_raw_state": best.get("mainline_raw_state"),
+                "mainline_intraday_state": best.get("mainline_intraday_state"),
                 "mainline_score": best.get("mainline_score"),
                 "mainline_mode": best.get("mainline_mode"),
                 "mainline_primary": best.get("mainline_primary"),
                 "mainline_secondary": best.get("mainline_secondary"),
                 "mainline_selected": best.get("mainline_selected"),
                 "mainline_confirmation_count": best.get("mainline_confirmation_count"),
+                "mainline_intraday_confirmation_count": best.get("mainline_intraday_confirmation_count"),
+                "mainline_cross_day_persistent": best.get("mainline_cross_day_persistent"),
+                "mainline_cross_day_confirmed": best.get("mainline_cross_day_confirmed"),
+                "mainline_confirmed": best.get("mainline_confirmed"),
+                "mainline_core_overlap_count": best.get("mainline_core_overlap_count"),
+                "mainline_core_overlap_ratio": best.get("mainline_core_overlap_ratio"),
+                "mainline_continued_core_codes": best.get("mainline_continued_core_codes"),
+                "mainline_as_of_date": best.get("mainline_as_of_date"),
+                "mainline_previous_as_of_date": best.get("mainline_previous_as_of_date"),
                 "mainline_state_streak": best.get("mainline_state_streak"),
                 "mainline_score_change": best.get("mainline_score_change"),
                 "strong_stock_count": best.get("strong_stock_count"),
@@ -1502,6 +1618,8 @@ def refresh_b1_candidate_cache_from_current_pool() -> dict[str, Any]:
                 "leader_concentration": best.get("leader_concentration"),
                 "single_stock_dominated": best.get("single_stock_dominated"),
                 "stock_role": best.get("stock_role"),
+                "stock_leader_rank": best.get("stock_leader_rank"),
+                "stock_leader_tier": best.get("stock_leader_tier"),
                 "stock_strong": best.get("stock_strong"),
                 "stock_strong_score": best.get("stock_strong_score"),
                 "stock_sector_rank": best.get("stock_sector_rank"),
@@ -1517,11 +1635,17 @@ def refresh_b1_candidate_cache_from_current_pool() -> dict[str, Any]:
                 "industry_flow_generated_at": best.get("industry_flow_generated_at"),
                 "ema20": best.get("ema20"),
                 "ema50": best.get("ema50"),
+                "atr": best.get("atr"),
+                "atr_period": best.get("atr_period"),
                 "atr20": best.get("atr20"),
                 "stop_price": best.get("stop_price"),
                 "stop_source": best.get("stop_source"),
                 "stop_distance_pct": best.get("stop_distance_pct"),
                 "stop_atr": best.get("stop_atr"),
+                "max_stop_distance_pct": best.get("max_stop_distance_pct"),
+                "max_stop_atr": best.get("max_stop_atr"),
+                "max_entry_change_pct": best.get("max_entry_change_pct"),
+                "max_entry_extension_atr": best.get("max_entry_extension_atr"),
                 "gap_buffer_pct": best.get("gap_buffer_pct"),
                 "execution_buffer_pct": best.get("execution_buffer_pct"),
                 "effective_loss_distance_pct": best.get("effective_loss_distance_pct"),
@@ -1702,7 +1826,27 @@ def maybe_run_practice_decision_async(b1_payload: dict[str, Any]) -> None:
     threading.Thread(target=_worker, name="niuniu-practice-decision", daemon=True).start()
 
 def load_practice_candidates_cache() -> dict[str, Any]:
+    strategy_suite = active_strategy_suite(
+        os.environ.get(ACTIVE_STRATEGY_ENV),
+        os.environ.get(STRATEGY_SOURCE_ENV),
+        os.environ.get(PERSONA_STRATEGY_ENV),
+    )
+    active_strategy_ids = enabled_strategy_ids(
+        os.environ.get(PERSONA_STRATEGY_ENV),
+        os.environ.get(STRATEGY_SOURCE_ENV),
+        os.environ.get(ACTIVE_STRATEGY_ENV),
+    )
+    strategy_meta = enabled_strategy_meta(
+        os.environ.get(PERSONA_STRATEGY_ENV),
+        os.environ.get(STRATEGY_SOURCE_ENV),
+        os.environ.get(ACTIVE_STRATEGY_ENV),
+    )
+    suite_labels = {
+        str(item.get("id") or ""): str(item.get("label") or item.get("id") or "")
+        for item in strategy_suite_options()
+    }
     errors: list[str] = []
+    stale_cache_found = False
     for cache_file in (MULTI_STRATEGY_CACHE_FILE, B1_CACHE_FILE):
         try:
             if not cache_file.exists():
@@ -1711,17 +1855,206 @@ def load_practice_candidates_cache() -> dict[str, Any]:
             if not isinstance(parsed, dict):
                 raise ValueError(f"候选缓存格式无效：{cache_file}")
             items = parsed.get("items") or parsed.get("candidates") or []
+            cached_ids: set[str] = set()
+            explicit_ids = parsed.get("enabled_strategy_ids")
+            if isinstance(explicit_ids, list):
+                cached_ids.update(str(value) for value in explicit_ids if str(value or "").strip())
+            cached_meta = parsed.get("strategy_meta")
+            if not cached_ids and isinstance(cached_meta, dict):
+                cached_ids.update(str(value) for value in cached_meta if str(value or "").strip())
+            for field in ("items", "candidates", "trade_items"):
+                rows = parsed.get(field)
+                for item in rows if isinstance(rows, list) else []:
+                    if not isinstance(item, dict):
+                        continue
+                    strategy_id = str(item.get("best_strategy") or item.get("strategy") or "").strip()
+                    if strategy_id:
+                        cached_ids.add(strategy_id)
+            cached_suite = str(parsed.get("strategy_suite") or "").strip()
+            if (
+                (cached_suite and cached_suite != strategy_suite)
+                or (cached_ids and not cached_ids.issubset(active_strategy_ids))
+            ):
+                stale_cache_found = True
+                continue
+            def active_rows(value: Any) -> list[dict[str, Any]]:
+                if not isinstance(value, list):
+                    return []
+                return [
+                    item
+                    for item in value
+                    if isinstance(item, dict)
+                    and (
+                        not str(item.get("best_strategy") or item.get("strategy") or "").strip()
+                        or str(item.get("best_strategy") or item.get("strategy") or "").strip()
+                        in active_strategy_ids
+                    )
+                ]
+
+            display_items = sort_candidates_by_score(active_rows(items))
+            candidates = sort_candidates_by_score(
+                active_rows(_candidate_rows(parsed, "candidates", "items"))
+            )
+            trade_items = sort_candidates_by_score(
+                active_rows(_candidate_rows(parsed, "trade_items", "items", "candidates"))
+            )
             return {
                 **parsed,
                 "generated_at": parsed.get("generated_at", ""),
-                "count": parsed.get("count", len(items)),
-                "items": items,
+                "count": len(display_items),
+                "items": display_items,
+                "candidates": candidates,
+                "trade_items": trade_items,
+                "trade_count": len(trade_items),
+                "strategy_suite": strategy_suite,
+                "enabled_strategy_ids": sorted(active_strategy_ids),
+                "strategy_meta": strategy_meta,
+                "strategy_cache_stale": False,
+                "refresh_required": False,
             }
         except (OSError, ValueError) as exc:
             errors.append(f"{cache_file.name}: {exc}")
+    base = {
+        "items": [],
+        "candidates": [],
+        "trade_items": [],
+        "count": 0,
+        "trade_count": 0,
+        "generated_at": "",
+        "strategy_suite": strategy_suite,
+        "enabled_strategy_ids": sorted(active_strategy_ids),
+        "strategy_meta": strategy_meta,
+        "strategy_distribution": {},
+        "strategy_cache_stale": stale_cache_found,
+        "refresh_required": stale_cache_found,
+    }
+    if stale_cache_found:
+        label = suite_labels.get(strategy_suite, strategy_suite)
+        base["status_message"] = f"已切换为{label}，正在等待按当前策略重新扫描候选股"
     if errors:
-        return {"error": "; ".join(errors), "items": [], "count": 0, "generated_at": ""}
-    return {"items": [], "count": 0, "generated_at": ""}
+        base["error"] = "; ".join(errors)
+    return base
+
+
+def load_niuone_mainline_cache_payload() -> dict[str, Any]:
+    """Load the newest dedicated or migration-era NiuOne mainline payload."""
+    payloads: list[dict[str, Any]] = []
+    for cache_file in (
+        NIUONE_MAINLINE_MINUTE_CACHE_FILE,
+        NIUONE_MAINLINE_CACHE_FILE,
+        MULTI_STRATEGY_CACHE_FILE,
+        B1_CACHE_FILE,
+    ):
+        try:
+            parsed = json.loads(cache_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        if isinstance(parsed, dict) and isinstance(parsed.get("niuone_context"), dict):
+            payloads.append(parsed)
+    if not payloads:
+        return {}
+    return max(payloads, key=lambda payload: str(payload.get("generated_at") or ""))
+
+
+def load_niuone_mainline_view() -> dict[str, Any]:
+    return build_niuone_mainline_view(load_niuone_mainline_cache_payload())
+
+
+def get_niuone_mainline_minute_engine() -> NiuOneMinuteEngine:
+    """Return one in-process engine for the active private cache paths."""
+
+    global NIUONE_MAINLINE_MINUTE_ENGINE, NIUONE_MAINLINE_MINUTE_ENGINE_PATHS
+    resolved_paths = (str(kline_cache_path()), str(STOCK_INDUSTRY_CACHE_FILE))
+    with NIUONE_MAINLINE_MINUTE_STATE_LOCK:
+        if (
+            NIUONE_MAINLINE_MINUTE_ENGINE is None
+            or NIUONE_MAINLINE_MINUTE_ENGINE_PATHS != resolved_paths
+        ):
+            NIUONE_MAINLINE_MINUTE_ENGINE = NiuOneMinuteEngine(
+                kline_cache_path=Path(resolved_paths[0]),
+                industry_cache_path=Path(resolved_paths[1]),
+            )
+            NIUONE_MAINLINE_MINUTE_ENGINE_PATHS = resolved_paths
+        return NIUONE_MAINLINE_MINUTE_ENGINE
+
+
+def run_niuone_mainline_minute_refresh(
+    quote_snapshot: Mapping[str, Any],
+    *,
+    engine: NiuOneMinuteEngine | None = None,
+) -> dict[str, Any]:
+    """Recalculate the theme cache from fresh quotes and local slow inputs."""
+
+    quote_generated_at = str(quote_snapshot.get("generated_at") or "")[:19]
+    existing = read_json_cache(NIUONE_MAINLINE_MINUTE_CACHE_FILE, None) or {}
+    if (
+        quote_generated_at
+        and str(existing.get("quote_generated_at") or "")[:19] >= quote_generated_at
+    ):
+        return {"skipped": True, "reason": "quote_already_processed"}
+    previous_payload = load_niuone_mainline_cache_payload()
+    flow_rows = read_json_cache(MONEY_FLOW_SNAPSHOT_FILE, None) or {}
+    if str(flow_rows.get("generated_at") or "")[:10] != quote_generated_at[:10]:
+        flow_rows = {}
+    scan = (engine or get_niuone_mainline_minute_engine()).build_scan(
+        quote_snapshot,
+        previous_payload=previous_payload,
+        flow_rows=flow_rows,
+        now=current_cn_datetime(),
+    )
+    payload = write_niuone_mainline_cache(NIUONE_MAINLINE_MINUTE_CACHE_FILE, scan)
+    invalidate_api_cache(NIUONE_MAINLINE_CACHE_KEY)
+    print(
+        "[Theme strength] minute quotes updated "
+        f"quote={payload.get('quote_generated_at') or 'unknown'} "
+        f"duration_ms={payload.get('calculation_duration_ms') or 0}",
+        flush=True,
+    )
+    return {
+        "updated": True,
+        "quote_generated_at": payload.get("quote_generated_at") or "",
+        "generated_at": payload.get("generated_at") or "",
+    }
+
+
+def _niuone_mainline_minute_worker() -> None:
+    global NIUONE_MAINLINE_MINUTE_PENDING, NIUONE_MAINLINE_MINUTE_THREAD
+    while True:
+        with NIUONE_MAINLINE_MINUTE_STATE_LOCK:
+            snapshot = NIUONE_MAINLINE_MINUTE_PENDING
+            NIUONE_MAINLINE_MINUTE_PENDING = None
+            if snapshot is None:
+                NIUONE_MAINLINE_MINUTE_THREAD = None
+                return
+        try:
+            run_niuone_mainline_minute_refresh(snapshot)
+        except Exception as exc:
+            print(
+                f"[WARN] Minute theme-strength refresh retained previous cache: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+
+def accept_niuone_mainline_quote_snapshot(quote_snapshot: dict[str, Any]) -> bool:
+    """Coalesce fresh quote snapshots into one non-overlapping minute worker."""
+
+    global NIUONE_MAINLINE_MINUTE_PENDING, NIUONE_MAINLINE_MINUTE_THREAD
+    if not NIUONE_MAINLINE_MINUTE_REFRESH_ENABLED:
+        return False
+    with NIUONE_MAINLINE_MINUTE_STATE_LOCK:
+        NIUONE_MAINLINE_MINUTE_PENDING = dict(quote_snapshot)
+        if NIUONE_MAINLINE_MINUTE_THREAD and NIUONE_MAINLINE_MINUTE_THREAD.is_alive():
+            return False
+        thread = threading.Thread(
+            target=_niuone_mainline_minute_worker,
+            name="niuone-mainline-minute",
+            daemon=True,
+        )
+        NIUONE_MAINLINE_MINUTE_THREAD = thread
+        thread.start()
+        return True
 
 
 def summarize_b1_scan_failure(stderr: str, stdout: str, limit: int = 900) -> str:
@@ -1736,6 +2069,175 @@ def summarize_b1_scan_failure(stderr: str, stdout: str, limit: int = 900) -> str
     if len(detail) > limit:
         detail = detail[: max(0, limit - 3)] + "..."
     return detail
+
+
+def niuone_mainline_cache_generated_for_slot(slot_key: str) -> bool:
+    """Return whether the independent cache already covers a schedule slot."""
+    if not slot_key:
+        return False
+    try:
+        payload = json.loads(NIUONE_MAINLINE_CACHE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return False
+    generated_at = str(payload.get("generated_at") or "")[:16]
+    return generated_at[:10] == slot_key[:10] and generated_at >= slot_key[:16]
+
+
+def run_independent_niuone_mainline_scan(
+    schedule_slot: str = "",
+    *,
+    runner: Any | None = None,
+) -> dict[str, Any]:
+    """Refresh only the full-market theme cache without touching trade caches."""
+    if schedule_slot and niuone_mainline_cache_generated_for_slot(schedule_slot):
+        return {"skipped": True, "reason": "slot_already_generated"}
+    if not NIUONE_MAINLINE_SCAN_LOCK.acquire(blocking=False):
+        return {"skipped": True, "reason": "scan_in_progress"}
+    try:
+        script = Path(
+            os.environ.get("DASHBOARD_B1_SCANNER", ENTRYPOINT_DIR / "multi_strategy_screen.py")
+        ).expanduser()
+        if not script.exists():
+            return {"error": f"扫描脚本不存在：{script}"}
+        active_runner = runner or subprocess.run
+        result = active_runner(
+            [sys.executable, str(script), "--json", "--niuone-mainline-only"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=B1_SCAN_TIMEOUT_SECONDS,
+        )
+        if result.returncode != 0:
+            error = summarize_b1_scan_failure(str(result.stderr or ""), "")
+            print(f"[WARN] Independent theme-strength scan failed: {error}", file=sys.stderr, flush=True)
+            return {"error": error}
+        if runner is None and not NIUONE_MAINLINE_CACHE_FILE.exists():
+            return {"error": "独立题材扫描完成但未生成缓存"}
+        invalidate_api_cache(NIUONE_MAINLINE_CACHE_KEY)
+        print(
+            f"[Theme strength] independent scan updated for {schedule_slot or 'manual'}",
+            flush=True,
+        )
+        return {"updated": True, "schedule_slot": schedule_slot}
+    except subprocess.TimeoutExpired:
+        error = f"独立题材扫描超时（{B1_SCAN_TIMEOUT_SECONDS}s）"
+        print(f"[WARN] {error}", file=sys.stderr, flush=True)
+        return {"error": error}
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        print(f"[WARN] Independent theme-strength scan error: {error}", file=sys.stderr, flush=True)
+        return {"error": error}
+    finally:
+        NIUONE_MAINLINE_SCAN_LOCK.release()
+
+
+def start_independent_niuone_mainline_scan(schedule_slot: str = "") -> bool:
+    """Start the research scan in the background when no equivalent run exists."""
+    global NIUONE_MAINLINE_SCAN_THREAD
+    if schedule_slot and niuone_mainline_cache_generated_for_slot(schedule_slot):
+        return False
+    if NIUONE_MAINLINE_SCAN_LOCK.locked():
+        return False
+    thread = threading.Thread(
+        target=run_independent_niuone_mainline_scan,
+        args=(schedule_slot,),
+        name="niuone-mainline-scan",
+        daemon=True,
+    )
+    NIUONE_MAINLINE_SCAN_THREAD = thread
+    thread.start()
+    return True
+
+
+def kline_prewarm_due(now: datetime | None = None) -> bool:
+    """Return whether today's bounded pre-market cache refresh should start."""
+    if not KLINE_PREWARM_ENABLED:
+        return False
+    current = now or datetime.now()
+    if not is_a_share_trading_day_for_dashboard(current):
+        return False
+    scheduled = _b1_schedule_slot_datetime(current, KLINE_PREWARM_TIME)
+    if scheduled is None:
+        return False
+    age_seconds = (current - scheduled).total_seconds()
+    if age_seconds < 0 or age_seconds > max(0, KLINE_PREWARM_CATCHUP_MINUTES) * 60:
+        return False
+    if prewarm_completed_for_date(current.strftime("%Y-%m-%d"), path=kline_cache_path()):
+        return False
+    if KLINE_PREWARM_LOCK.locked():
+        return False
+    return time.time() - KLINE_PREWARM_LAST_ATTEMPT_TS >= max(30, KLINE_PREWARM_RETRY_SECONDS)
+
+
+def run_kline_prewarm(
+    target_date: str = "",
+    *,
+    runner: Any | None = None,
+) -> dict[str, Any]:
+    """Run the full-market prewarm subprocess without touching trading caches."""
+    global KLINE_PREWARM_LAST_ATTEMPT_TS
+    if not KLINE_PREWARM_LOCK.acquire(blocking=False):
+        return {"skipped": True, "reason": "prewarm_in_progress"}
+    KLINE_PREWARM_LAST_ATTEMPT_TS = time.time()
+    try:
+        run_date = str(target_date or datetime.now().strftime("%Y-%m-%d"))[:10]
+        if prewarm_completed_for_date(run_date, path=kline_cache_path()):
+            return {"skipped": True, "reason": "already_completed", "target_date": run_date}
+        script = Path(
+            os.environ.get("DASHBOARD_B1_SCANNER", ENTRYPOINT_DIR / "multi_strategy_screen.py")
+        ).expanduser()
+        if not script.exists():
+            return {"error": f"扫描脚本不存在：{script}"}
+        active_runner = runner or subprocess.run
+        result = active_runner(
+            [sys.executable, str(script), "--json", "--prewarm-kline-cache"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=KLINE_PREWARM_TIMEOUT_SECONDS,
+        )
+        if result.returncode != 0:
+            error = summarize_b1_scan_failure(str(result.stderr or ""), "")
+            print(f"[WARN] Pre-market K-line prewarm failed: {error}", file=sys.stderr, flush=True)
+            return {"error": error, "target_date": run_date}
+        if runner is None and not prewarm_completed_for_date(run_date, path=kline_cache_path()):
+            return {"error": "盘前日K预热完成但有效覆盖率不足", "target_date": run_date}
+        print(f"[K-line cache] pre-market refresh completed for {run_date}", flush=True)
+        return {"updated": True, "target_date": run_date}
+    except subprocess.TimeoutExpired:
+        error = f"盘前日K预热超时（{KLINE_PREWARM_TIMEOUT_SECONDS}s）"
+        print(f"[WARN] {error}", file=sys.stderr, flush=True)
+        return {"error": error, "target_date": str(target_date or "")[:10]}
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        print(f"[WARN] Pre-market K-line prewarm error: {error}", file=sys.stderr, flush=True)
+        return {"error": error, "target_date": str(target_date or "")[:10]}
+    finally:
+        KLINE_PREWARM_LOCK.release()
+
+
+def start_kline_prewarm(target_date: str = "") -> bool:
+    """Start one pre-market cache refresh in the background."""
+    global KLINE_PREWARM_RUN_THREAD
+    if KLINE_PREWARM_LOCK.locked():
+        return False
+    thread = threading.Thread(
+        target=run_kline_prewarm,
+        args=(target_date,),
+        name="kline-cache-prewarm",
+        daemon=True,
+    )
+    KLINE_PREWARM_RUN_THREAD = thread
+    thread.start()
+    return True
+
+
+def kline_prewarm_schedule_loop() -> None:
+    while True:
+        current = datetime.now()
+        if kline_prewarm_due(current):
+            start_kline_prewarm(current.strftime("%Y-%m-%d"))
+        time.sleep(15)
 
 
 def _trigger_b1_scan_unlocked(
@@ -1754,9 +2256,9 @@ def _trigger_b1_scan_unlocked(
         result = subprocess.run(args, capture_output=True, text=True, timeout=B1_SCAN_TIMEOUT_SECONDS)
         if result.returncode == 0:
             data = json.loads(result.stdout)
-            items = data.get("items") or data.get("candidates") or []
-            candidates = data.get("candidates") or items
-            trade_items = data.get("trade_items") or items
+            items = _candidate_rows(data, "items", "candidates")
+            candidates = _candidate_rows(data, "candidates", "items")
+            trade_items = _candidate_rows(data, "trade_items", "items", "candidates")
             schedule_meta = {}
             if schedule_slot:
                 schedule_meta = {
@@ -1832,7 +2334,7 @@ def recent_practice_candidates_for_manual_cycle() -> dict[str, Any] | None:
     if PRACTICE_MANUAL_SCAN_REUSE_SECONDS <= 0:
         return None
     cache = load_practice_candidates_cache()
-    if cache.get("error"):
+    if cache.get("error") or cache.get("refresh_required") or cache.get("strategy_cache_stale"):
         return None
     generated_at = str(cache.get("generated_at") or "")[:19]
     try:
@@ -1857,6 +2359,8 @@ def _run_practice_manual_cycle() -> None:
             cache = trigger_b1_scan(force=True, decision_mode="none")
         if cache.get("error"):
             raise RuntimeError(str(cache.get("error")))
+        if not isinstance(cache.get("niuone_context"), dict):
+            start_independent_niuone_mainline_scan()
 
         _set_practice_manual_cycle_state(
             stage="trading",
@@ -2074,6 +2578,7 @@ def run_scheduled_b1_scan(slot_key: str) -> None:
         _mark_b1_schedule_slot(slot_key, "running", lag_seconds=round(lag_seconds, 1), run_kind=run_kind)
         summary = refresh_practice_market_summary_for_decision("scheduled")
         if b1_cache_generated_for_slot(slot_key):
+            start_independent_niuone_mainline_scan(slot_key)
             _mark_b1_schedule_slot(
                 slot_key,
                 "ok",
@@ -2090,6 +2595,7 @@ def run_scheduled_b1_scan(slot_key: str) -> None:
         )
         with API_RESPONSE_LOCK:
             API_RESPONSE_CACHE.pop(PRACTICE_CANDIDATES_CACHE_KEY, None)
+        start_independent_niuone_mainline_scan(slot_key)
         if cache.get("error"):
             _mark_b1_schedule_slot(slot_key, "error", error=str(cache.get("error") or "")[:500])
             print(f"[Practice schedule] {slot_key} failed: {cache.get('error')}", flush=True)
@@ -2506,6 +3012,20 @@ def _cached_market_breadth_payload(now: datetime) -> dict[str, Any] | None:
     )
 
 
+def _fetch_market_turnover_estimate_with_persistent_profile(
+    generated_at: datetime,
+    fallback_actual_turnover_yi: Any,
+) -> dict[str, Any]:
+    return fetch_market_turnover_estimate(
+        generated_at,
+        fallback_actual_turnover_yi,
+        profile_fetcher=lambda before_date: fetch_turnover_profile(
+            before_date,
+            persistent_cache_path=TURNOVER_PROFILE_CACHE_FILE,
+        ),
+    )
+
+
 def produce_market_breadth_data() -> dict[str, Any]:
     """Fetch, validate, persist, and project one market-breadth observation."""
 
@@ -2523,7 +3043,16 @@ def produce_market_breadth_data() -> dict[str, Any]:
                 interval_seconds=MARKET_BREADTH_SAMPLE_INTERVAL_SECONDS,
             )
         try:
-            snapshot = fetch_tencent_market_breadth()
+            snapshot = fetch_tencent_market_breadth(
+                turnover_estimate_fetcher=(
+                    _fetch_market_turnover_estimate_with_persistent_profile
+                ),
+                quote_snapshot_consumer=(
+                    accept_niuone_mainline_quote_snapshot
+                    if NIUONE_MAINLINE_MINUTE_REFRESH_ENABLED
+                    else None
+                )
+            )
             samples = record_market_breadth_sample(snapshot, now=current)
             compact = compact_market_breadth_sample(snapshot)
             if (
@@ -2568,7 +3097,7 @@ def market_breadth_sampling_loop(
     next_due = time.monotonic()
     while not stop_event.is_set():
         interval = max(
-            60.0,
+            30.0,
             float(
                 MARKET_BREADTH_SAMPLE_INTERVAL_SECONDS
                 if poll_seconds is None
@@ -2793,6 +3322,21 @@ def start_b1_scheduler() -> None:
     B1_SCHEDULE_THREAD = threading.Thread(target=b1_schedule_loop, name="b1-scheduler", daemon=True)
     B1_SCHEDULE_THREAD.start()
     print(f"Practice schedule enabled: {', '.join(PRACTICE_SCHEDULE_TIMES)}", flush=True)
+
+
+def start_kline_prewarm_scheduler() -> None:
+    global KLINE_PREWARM_SCHEDULER_THREAD
+    if not KLINE_PREWARM_ENABLED:
+        return
+    if KLINE_PREWARM_SCHEDULER_THREAD and KLINE_PREWARM_SCHEDULER_THREAD.is_alive():
+        return
+    KLINE_PREWARM_SCHEDULER_THREAD = threading.Thread(
+        target=kline_prewarm_schedule_loop,
+        name="kline-prewarm-scheduler",
+        daemon=True,
+    )
+    KLINE_PREWARM_SCHEDULER_THREAD.start()
+    print(f"K-line prewarm schedule enabled: {KLINE_PREWARM_TIME}", flush=True)
 
 
 def trade_minute_from_hhmm(hhmm: str) -> int | None:
@@ -3541,6 +4085,16 @@ def us_features_enabled(env_values: dict[str, str] | None = None) -> bool:
     return str(raw).strip().lower() in TRUTHY_VALUES
 
 
+def auto_version_check_enabled(env_values: dict[str, str] | None = None) -> bool:
+    values = env_values if env_values is not None else parse_env_file()
+    raw = (
+        os.environ.get("DASHBOARD_AUTO_VERSION_CHECK_ENABLED")
+        if "DASHBOARD_AUTO_VERSION_CHECK_ENABLED" in os.environ
+        else values.get("DASHBOARD_AUTO_VERSION_CHECK_ENABLED", "1")
+    )
+    return str(raw).strip().lower() in TRUTHY_VALUES
+
+
 def admin_visible_env_names(env_values: dict[str, str] | None = None) -> list[str]:
     return list(ADMIN_VISIBLE_ENV_NAMES)
 
@@ -3837,6 +4391,7 @@ ADMIN_GROUP_NOTES = {
     "选股与交易策略": "选择一套独立策略；基础策略、Z哥、李大霄、板块潮汐、牛牛战法和预设文字策略的候选、买入、卖出、仓位与 Prompt 规则互不混用。",
     "盘面监控生产时间点": "直接填写北京时间 HH:MM；隔夜美股总结默认交易日 08:00 生成，A 股盘面监控在交易时段触发；长度默认：上下文 128000 tokens，最大输出 4096 tokens。",
     "行情与资金流设置": "统一管理公开快照、指数刷新和行业资金流动画。播放速度、每侧行业数量、采样间隔及上午/下午采样窗口均支持运行时保存后生效；时间使用北京时间 HH:MM，默认 09:25～11:31、13:00～15:01。",
+    "关于": "查看项目作者、源代码仓库、开源许可和版本信息，并控制首页是否在打开或重新加载时自动检测新版本。",
 }
 ADMIN_SETTING_GROUPS: tuple[dict[str, str], ...] = (
     {
@@ -3916,6 +4471,12 @@ ADMIN_SETTING_GROUPS: tuple[dict[str, str], ...] = (
         "name": "行情与资金流设置",
         "summary": "调整指数刷新、资金流展示数量、播放速度、采样频率和时间窗口。",
         "icon": "行情",
+    },
+    {
+        "slug": "about",
+        "name": "关于",
+        "summary": "查看作者、代码仓库、开源许可和版本信息。",
+        "icon": "关于",
     },
 )
 ADMIN_SETTING_GROUP_BY_SLUG = {
@@ -4251,9 +4812,30 @@ def validate_business_updates(updates: dict[str, str]) -> None:
             "DASHBOARD_B3_EXIT_TIME",
             "DASHBOARD_TIME_EXIT_TIME",
             "DASHBOARD_TIME_STOP_EXIT_TIME",
+            "DASHBOARD_KLINE_PREWARM_TIME",
             *INDUSTRY_FLOW_WINDOW_CONFIG_NAMES,
         }:
             normalize_env_update(name, value, "time")
+        elif name in {
+            "DASHBOARD_KLINE_PREWARM_WORKERS",
+            "DASHBOARD_KLINE_PREWARM_TIMEOUT_SECONDS",
+            "DASHBOARD_KLINE_PREWARM_CATCHUP_MINUTES",
+        } and str(value or "").strip():
+            number = int(value)
+            minimum, maximum = {
+                "DASHBOARD_KLINE_PREWARM_WORKERS": (1, 16),
+                "DASHBOARD_KLINE_PREWARM_TIMEOUT_SECONDS": (60, 1800),
+                "DASHBOARD_KLINE_PREWARM_CATCHUP_MINUTES": (0, 120),
+            }[name]
+            if number < minimum or number > maximum:
+                raise ValueError(f"{name} 必须在 {minimum} 到 {maximum} 之间")
+        elif (
+            name == "DASHBOARD_MARKET_BREADTH_SAMPLE_INTERVAL_SECONDS"
+            and str(value or "").strip()
+        ):
+            number = int(value)
+            if number < 30 or number > 600:
+                raise ValueError(f"{name} 必须在 30 到 600 之间")
         elif name == "X_WATCHLIST_ACCOUNTS":
             normalize_handle_list_update(value)
         elif name == STOCK_UNIVERSE_ENV:
@@ -4854,6 +5436,15 @@ def build_admin_config_payload() -> dict[str, Any]:
             "strategy_preset_name": PRESET_STRATEGY_TEXT_ENV,
             "strategy_preset_value": "preset_text",
         },
+        "about": {
+            "author": PROJECT_AUTHOR,
+            "author_url": PROJECT_AUTHOR_URL,
+            "repository": PROJECT_REPOSITORY,
+            "repository_url": PROJECT_REPOSITORY_URL,
+            "license": PROJECT_LICENSE,
+            "license_url": PROJECT_LICENSE_URL,
+            "current_version": CURRENT_VERSION,
+        },
         "secret_placeholder": SECRET_PLACEHOLDER,
     }
 
@@ -5012,13 +5603,13 @@ def build_version_status() -> dict[str, Any]:
     return result
 
 
-def get_version_status() -> dict[str, Any]:
+def get_version_status(force_refresh: bool = False) -> dict[str, Any]:
     now = time.time()
     with VERSION_CHECK_LOCK:
         cached = VERSION_CHECK_CACHE.get("payload")
         cached_at = float(VERSION_CHECK_CACHE.get("ts") or 0)
         cached_ttl = int(VERSION_CHECK_CACHE.get("ttl") or 0)
-        if isinstance(cached, dict) and now - cached_at < cached_ttl:
+        if not force_refresh and isinstance(cached, dict) and now - cached_at < cached_ttl:
             return dict(cached)
         payload = build_version_status()
         ttl = VERSION_CHECK_TTL_SECONDS if payload["check_ok"] else VERSION_CHECK_FAILURE_TTL_SECONDS

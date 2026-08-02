@@ -22,13 +22,37 @@ from strategies.prompts import build_position_exit_prompt_section, build_strateg
 
 
 class StrategyPackageTests(unittest.TestCase):
+    def test_niuone_is_the_default_strategy_suite(self):
+        names = (
+            registry.ACTIVE_STRATEGY_ENV,
+            registry.STRATEGY_SOURCE_ENV,
+            registry.PERSONA_STRATEGY_ENV,
+        )
+        saved = {name: os.environ.get(name) for name in names}
+        try:
+            for name in names:
+                os.environ.pop(name, None)
+
+            self.assertEqual(registry.default_enabled_persona_strategies_value(), "niuone")
+            self.assertEqual(registry.active_strategy_suite(), "niuone")
+            self.assertEqual(
+                registry.enabled_strategy_ids(),
+                {"niu_leader", "niu_pullback", "niu_emerging", "niu_reversal_probe"},
+            )
+        finally:
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
     def test_strategy_suite_prompts_do_not_include_inactive_suites(self):
         cases = {
             "base": ("基础策略：", ("Z哥评分基准", "李大霄")),
             "zettaranc": ("Z哥评分基准", ("基础策略：", "李大霄")),
             "li_daxiao_bottom": ("李大霄", ("Z哥评分基准", "基础策略：")),
             "sector_tide": ("板块潮汐（市场→行业→个股", ("Z哥评分基准", "基础策略：", "李大霄")),
-            "niuone": ("牛牛战法（强势股→主题共振", ("板块潮汐（市场→行业→个股", "Z哥评分基准", "基础策略：", "李大霄")),
+            "niuone": ("牛牛战法（日内反转试仓→跨日启动→主线领航/回踩", ("板块潮汐（市场→行业→个股", "Z哥评分基准", "基础策略：", "李大霄")),
         }
         for suite, (included, excluded) in cases.items():
             sections = build_strategy_prompt_sections(
@@ -55,10 +79,17 @@ class StrategyPackageTests(unittest.TestCase):
         self.assertIn("30%是单票绝对上限", active)
         self.assertIn("25%是单票绝对上限", active)
         self.assertIn("15%是单票绝对上限", active)
+        self.assertIn("反转试仓仅≤0.35%/0.30%/0.25%", active)
+        self.assertIn("间隔≥20分钟的两次快照确认", active)
+        self.assertIn("当日只建一次不超过5%的试仓", active)
         self.assertIn("单笔权益风险≤1.50%/1.00%/0.60%", active)
         self.assertIn("总仓≤70%/55%/35%", active)
         self.assertIn("主题敞口≤55%/40%/25%", active)
+        self.assertIn("主题敞口≤12%/10%/8%", active)
         self.assertIn("策略同时最多持有5只", active)
+        self.assertIn("strong_score前三且仍为强势股", active)
+        self.assertIn("第一名涨停或无有效买点时可顺延", active)
+        self.assertIn("连续两个交易日跌出行业前三龙头梯队时换出", active)
         self.assertNotIn("单笔权益风险≤0.25%/0.18%/0.10%", active)
         self.assertNotIn("总仓≤40%/28%/15%", active)
 
@@ -85,7 +116,7 @@ class StrategyPackageTests(unittest.TestCase):
 
         self.assertIn("单笔权益风险分别≤1.50%/1.00%/0.60%", discipline)
         self.assertIn("总仓≤70%/55%/35%", discipline)
-        self.assertIn("领航/回踩/启动单票30%/25%/15%", discipline)
+        self.assertIn("领航/回踩/启动/反转试仓单票30%/25%/15%/5%", discipline)
         self.assertIn("同时最多持有5只", discipline)
         self.assertNotIn("单笔权益风险分别≤0.25%/0.18%/0.10%", discipline)
 
@@ -116,6 +147,7 @@ class StrategyPackageTests(unittest.TestCase):
         )
         self.assertIn("牛牛战法历史持仓退出纪律", niuone_exits)
         self.assertIn("strategy_mark=牛牛领航", niuone_exits)
+        self.assertIn("连续两个交易日跌出强势行业前三龙头梯队时换出", niuone_exits)
 
     def test_legacy_registry_is_a_compatibility_view(self):
         self.assertIs(legacy_registry.STRATEGY_DEFINITIONS, registry.STRATEGY_DEFINITIONS)

@@ -4,6 +4,7 @@ import os
 import sys
 import threading
 import time
+import tempfile
 import types
 import unittest
 import urllib.error
@@ -80,6 +81,108 @@ class MultiStrategyRuleTests(unittest.TestCase):
         )
         self.assertEqual(reference, trade)
 
+    def test_independent_mainline_mode_ignores_active_trading_strategy(self):
+        os.environ[screen.ACTIVE_STRATEGY_ENV] = "zettaranc"
+
+        scorers = screen.strategy_scorers_for_run(niuone_mainline_only=True)
+
+        self.assertTrue(screen.niuone_mainline_only_mode(["--json", "--niuone-mainline-only"]))
+        self.assertEqual(set(scorers), set(screen.NIUONE_STRATEGY_IDS))
+        self.assertFalse(set(scorers).intersection(screen.ZETTARANC_STRATEGY_IDS))
+
+    def test_kline_prewarm_mode_is_independent_cli_task(self):
+        self.assertTrue(screen.kline_prewarm_only_mode(["--json", "--prewarm-kline-cache"]))
+        self.assertFalse(screen.kline_prewarm_only_mode(["--json", "--niuone-mainline-only"]))
+
+    def test_prepare_strategy_rows_prefers_cache_and_merges_live_quote(self):
+        historical = [
+            {
+                "date": f"2026-{5 + index // 28:02d}-{index % 28 + 1:02d}",
+                "open": 10 + index / 100,
+                "close": 10 + index / 100,
+                "high": 10.1 + index / 100,
+                "low": 9.9 + index / 100,
+                "volume": 1000 + index,
+            }
+            for index in range(60)
+        ]
+        historical[-1]["date"] = "2026-07-28"
+        network_calls = []
+        fetched = []
+
+        rows = screen.prepare_strategy_rows(
+            "600001",
+            "sh600001",
+            quote={
+                "quote_time": "20260729100501",
+                "open": 11.0,
+                "price": 11.5,
+                "high": 11.8,
+                "low": 10.9,
+                "volume": 8888,
+            },
+            historical_rows=historical,
+            kline_loader=lambda *_args: network_calls.append(True) or [],
+            fetched_callback=lambda symbol, values: fetched.append((symbol, values)),
+        )
+
+        self.assertEqual(network_calls, [])
+        self.assertEqual(fetched, [])
+        self.assertEqual(rows[-1]["date"], "2026-07-29")
+        self.assertEqual(rows[-1]["close"], 11.5)
+        self.assertIn("ema20", rows[-1])
+
+    def test_prepare_strategy_rows_fills_cache_only_after_network_fallback(self):
+        historical = [
+            {
+                "date": f"2026-{5 + index // 28:02d}-{index % 28 + 1:02d}",
+                "open": 10.0,
+                "close": 10.0,
+                "high": 10.1,
+                "low": 9.9,
+                "volume": 1000,
+            }
+            for index in range(60)
+        ]
+        historical[-1]["date"] = "2026-07-28"
+        fetched = []
+
+        rows = screen.prepare_strategy_rows(
+            "600001",
+            "sh600001",
+            quote={"quote_time": "20260729100501", "price": 10.2},
+            kline_loader=lambda *_args: historical,
+            fetched_callback=lambda symbol, values: fetched.append((symbol, len(values))),
+        )
+
+        self.assertIsNotNone(rows)
+        self.assertEqual(fetched, [("sh600001", 60)])
+
+    def test_independent_mainline_news_shortlist_uses_theme_context(self):
+        shortlist = screen.niuone_news_shortlist({
+            "themes": {
+                "银行": {
+                    "industry": "银行",
+                    "strong_stocks": [
+                        {"code": "600036", "name": "招商银行", "strong_score": 88},
+                        {"code": "601398", "name": "工商银行", "strong_score": 72},
+                    ],
+                },
+                "电力": {
+                    "industry": "电力",
+                    "strong_stocks": [
+                        {"code": "600036", "name": "重复股票", "strong_score": 99},
+                        {"code": "600011", "name": "华能国际", "strong_score": 81},
+                    ],
+                },
+            },
+        }, limit=2)
+
+        self.assertEqual(
+            [(item["code"], item["industry"]) for item in shortlist],
+            [("600036", "银行"), ("600011", "电力")],
+        )
+
     def test_niuone_trade_pool_filter_ignores_turnover_and_daily_move(self):
         candidates = [
             ("600001", "零成交额"),
@@ -99,6 +202,64 @@ class MultiStrategyRuleTests(unittest.TestCase):
         selected = screen.filter_niuone_reference_candidates(candidates, keys, quotes)
 
         self.assertEqual([item[0] for item in selected], ["600001", "300001", "688001"])
+
+    def test_niuone_dates_follow_quote_date_and_exact_previous_trading_day(self):
+        status_calls = []
+
+        def status_loader(value, *, allow_refresh=True):
+            status_calls.append((value, allow_refresh))
+            return {"previous_trading_day": "2026-07-24"}
+
+        current, previous = screen.resolve_niuone_trading_dates(
+            [
+                {
+                    "quote": {"quote_time": "20260727103000"},
+                    "rows": [{"date": "2026-07-24"}],
+                },
+                {
+                    "quote": {"quote_time": "20260727103100"},
+                    "rows": [{"date": "2026-07-24"}],
+                },
+            ],
+            status_loader=status_loader,
+        )
+
+        self.assertEqual((current, previous), ("2026-07-27", "2026-07-24"))
+        self.assertEqual(status_calls, [("2026-07-27", False)])
+
+    def test_niuone_previous_context_uses_newest_persisted_sample(self):
+        with tempfile.TemporaryDirectory(prefix="niuone-context-") as directory:
+            root = Path(directory)
+            minute = root / "niuone_mainline_minute_latest.json"
+            dedicated = root / "niuone_mainline_latest.json"
+            shared = root / "multi_strategy_latest.json"
+            minute.write_text(
+                '{"generated_at":"2026-07-29 10:25:00","niuone_context":{"as_of_date":"2026-07-29","sample_at":"2026-07-29 10:25:00","mainline":{"primary":"半导体"}}}',
+                encoding="utf-8",
+            )
+            dedicated.write_text(
+                '{"generated_at":"2026-07-29 10:00:00","niuone_context":{"as_of_date":"2026-07-29","sample_at":"2026-07-29 10:00:00","mainline":{"primary":"银行"}}}',
+                encoding="utf-8",
+            )
+            shared.write_text(
+                '{"generated_at":"2026-07-29 10:10:00","niuone_context":{"as_of_date":"2026-07-29","sample_at":"2026-07-29 10:10:00","mainline":{"primary":"证券"}}}',
+                encoding="utf-8",
+            )
+            original_minute = screen.NIUONE_MAINLINE_MINUTE_CACHE
+            original_dedicated = screen.NIUONE_MAINLINE_CACHE
+            original_shared = screen.MULTI_STRATEGY_CACHE
+            try:
+                screen.NIUONE_MAINLINE_MINUTE_CACHE = minute
+                screen.NIUONE_MAINLINE_CACHE = dedicated
+                screen.MULTI_STRATEGY_CACHE = shared
+                context = screen.load_previous_niuone_context()
+            finally:
+                screen.NIUONE_MAINLINE_MINUTE_CACHE = original_minute
+                screen.NIUONE_MAINLINE_CACHE = original_dedicated
+                screen.MULTI_STRATEGY_CACHE = original_shared
+
+        self.assertEqual(context["as_of_date"], "2026-07-29")
+        self.assertEqual(context["mainline"]["primary"], "半导体")
 
     @staticmethod
     def _tencent_quote_response():
@@ -605,6 +766,47 @@ class MultiStrategyRuleTests(unittest.TestCase):
 
         self.assertEqual(screen.select_trade_candidates([blocked, good]), [good])
 
+    def test_candidate_lists_sort_by_displayed_score_descending(self):
+        candidates = [
+            {
+                "code": "600001",
+                "best_score": 6.6,
+                "best_decision_score": 9.8,
+                "entry_threshold": 6.0,
+                "distance_pct": 1.0,
+                "actionable": True,
+                "hard_blockers": [],
+            },
+            {
+                "code": "600002",
+                "best_score": 8.3,
+                "best_decision_score": 8.5,
+                "entry_threshold": 6.0,
+                "distance_pct": 1.0,
+                "actionable": True,
+                "hard_blockers": [],
+            },
+            {
+                "code": "600003",
+                "best_score": 7.4,
+                "best_decision_score": 9.0,
+                "entry_threshold": 6.0,
+                "distance_pct": 1.0,
+                "actionable": True,
+                "hard_blockers": [],
+            },
+        ]
+
+        expected = ["600002", "600003", "600001"]
+        self.assertEqual(
+            [item["code"] for item in screen.select_display_candidates(candidates)],
+            expected,
+        )
+        self.assertEqual(
+            [item["code"] for item in screen.select_trade_candidates(candidates)],
+            expected,
+        )
+
     def test_candidate_counts_follow_runtime_settings(self):
         candidates = [
             {
@@ -847,7 +1049,7 @@ class MultiStrategyRuleTests(unittest.TestCase):
             self.assertNotIn("buffett_value", screen.STRATEGY_SCORERS)
             self.assertEqual(screen.STRATEGY_META["shaofu_b1"]["family"], "persona")
             self.assertEqual(screen.STRATEGY_META["breakout"]["family"], "local")
-            self.assertEqual(screen.enabled_persona_strategy_ids(), {"zettaranc"})
+            self.assertEqual(screen.enabled_persona_strategy_ids(), {"niuone"})
         finally:
             if old is None:
                 os.environ.pop(screen.PERSONA_STRATEGY_ENV, None)
@@ -918,6 +1120,7 @@ class MultiStrategyRuleTests(unittest.TestCase):
                 "base": {"breakout", "trend_pullback"},
                 "zettaranc": {"b3_accelerate", "b2_confirm", "shaofu_b1", "super_b1"},
                 "li_daxiao_bottom": {"li_daxiao_bottom"},
+                "niuone": {"niu_emerging", "niu_leader", "niu_pullback", "niu_reversal_probe"},
                 "preset_text": {"breakout", "trend_pullback"},
             }
             for suite, scorer_ids in expected.items():

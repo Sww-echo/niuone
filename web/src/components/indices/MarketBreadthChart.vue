@@ -1,5 +1,6 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { allowInfoPopoverClick } from '../../utils/infoPopover.js'
 import { previousDayMarketLabel } from '../../utils/marketDisplay.js'
 
 const props = defineProps({
@@ -7,16 +8,16 @@ const props = defineProps({
 })
 
 const SERIES = [
-  { key: 'limit_down', label: '跌停板', color: 'var(--market-breadth-limit-down, #4ade80)', axis: 'right', group: 'limit' },
-  { key: 'limit_up', label: '涨停板', color: 'var(--market-breadth-limit-up, #fb7185)', axis: 'right', group: 'limit' },
-  { key: 'broken_limit', label: '炸板', color: 'var(--market-breadth-broken-limit, #fbbf24)', axis: 'right', group: 'limit' },
-  { key: 'red', label: '红盘', color: 'var(--market-breadth-red, #e879f9)', axis: 'left', group: 'breadth', muted: true },
-  { key: 'green', label: '绿盘', color: 'var(--market-breadth-green, #38bdf8)', axis: 'left', group: 'breadth', muted: true },
-  { key: 'estimated_turnover_yi', label: '预测全天量能', color: 'var(--market-breadth-estimated-turnover, #f59e0b)', axis: 'volume', group: 'volume' },
-  { key: 'actual_turnover_yi', label: '今日实际量能', color: 'var(--market-breadth-actual-turnover, #818cf8)', axis: 'volume', group: 'volume', muted: true },
-  { key: 'previous_actual_turnover_yi', label: '前日同期量能', color: 'var(--market-breadth-previous-turnover, #94a3b8)', axis: 'volume', group: 'volume', muted: true, dashed: true },
-  { key: 'turnover_increment_yi', label: '预测增量', color: 'var(--market-breadth-turnover-increment, #2dd4bf)', axis: 'volume', group: 'volume', signed: true },
-  { key: 'turnover_same_time_delta_yi', label: '同时点量能差', color: 'var(--market-breadth-same-time-delta, #22d3ee)', axis: 'volume', group: 'volume', signed: true },
+  { key: 'limit_down', label: '跌停板', compactLabel: '跌', color: 'var(--market-breadth-limit-down, #4ade80)', axis: 'right', group: 'limit' },
+  { key: 'limit_up', label: '涨停板', compactLabel: '涨', color: 'var(--market-breadth-limit-up, #fb7185)', axis: 'right', group: 'limit' },
+  { key: 'broken_limit', label: '炸板', compactLabel: '炸', color: 'var(--market-breadth-broken-limit, #fbbf24)', axis: 'right', group: 'limit' },
+  { key: 'red', label: '红盘', compactLabel: '红', color: 'var(--market-breadth-red, #e879f9)', axis: 'left', group: 'breadth', muted: true },
+  { key: 'green', label: '绿盘', compactLabel: '绿', color: 'var(--market-breadth-green, #38bdf8)', axis: 'left', group: 'breadth', muted: true },
+  { key: 'estimated_turnover_yi', label: '预测全天量能', compactLabel: '预测', color: 'var(--market-breadth-estimated-turnover, #fb923c)', axis: 'volume', group: 'volume' },
+  { key: 'actual_turnover_yi', label: '今日实际量能', compactLabel: '实际', color: 'var(--market-breadth-actual-turnover, #818cf8)', axis: 'volume', group: 'volume', emphasized: true },
+  { key: 'previous_actual_turnover_yi', label: '前日同期量能', compactLabel: '昨同期', color: 'var(--market-breadth-previous-turnover, #94a3b8)', axis: 'volume', group: 'volume', muted: true, dashed: true },
+  { key: 'turnover_increment_yi', label: '预测增量', compactLabel: '增量', color: 'var(--market-breadth-turnover-increment, #2dd4bf)', axis: 'volume', group: 'volume', signed: true },
+  { key: 'turnover_same_time_delta_yi', label: '较昨日同期差', compactLabel: '同期差', color: 'var(--market-breadth-same-time-delta, #f472b6)', axis: 'volume', group: 'volume', signed: true },
 ]
 
 const showBreadth = ref(true)
@@ -25,6 +26,9 @@ const showVolume = ref(true)
 const hoveredAt = ref('')
 const chartElement = ref(null)
 const chartWrapElement = ref(null)
+const marketInfoOpen = ref(false)
+const marketInfoRoot = ref(null)
+const marketInfoTrigger = ref(null)
 const chartWidth = ref(720)
 const chartAvailableHeight = ref(330)
 let chartResizeObserver = null
@@ -53,10 +57,21 @@ function formatSeriesValue(series, value, withCountUnit = false) {
   return withCountUnit ? `${formatted}只` : formatted
 }
 
+function formatCompactSeriesValue(series, value) {
+  const parsed = nullableNumeric(value, series.signed)
+  if (parsed == null) return '--'
+  if (series.axis !== 'volume') return String(Math.round(parsed))
+  const sign = series.signed && parsed > 0 ? '+' : ''
+  if (Math.abs(parsed) >= 10_000) {
+    return `${sign}${(parsed / 10_000).toLocaleString('zh-CN', { maximumFractionDigits: 1 })}万亿`
+  }
+  return `${sign}${Math.round(parsed)}亿`
+}
+
 function tradeProgress(value) {
-  const match = String(value || '').match(/(\d{2}):(\d{2})/)
+  const match = String(value || '').match(/(\d{2}):(\d{2})(?::(\d{2}))?/)
   if (!match) return null
-  const minute = Number(match[1]) * 60 + Number(match[2])
+  const minute = Number(match[1]) * 60 + Number(match[2]) + Number(match[3] || 0) / 60
   const morningStart = 9 * 60 + 30
   const morningEnd = 11 * 60 + 30
   const afternoonStart = 13 * 60
@@ -75,31 +90,6 @@ function turnoverStep(value) {
   if (value > 5_000) return 1_000
   if (value > 1_000) return 500
   return 100
-}
-
-function spreadEndLabels(paths, top, bottom) {
-  const gap = 17
-  const labels = paths
-    .map(path => ({
-      ...path,
-      anchorY: Number(path.lastY),
-      labelY: Number(path.lastY),
-    }))
-    .sort((left, right) => left.labelY - right.labelY)
-  if (!labels.length) return labels
-
-  labels[0].labelY = Math.max(top, labels[0].labelY)
-  for (let index = 1; index < labels.length; index += 1) {
-    labels[index].labelY = Math.max(labels[index].labelY, labels[index - 1].labelY + gap)
-  }
-  const overflow = labels.at(-1).labelY - bottom
-  if (overflow > 0) labels.forEach(label => { label.labelY -= overflow })
-  for (let index = labels.length - 2; index >= 0; index -= 1) {
-    labels[index].labelY = Math.min(labels[index].labelY, labels[index + 1].labelY - gap)
-  }
-  const underflow = top - labels[0].labelY
-  if (underflow > 0) labels.forEach(label => { label.labelY += underflow })
-  return labels
 }
 
 const latest = computed(() => props.payload.latest || {})
@@ -141,8 +131,8 @@ const chart = computed(() => {
     ? Math.max(compactMinHeight, Math.min(baseHeight, chartAvailableHeight.value))
     : Math.max(baseHeight, chartAvailableHeight.value)
   const margin = compact
-    ? { top: 16, right: 88, bottom: 30, left: 42 }
-    : { top: 16, right: 92, bottom: 34, left: 50 }
+    ? { top: showVolume.value ? 74 : 42, right: 38, bottom: 30, left: 42 }
+    : { top: 16, right: 42, bottom: 34, left: 50 }
   const plotWidth = width - margin.left - margin.right
   const sectionGap = showSentiment && showVolume.value ? (compact ? 20 : 24) : 0
   const drawableHeight = height - margin.top - margin.bottom - sectionGap
@@ -206,26 +196,8 @@ const chart = computed(() => {
       lastX: last?.x.toFixed(1),
       lastY: last?.y.toFixed(1),
       lastValue: last?.value,
-      labelWidth: Math.max(31, series.label.length * 10 + 9),
     }
   }).filter(series => series.path)
-  const latestX = Math.max(
-    margin.left,
-    ...paths.map(path => Number(path.lastX)),
-  )
-  const labelRailX = Math.min(latestX + 14, width - margin.right + 11)
-  const endLabels = [
-    ...spreadEndLabels(
-      paths.filter(path => path.axis !== 'volume'),
-      margin.top + 6,
-      sentimentBottom - 6,
-    ),
-    ...spreadEndLabels(
-      paths.filter(path => path.axis === 'volume'),
-      volumeTop + 6,
-      plotBottom - 6,
-    ),
-  ]
   const grid = showSentiment ? Array.from({ length: 5 }, (_, index) => {
     const ratio = index / 4
     return {
@@ -276,6 +248,7 @@ const chart = computed(() => {
   return {
     width,
     height,
+    compact,
     margin,
     plotWidth,
     sentimentBottom,
@@ -284,8 +257,6 @@ const chart = computed(() => {
     volumeMin,
     plotBottom,
     paths,
-    endLabels,
-    labelRailX,
     morningNotice,
     grid,
     volumeGrid,
@@ -295,16 +266,18 @@ const chart = computed(() => {
   }
 })
 
-const hoveredSample = computed(() => {
+const activeSample = computed(() => {
   const current = chart.value
-  if (!current || !hoveredAt.value) return null
+  if (!current) return null
   const sample = current.samples.find(item => item.point.generated_at === hoveredAt.value)
+    || current.samples.at(-1)
   if (!sample) return null
   const tooltipWidth = 166
   const rows = visibleSeries.value.map(series => ({
     ...series,
     value: nullableNumeric(sample.point[series.key], series.signed),
     displayValue: formatSeriesValue(series, sample.point[series.key]),
+    compactDisplayValue: formatCompactSeriesValue(series, sample.point[series.key]),
   }))
   const tooltipHeight = 42 + rows.length * 14
   const plotRight = current.width - current.margin.right
@@ -320,6 +293,11 @@ const hoveredSample = computed(() => {
     tooltipWidth,
     tooltipHeight,
     rows,
+    compactCountRows: [
+      ...rows.filter(row => row.group === 'breadth'),
+      ...rows.filter(row => row.group === 'limit'),
+    ],
+    compactVolumeRows: rows.filter(row => row.group === 'volume'),
     markers: visibleSeries.value.flatMap(series => {
       const markerY = current.y(sample.point[series.key], series.axis, series.signed)
       return markerY == null ? [] : [{ ...series, y: markerY }]
@@ -378,6 +356,33 @@ function syncChartSize() {
   if (availableHeight > 0) chartAvailableHeight.value = availableHeight
 }
 
+function toggleMarketInfo(event) {
+  if (!allowInfoPopoverClick(event)) {
+    marketInfoOpen.value = false
+    return
+  }
+  marketInfoOpen.value = !marketInfoOpen.value
+}
+
+async function closeMarketInfo({ restoreFocus = false } = {}) {
+  if (!marketInfoOpen.value) return
+  marketInfoOpen.value = false
+  if (!restoreFocus) return
+  await nextTick()
+  marketInfoTrigger.value?.focus({ preventScroll: true })
+}
+
+function handleMarketInfoPointerDown(event) {
+  if (!marketInfoOpen.value || marketInfoRoot.value?.contains(event.target)) return
+  closeMarketInfo()
+}
+
+function handleMarketInfoKeydown(event) {
+  if (event.key !== 'Escape' || !marketInfoOpen.value) return
+  event.preventDefault()
+  closeMarketInfo({ restoreFocus: true })
+}
+
 watch(chartWrapElement, element => {
   chartResizeObserver?.disconnect()
   chartResizeObserver = null
@@ -393,11 +398,15 @@ onMounted(() => {
   window.addEventListener('pointermove', clearHoverOutside, { passive: true })
   window.addEventListener('resize', syncChartSize, { passive: true })
   window.visualViewport?.addEventListener('resize', syncChartSize, { passive: true })
+  document.addEventListener('pointerdown', handleMarketInfoPointerDown)
+  document.addEventListener('keydown', handleMarketInfoKeydown)
 })
 onBeforeUnmount(() => {
   window.removeEventListener('pointermove', clearHoverOutside)
   window.removeEventListener('resize', syncChartSize)
   window.visualViewport?.removeEventListener('resize', syncChartSize)
+  document.removeEventListener('pointerdown', handleMarketInfoPointerDown)
+  document.removeEventListener('keydown', handleMarketInfoKeydown)
   chartResizeObserver?.disconnect()
 })
 
@@ -453,20 +462,30 @@ const turnoverEstimateText = computed(() => {
       <div class="market-breadth-heading">
         <div class="market-breadth-title-row">
           <h3 id="market-breadth-title">A股市场情绪曲线</h3>
-          <div class="market-breadth-info">
+          <div ref="marketInfoRoot" class="market-breadth-info">
             <button
-              class="market-breadth-info-trigger"
+              ref="marketInfoTrigger"
+              class="market-breadth-info-trigger dashboard-info-trigger"
               type="button"
               aria-label="查看市场情绪数据说明"
+              aria-controls="marketBreadthInfoPopover"
+              :aria-expanded="marketInfoOpen"
+              @click="toggleMarketInfo"
             >
               <svg viewBox="0 0 20 20" aria-hidden="true">
                 <circle cx="10" cy="10" r="8"></circle>
                 <path d="M10 9v5M10 6.2v.1"></path>
               </svg>
             </button>
-            <div class="market-breadth-info-popover" role="tooltip">
+            <div
+              id="marketBreadthInfoPopover"
+              class="market-breadth-info-popover"
+              :class="{ open: marketInfoOpen }"
+              role="dialog"
+              aria-label="市场情绪数据说明"
+            >
               <strong>数据说明</strong>
-              <span>{{ payload.universe || '沪深A股' }} · 每分钟真实采样</span>
+              <span>{{ payload.universe || '沪深A股' }} · 每 {{ payload.sampling?.interval_seconds || 30 }} 秒真实采样</span>
               <span v-if="latestGeneratedAt">最新采样：{{ latestGeneratedAt }}</span>
               <span>情绪数据源：{{ payload.source || '腾讯证券沪深A股实时行情' }}</span>
               <span v-if="showVolume && turnoverSourceText">{{ turnoverSourceText }}</span>
@@ -508,7 +527,12 @@ const turnoverEstimateText = computed(() => {
       行情源暂时不可用，{{ payload.stale_cache ? '继续展示上一份有效采样' : '等待下一次采样' }}
     </div>
 
-    <div v-if="chart" ref="chartWrapElement" class="market-breadth-chart-wrap">
+    <div
+      v-if="chart"
+      ref="chartWrapElement"
+      class="market-breadth-chart-wrap"
+      @touchmove.prevent
+    >
       <svg
         ref="chartElement"
         class="market-breadth-chart"
@@ -555,8 +579,8 @@ const turnoverEstimateText = computed(() => {
           :y1="chart.margin.top"
           :y2="chart.sentimentBottom"
         />
-        <text v-if="showBreadth" class="market-breadth-axis-title" :x="chart.margin.left" y="11">红盘 / 绿盘（只）</text>
-        <text v-if="showLimitState" class="market-breadth-axis-title" :x="chart.width - chart.margin.right" y="11" text-anchor="end">涨跌停 / 炸板（只）</text>
+        <text v-if="showBreadth && !chart.compact" class="market-breadth-axis-title" :x="chart.margin.left" y="11">红盘 / 绿盘（只）</text>
+        <text v-if="showLimitState && !chart.compact" class="market-breadth-axis-title" :x="chart.width - chart.margin.right" y="11" text-anchor="end">涨跌停 / 炸板（只）</text>
         <g v-for="line in chart.volumeGrid" :key="`volume-${line.y}`">
           <line
             class="market-breadth-grid market-breadth-volume-grid"
@@ -608,6 +632,7 @@ const turnoverEstimateText = computed(() => {
             class="market-breadth-line"
             :class="{
               'market-breadth-line-muted': series.muted,
+              'market-breadth-line-emphasized': series.emphasized,
               'market-breadth-line-dashed': series.dashed,
             }"
             :d="series.path"
@@ -618,37 +643,11 @@ const turnoverEstimateText = computed(() => {
             :class="{ 'market-breadth-endpoint-muted': series.muted }"
             :cx="series.lastX"
             :cy="series.lastY"
-            :r="series.muted ? 1.45 : 1.9"
+            :r="series.emphasized ? 2.2 : series.muted ? 1.45 : 1.9"
             :fill="series.color"
           >
             <title>{{ series.label }} {{ formatSeriesValue(series, series.lastValue, true) }}</title>
           </circle>
-        </g>
-        <g
-          v-for="label in chart.endLabels"
-          :key="`${label.key}-end-label`"
-          class="market-breadth-end-label-group"
-          aria-hidden="true"
-        >
-          <path
-            class="market-breadth-end-label-connector"
-            :d="`M ${Number(label.lastX) + 3} ${label.anchorY} L ${chart.labelRailX - 7} ${label.anchorY} L ${chart.labelRailX - 2} ${label.labelY}`"
-            :stroke="label.color"
-          />
-          <rect
-            class="market-breadth-end-label-bg"
-            :x="chart.labelRailX"
-            :y="label.labelY - 7"
-            :width="label.labelWidth"
-            height="14"
-            rx="4"
-          />
-          <text
-            class="market-breadth-end-label"
-            :x="chart.labelRailX + 4"
-            :y="label.labelY + 3"
-            :fill="label.color"
-          >{{ label.label }}</text>
         </g>
         <rect
           class="market-breadth-hit-area"
@@ -661,44 +660,81 @@ const turnoverEstimateText = computed(() => {
           @pointerdown="updateHover"
           @pointerleave="clearHover"
         />
-        <g v-if="hoveredSample" class="market-breadth-hover" aria-hidden="true">
+        <g v-if="activeSample" class="market-breadth-hover" aria-hidden="true">
           <line
             class="market-breadth-crosshair"
-            :x1="hoveredSample.x"
-            :x2="hoveredSample.x"
+            :x1="activeSample.x"
+            :x2="activeSample.x"
             :y1="chart.margin.top"
             :y2="chart.plotBottom"
           />
           <circle
-            v-for="marker in hoveredSample.markers"
+            v-for="marker in activeSample.markers"
             :key="marker.key"
             class="market-breadth-hover-point"
-            :cx="hoveredSample.x"
+            :cx="activeSample.x"
             :cy="marker.y"
             r="2.2"
             :fill="marker.color"
           />
-          <g :transform="`translate(${hoveredSample.tooltipX} ${hoveredSample.tooltipY})`">
+          <g
+            v-if="!chart.compact"
+            :transform="`translate(${activeSample.tooltipX} ${activeSample.tooltipY})`"
+          >
             <rect
               class="market-breadth-tooltip-panel"
-              :width="hoveredSample.tooltipWidth"
-              :height="hoveredSample.tooltipHeight"
+              :width="activeSample.tooltipWidth"
+              :height="activeSample.tooltipHeight"
               rx="7"
             />
-            <text class="market-breadth-tooltip-time" x="10" y="17">{{ hoveredSample.time }}</text>
-            <line class="market-breadth-tooltip-divider" x1="10" :x2="hoveredSample.tooltipWidth - 10" y1="25" y2="25" />
+            <text class="market-breadth-tooltip-time" x="10" y="17">{{ activeSample.time }}</text>
+            <line class="market-breadth-tooltip-divider" x1="10" :x2="activeSample.tooltipWidth - 10" y1="25" y2="25" />
             <g
-              v-for="(row, index) in hoveredSample.rows"
+              v-for="(row, index) in activeSample.rows"
               :key="row.key"
               :transform="`translate(0 ${39 + index * 14})`"
             >
               <circle cx="11" cy="0" r="2.1" :fill="row.color" />
               <text class="market-breadth-tooltip-label" x="18" y="3">{{ row.label }}</text>
-              <text class="market-breadth-tooltip-value" :x="hoveredSample.tooltipWidth - 10" y="3" text-anchor="end">{{ row.displayValue }}</text>
+              <text class="market-breadth-tooltip-value" :x="activeSample.tooltipWidth - 10" y="3" text-anchor="end">{{ row.displayValue }}</text>
             </g>
           </g>
         </g>
       </svg>
+      <div
+        v-if="chart.compact && activeSample"
+        class="market-breadth-compact-tooltip"
+        :style="{
+          left: `${chart.margin.left}px`,
+          top: '4px',
+          width: `${chart.plotWidth}px`,
+        }"
+        aria-label="当前时刻市场情绪数据"
+      >
+        <time>{{ activeSample.time }}</time>
+        <span
+          v-for="row in activeSample.compactCountRows"
+          :key="row.key"
+          class="market-breadth-compact-tooltip-item market-breadth-compact-tooltip-count-item"
+        >
+          <i :style="{ backgroundColor: row.color }"></i>
+          <b>{{ row.compactLabel }}</b>
+          <strong>{{ row.compactDisplayValue }}</strong>
+        </span>
+        <span
+          v-if="activeSample.compactVolumeRows.length"
+          class="market-breadth-compact-tooltip-group-label"
+        >量能</span>
+        <span
+          v-for="row in activeSample.compactVolumeRows"
+          :key="row.key"
+          class="market-breadth-compact-tooltip-item market-breadth-compact-tooltip-volume-item"
+        >
+          <i :style="{ backgroundColor: row.color }"></i>
+          <b>{{ row.compactLabel }}</b>
+          <strong>{{ row.compactDisplayValue }}</strong>
+        </span>
+      </div>
     </div>
 
     <div v-else class="market-breadth-empty">

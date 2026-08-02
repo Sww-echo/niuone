@@ -14,6 +14,11 @@ const state = reactive({
   generatedAt: '',
   strategyMeta: {},
   strategyDistribution: {},
+  strategySuite: '',
+  stockUniverseLabel: '',
+  strategyCacheStale: false,
+  refreshRequired: false,
+  statusMessage: '',
   running: false,
   startedAt: '',
   error: '',
@@ -47,6 +52,11 @@ function saveCache() {
       generatedAt: state.generatedAt,
       strategyMeta: state.strategyMeta,
       strategyDistribution: state.strategyDistribution,
+      strategySuite: state.strategySuite,
+      stockUniverseLabel: state.stockUniverseLabel,
+      strategyCacheStale: state.strategyCacheStale,
+      refreshRequired: state.refreshRequired,
+      statusMessage: state.statusMessage,
       running: state.running,
       startedAt: state.startedAt,
       candidatesDigest,
@@ -64,6 +74,11 @@ function restoreCache() {
     state.generatedAt = String(cached.generatedAt || '')
     state.strategyMeta = cached.strategyMeta || {}
     state.strategyDistribution = cached.strategyDistribution || {}
+    state.strategySuite = String(cached.strategySuite || '')
+    state.stockUniverseLabel = String(cached.stockUniverseLabel || '')
+    state.strategyCacheStale = cached.strategyCacheStale === true
+    state.refreshRequired = cached.refreshRequired === true
+    state.statusMessage = String(cached.statusMessage || '')
     state.running = cached.running === true
     state.startedAt = String(cached.startedAt || '')
     state.loading = false
@@ -104,6 +119,13 @@ function applyCandidates(payload) {
   state.generatedAt = String(payload?.generated_at || '')
   state.strategyMeta = payload?.strategy_meta || {}
   state.strategyDistribution = payload?.strategy_distribution || {}
+  state.strategySuite = String(payload?.strategy_suite || '')
+  state.stockUniverseLabel = String(
+    payload?.stock_universe_label || payload?.configured_stock_universe_label || '',
+  )
+  state.strategyCacheStale = payload?.strategy_cache_stale === true
+  state.refreshRequired = payload?.refresh_required === true
+  state.statusMessage = String(payload?.status_message || '')
   state.running = payload?.running === true
   state.startedAt = String(payload?.started_at || '')
   state.error = String(payload?.error || '')

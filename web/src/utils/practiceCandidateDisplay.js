@@ -8,9 +8,10 @@ export const PRACTICE_STRATEGY_META = {
   tide_leader: { label: '主线领航', color: '#06b6d4' },
   tide_rotation: { label: '轮动初升', color: '#14b8a6' },
   tide_recovery: { label: '冰点修复', color: '#22d3ee' },
-  niu_leader: { label: '牛牛领航', color: '#8b5cf6' },
-  niu_pullback: { label: '牛牛回踩', color: '#a78bfa' },
-  niu_emerging: { label: '牛牛启动', color: '#c084fc' },
+  niu_leader: { label: '牛牛战法 · 领航', color: '#8b5cf6' },
+  niu_pullback: { label: '牛牛战法 · 回踩', color: '#a78bfa' },
+  niu_emerging: { label: '牛牛战法 · 启动', color: '#c084fc' },
+  niu_reversal_probe: { label: '牛牛战法 · 反转试仓', color: '#f59e0b' },
 }
 
 export const PRACTICE_STOCK_BOARD_LABELS = {
@@ -27,6 +28,8 @@ export const PRACTICE_TIDE_STATUS_LABELS = {
   lagging: '落后',
   candidate: '候选',
   emerging: '启动',
+  intraday_mainline: '日内强势观察',
+  reversal_probe: '反转试仓',
   mainline: '主线',
   diverging: '分歧',
   fading: '退潮',
@@ -54,8 +57,22 @@ export function practiceCandidateTierCounts(items) {
   return counts
 }
 
+export function practiceCandidateScanDescription(strategySuite, stockUniverseLabel) {
+  const universeLabel = String(stockUniverseLabel || '').trim() || '配置范围'
+  return String(strategySuite || '').trim() === 'niuone'
+    ? `全市场非ST主线识别 · ${universeLabel}入选`
+    : `高流动性扫描 · ${universeLabel}入选`
+}
+
 export function practiceCandidateStrategyMeta(payloadMeta = {}) {
-  return { ...PRACTICE_STRATEGY_META, ...(payloadMeta || {}) }
+  const merged = { ...PRACTICE_STRATEGY_META, ...(payloadMeta || {}) }
+  for (const strategyId of ['niu_leader', 'niu_pullback', 'niu_emerging', 'niu_reversal_probe']) {
+    merged[strategyId] = {
+      ...(merged[strategyId] || {}),
+      label: PRACTICE_STRATEGY_META[strategyId].label,
+    }
+  }
+  return merged
 }
 
 export function practiceCandidateIndustryLabel(item = {}) {

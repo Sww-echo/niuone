@@ -39,8 +39,32 @@ def candidate_buy_blockers(
         blockers.append(f"评分{score:g}<基准{threshold:g}")
     if candidate.get("actionable") is False:
         blockers.append("候选未通过战法硬过滤")
-    strategy_id = str(candidate.get("best_strategy") or candidate.get("buy_strategy") or "")
+    strategy_id = str(
+        candidate.get("best_strategy")
+        or candidate.get("buy_strategy")
+        or candidate.get("strategy_id")
+        or ""
+    )
     persona = STRATEGY_DEFINITIONS.get(strategy_id, {}).get("persona")
+    reversal_probe = strategy_id == "niu_reversal_probe"
+    if persona == "niuone" and (
+        (
+            candidate.get("stock_reversal_leader_tier") is not True
+            or candidate.get("stock_reversal_strong") is not True
+        )
+        if reversal_probe
+        else (
+            candidate.get("stock_leader_tier") is not True
+            or candidate.get("stock_strong") is not True
+        )
+    ):
+        leader_blocker = (
+            "个股未进入反转领涨前三"
+            if reversal_probe
+            else "个股未进入强势行业龙头梯队"
+        )
+        if leader_blocker not in blockers:
+            blockers.append(leader_blocker)
     is_ema_strategy = persona in {"sector_tide", "niuone"}
     distance = candidate.get("distance_pct")
     if not is_ema_strategy and distance is not None and _safe_float(distance, 99.0) > max_bbi_distance_pct:

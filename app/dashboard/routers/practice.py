@@ -58,6 +58,31 @@ def create_practice_router(
     for path in services.PRACTICE_CANDIDATES_API_PATHS:
         router.add_api_route(path, practice_candidates_response, methods=["GET", "HEAD"])
 
+    @router.api_route("/api/niuone/mainline", methods=["GET", "HEAD"])
+    async def niuone_mainline(request: Request) -> Response:
+        ttl = services.API_TTLS["niuone_mainline"]
+        return await cached_response(
+            request,
+            cache_key=services.NIUONE_MAINLINE_CACHE_KEY,
+            ttl=ttl,
+            producer=services.load_niuone_mainline_view,
+            edge_ttl=ttl,
+            browser_ttl=10,
+        )
+
+    @router.post("/api/niuone/mainline/refresh")
+    async def refresh_niuone_mainline(request: Request) -> Response:
+        rejected = await require_admin_action(request)
+        if rejected is not None:
+            return rejected
+
+        def refresh() -> dict[str, Any]:
+            services.invalidate_api_cache(services.NIUONE_MAINLINE_CACHE_KEY)
+            return services.load_niuone_mainline_view()
+
+        payload = await run_in_threadpool(refresh)
+        return json_response(request, payload, cache_control="no-store")
+
     @router.api_route("/api/niuniu_practice", methods=["GET", "HEAD"])
     async def niuniu_practice(request: Request) -> Response:
         fast = str(request.query_params.get("fast") or "0").lower() in {
