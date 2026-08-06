@@ -4,8 +4,17 @@ from __future__ import annotations
 import math
 from typing import Any, Mapping
 
+try:
+    from app.market_data.eastmoney_concept_boards import (
+        normalize_eastmoney_concept_name,
+    )
+except ImportError:  # pragma: no cover - standalone entrypoints add app/ to sys.path
+    from market_data.eastmoney_concept_boards import (
+        normalize_eastmoney_concept_name,
+    )
 
-NIUONE_MAINLINE_VIEW_SCHEMA_VERSION = 7
+
+NIUONE_MAINLINE_VIEW_SCHEMA_VERSION = 13
 NIUONE_MAINLINE_THEME_LIMIT = 5
 
 
@@ -30,6 +39,96 @@ def _text(value: Any, limit: int = 160) -> str:
     return str(value or "").strip()[:limit]
 
 
+def _eastmoney_board_view(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    name = _text(value.get("name"), 80)
+    rank = _integer(value.get("rank"))
+    if not name or rank <= 0:
+        return None
+    up_count = _integer(value.get("up_count"))
+    down_count = _integer(value.get("down_count"))
+    flat_count = _integer(value.get("flat_count"))
+    quote_count = up_count + down_count + flat_count
+    leader_code = _text(value.get("leader_code"), 12)
+    leader_name = _text(value.get("leader_name"), 40)
+    return {
+        "board_code": _text(value.get("code"), 16),
+        "board_name": name,
+        "rank": rank,
+        "change_pct": _number(value.get("change_pct")),
+        "main_net_yi": _number(value.get("main_net_yi")),
+        "up_count": up_count,
+        "down_count": down_count,
+        "flat_count": flat_count,
+        "breadth_pct": (
+            round(up_count / quote_count * 100, 2) if quote_count else None
+        ),
+        "leader": (
+            {
+                "code": leader_code,
+                "name": leader_name,
+                "change_pct": _number(value.get("leader_change_pct")),
+            }
+            if leader_code or leader_name
+            else None
+        ),
+    }
+
+
+def _eastmoney_signal_view(
+    value: Any,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    default = {
+        "available": False,
+        "status": "not_collected",
+        "source": "eastmoney_concept_board_rank",
+        "source_url": "",
+        "captured_at": "",
+        "quote_generated_at": "",
+        "sort": "change_pct_desc",
+        "total_count": 0,
+        "covered_count": 0,
+        "stale": False,
+        "matched_theme_count": 0,
+    }
+    if not isinstance(value, Mapping):
+        return default, {}
+    boards = [
+        board
+        for raw in list(value.get("boards") or [])[:100]
+        if (board := _eastmoney_board_view(raw)) is not None
+    ]
+    available = value.get("available") is not False and bool(boards)
+    signal = {
+        "available": available,
+        "status": (
+            "available"
+            if available
+            else _text(value.get("status"), 40) or "upstream_unavailable"
+        ),
+        "source": _text(value.get("source"), 60)
+        or "eastmoney_concept_board_rank",
+        "source_url": _text(value.get("source_url"), 240),
+        "captured_at": _text(value.get("captured_at"), 19),
+        "quote_generated_at": _text(value.get("quote_generated_at"), 19),
+        "sort": _text(value.get("sort"), 32) or "change_pct_desc",
+        "total_count": _integer(value.get("total_count")),
+        "covered_count": _integer(value.get("covered_count")) or len(boards),
+        "stale": value.get("stale") is True,
+        "matched_theme_count": 0,
+    }
+    lookup: dict[str, dict[str, Any]] = {}
+    if available:
+        for board in boards:
+            normalized = normalize_eastmoney_concept_name(
+                board.get("board_name")
+            )
+            if normalized and normalized not in lookup:
+                lookup[normalized] = board
+    return signal, lookup
+
+
 def _strong_stock_view(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, Mapping):
         return None
@@ -42,8 +141,8 @@ def _strong_stock_view(value: Any) -> dict[str, Any] | None:
         "name": name,
         "strong_score": _number(value.get("strong_score")),
         "change_pct": _number(value.get("change_pct")),
-        "rebound_from_low_pct": _number(value.get("rebound_from_low_pct")),
-        "reclaim_previous_close": value.get("reclaim_previous_close") is True,
+        "attribution_score": _number(value.get("attribution_score")),
+        "attribution_weight": _number(value.get("attribution_weight")),
         "role": _text(value.get("role"), 16),
     }
 
@@ -93,22 +192,52 @@ def _theme_view(value: Any) -> dict[str, Any] | None:
         "state": _text(value.get("state"), 32),
         "raw_state": _text(value.get("raw_state"), 32),
         "intraday_state": _text(value.get("intraday_state"), 32),
+        "niuone_lifecycle_stage": _text(
+            value.get("niuone_lifecycle_stage"), 24
+        ),
+        "niuone_lifecycle_label": _text(
+            value.get("niuone_lifecycle_label"), 24
+        ),
+        "niuone_lifecycle_order": _integer(
+            value.get("niuone_lifecycle_order")
+        ),
+        "niuone_lifecycle_entry_policy": _text(
+            value.get("niuone_lifecycle_entry_policy"), 32
+        ),
         "member_count": member_count,
+        "attributed_member_count": _number(value.get("attributed_member_count")),
         "eligible_data": value.get("eligible_data") is True,
         "today_eligible_data": value.get("today_eligible_data") is True,
         "today_quote_count": _integer(value.get("today_quote_count")),
         "today_data_coverage": today_data_coverage,
+        "today_attributed_data_coverage": _number(
+            value.get("today_attributed_data_coverage")
+        ),
         "today_up_count": _integer(value.get("today_up_count")),
         "today_1_5pct_count": _integer(value.get("today_1_5pct_count")),
         "today_3pct_count": _integer(value.get("today_3pct_count")),
         "today_5pct_count": _integer(value.get("today_5pct_count")),
         "today_breadth_pct": today_breadth_pct,
+        "today_attributed_quote_count": _number(
+            value.get("today_attributed_quote_count")
+        ),
+        "today_attributed_up_count": _number(
+            value.get("today_attributed_up_count")
+        ),
+        "today_attributed_breadth_pct": _number(
+            value.get("today_attributed_breadth_pct")
+        ),
+        "today_adjusted_breadth_pct": _number(
+            value.get("today_adjusted_breadth_pct")
+        ),
         "today_median_change_pct": _number(value.get("today_median_change_pct")),
-        "today_median_rebound_pct": _number(value.get("today_median_rebound_pct")),
-        "today_prior_median_ret5_pct": _number(value.get("today_prior_median_ret5_pct")),
         "today_strength_score": _number(value.get("today_strength_score")),
         "today_leadership_score": _number(value.get("today_leadership_score")),
         "strong_stock_count": _integer(value.get("strong_stock_count")),
+        "raw_strong_stock_count": _integer(value.get("raw_strong_stock_count")),
+        "attributed_strong_stock_count": _number(
+            value.get("attributed_strong_stock_count")
+        ),
         "effective_strong_count": effective_strong_count,
         "effective_breadth_pct": effective_breadth_pct,
         "leader_concentration": _number(value.get("leader_concentration")),
@@ -118,18 +247,6 @@ def _theme_view(value: Any) -> dict[str, Any] | None:
         "cross_day_persistent": value.get("cross_day_persistent") is True,
         "cross_day_confirmed": value.get("cross_day_confirmed") is True,
         "mainline_confirmed": value.get("mainline_confirmed") is True,
-        "reversal_candidate": value.get("reversal_candidate") is True,
-        "reversal_confirmed": value.get("reversal_confirmed") is True,
-        "reversal_confirmation_count": _integer(value.get("reversal_confirmation_count")),
-        "reversal_sample_gap_minutes": _number(value.get("reversal_sample_gap_minutes")),
-        "reversal_min_sample_gap_minutes": _number(value.get("reversal_min_sample_gap_minutes")),
-        "reversal_origin_weak": value.get("reversal_origin_weak") is True,
-        "reversal_quote_coverage_ok": value.get("reversal_quote_coverage_ok") is True,
-        "reversal_flow_available": value.get("reversal_flow_available") is True,
-        "reversal_flow_positive": value.get("reversal_flow_positive") is True,
-        "reversal_flow_flip": value.get("reversal_flow_flip") is True,
-        "reversal_flow_improving": value.get("reversal_flow_improving") is True,
-        "reversal_score": _number(value.get("reversal_score")),
         "core_overlap_count": _integer(value.get("core_overlap_count")),
         "core_overlap_ratio": _number(value.get("core_overlap_ratio")),
         "continued_core_codes": continued_codes,
@@ -141,7 +258,70 @@ def _theme_view(value: Any) -> dict[str, Any] | None:
         "strong_stocks": strong_stocks,
         "today_leader_stock": today_leader_stock,
         "today_leaders": today_leaders,
+        "related_themes": [
+            _text(label, 80)
+            for label in list(value.get("related_themes") or [])[:5]
+            if _text(label, 80)
+        ],
     }
+
+
+def _theme_driver_codes(theme: Mapping[str, Any], *, today: bool) -> list[str]:
+    key = "today_leaders" if today else "strong_stocks"
+    return [
+        _text(stock.get("code"), 12)
+        for stock in list(theme.get(key) or [])[:3]
+        if isinstance(stock, Mapping) and _text(stock.get("code"), 12)
+    ]
+
+
+def _diverse_themes(
+    ordered: list[dict[str, Any]],
+    *,
+    today: bool,
+) -> list[dict[str, Any]]:
+    """Collapse label clones driven by the same attributed stock cohort."""
+    selected: list[dict[str, Any]] = []
+    for raw_theme in ordered:
+        theme = dict(raw_theme)
+        drivers = _theme_driver_codes(theme, today=today)
+        duplicate: dict[str, Any] | None = None
+        for existing in selected:
+            existing_drivers = _theme_driver_codes(existing, today=today)
+            if not drivers or not existing_drivers:
+                continue
+            shared = set(drivers).intersection(existing_drivers)
+            overlap_base = min(len(drivers), len(existing_drivers))
+            high_overlap = bool(
+                overlap_base and len(shared) / overlap_base >= 0.6
+            )
+            same_leader = drivers[0] == existing_drivers[0]
+            leader_key = "today_leader_stock" if today else "leader_stock"
+            leader = theme.get(leader_key) if isinstance(theme.get(leader_key), Mapping) else {}
+            existing_leader = (
+                existing.get(leader_key)
+                if isinstance(existing.get(leader_key), Mapping)
+                else {}
+            )
+            weak_duplicate_leader = bool(
+                same_leader
+                and min(
+                    float(leader.get("attribution_weight") or 0.0),
+                    float(existing_leader.get("attribution_weight") or 0.0),
+                ) < 0.35
+            )
+            if high_overlap or weak_duplicate_leader:
+                duplicate = existing
+                break
+        if duplicate is None:
+            selected.append(theme)
+            continue
+        related = list(duplicate.get("related_themes") or [])
+        label = _text(theme.get("industry"), 80)
+        if label and label not in related:
+            related.append(label)
+        duplicate["related_themes"] = related[:5]
+    return selected
 
 
 def _coverage_reason_view(value: Any) -> dict[str, Any] | None:
@@ -167,13 +347,32 @@ def build_niuone_mainline_view(payload: Mapping[str, Any] | None) -> dict[str, A
     context = payload.get("niuone_context") if isinstance(payload.get("niuone_context"), Mapping) else {}
     market = context.get("market") if isinstance(context.get("market"), Mapping) else {}
     mainline = context.get("mainline") if isinstance(context.get("mainline"), Mapping) else {}
+    today_primary = _text(mainline.get("today_primary"), 80)
     raw_themes = context.get("themes") if isinstance(context.get("themes"), Mapping) else {}
-    themes = [theme for value in raw_themes.values() if (theme := _theme_view(value)) is not None]
-    themes.sort(key=lambda theme: float(theme.get("score") or 0), reverse=True)
-    today_themes = sorted(
+    theme_views = [theme for value in raw_themes.values() if (theme := _theme_view(value)) is not None]
+    eastmoney_signal, eastmoney_lookup = _eastmoney_signal_view(
+        payload.get("eastmoney_concept_signal")
+    )
+    matched_theme_count = 0
+    for theme in theme_views:
+        normalized = normalize_eastmoney_concept_name(theme.get("industry"))
+        board = eastmoney_lookup.get(normalized)
+        if board is not None:
+            theme["eastmoney"] = dict(board)
+            matched_theme_count += 1
+    eastmoney_signal["matched_theme_count"] = matched_theme_count
+    themes = _diverse_themes(
+        sorted(
+            theme_views,
+            key=lambda theme: float(theme.get("score") or 0),
+            reverse=True,
+        ),
+        today=False,
+    )
+    today_themes = _diverse_themes(sorted(
         (
             theme
-            for theme in themes
+            for theme in theme_views
             if theme.get("today_eligible_data") and theme.get("today_strength_score") is not None
         ),
         key=lambda theme: (
@@ -181,12 +380,7 @@ def build_niuone_mainline_view(payload: Mapping[str, Any] | None) -> dict[str, A
             float(theme.get("today_median_change_pct") or 0),
         ),
         reverse=True,
-    )
-    reversal_themes = sorted(
-        (theme for theme in themes if theme.get("reversal_candidate")),
-        key=lambda theme: float(theme.get("reversal_score") or 0),
-        reverse=True,
-    )
+    ), today=True)
     reference_pool_count = _integer(payload.get("reference_pool_count"))
     mapped_stock_count = _integer(context.get("mapped_stock_count"))
     diagnostics = (
@@ -241,24 +435,20 @@ def build_niuone_mainline_view(payload: Mapping[str, Any] | None) -> dict[str, A
             "reason": _text(mainline.get("reason"), 200),
             "intraday_primary": _text(mainline.get("intraday_primary"), 80),
             "intraday_primary_score": _number(mainline.get("intraday_primary_score")),
-            "observation_reason": _text(mainline.get("observation_reason"), 240),
-            "today_primary": _text(mainline.get("today_primary"), 80),
+            "today_primary": today_primary,
             "today_primary_score": _number(mainline.get("today_primary_score")),
             "today_primary_breadth_pct": _number(mainline.get("today_primary_breadth_pct")),
-            "today_observation_reason": _text(mainline.get("today_observation_reason"), 240),
-            "reversal_primary": _text(mainline.get("reversal_primary"), 80),
-            "reversal_primary_score": _number(mainline.get("reversal_primary_score")),
-            "reversal_confirmation_count": _integer(mainline.get("reversal_confirmation_count")),
-            "reversal_reason": _text(
-                mainline.get("reversal_reason") or mainline.get("today_observation_reason"),
-                240,
+            "today_observation_reason": (
+                "今日强度仅作观察，不改变原有跨日主线确认门槛"
+                if today_primary
+                else ""
             ),
         },
         "theme_count": _integer(context.get("theme_count")),
         "strong_stock_count": _integer(context.get("strong_stock_count")),
+        "eastmoney_concept_signal": eastmoney_signal,
         "themes": themes[:NIUONE_MAINLINE_THEME_LIMIT],
         "today_themes": today_themes[:NIUONE_MAINLINE_THEME_LIMIT],
-        "reversal_themes": reversal_themes[:NIUONE_MAINLINE_THEME_LIMIT],
         "data_quality": {
             "reference_pool_count": reference_pool_count,
             "reference_analysis_count": _integer(payload.get("reference_analysis_count")),

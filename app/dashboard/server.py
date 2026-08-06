@@ -10,20 +10,26 @@ import os
 import re
 import secrets
 import shlex
+import sqlite3
 import time
 import subprocess
 import sys
 import threading
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 import urllib.request
 
 from a_share_calendar import is_a_share_trading_day as calendar_is_a_share_trading_day, trading_day_status
-from dashboard_json_cache import read_json_cache, write_json_cache
+from dashboard_json_cache import (
+    read_json_cache,
+    read_versioned_json_cache,
+    write_json_cache,
+)
+from core.process_lease import FileLease
 from dashboard import practice_payload as practice_payload_impl
 from dashboard import practice_market_summary as practice_market_summary_impl
 from dashboard.niuone_mainline import build_niuone_mainline_view
@@ -90,11 +96,29 @@ from market_data.eastmoney_turnover import (
     fetch_market_turnover_estimate,
     fetch_turnover_profile,
 )
+from market_data.eastmoney_concept_boards import (
+    EASTMONEY_CONCEPT_BOARD_SCHEMA_VERSION,
+    EASTMONEY_CONCEPT_BOARD_SOURCE,
+    load_eastmoney_concept_board_signal,
+)
 from market_data.tencent_market_breadth import fetch_tencent_market_breadth
-from market_data.tencent_kline_cache import kline_cache_path, prewarm_completed_for_date
+from market_data.tencent_kline_cache import (
+    kline_cache_path,
+    kline_cache_readiness,
+    mark_prewarm_run_failed,
+    prewarm_completed_for_date,
+)
 from niuone_paths import apply_container_runtime_overrides, get_dashboard_env_file, get_dashboard_home, get_local_data_dir
 import push_history
-from screening.niuone_mainline_cache import write_niuone_mainline_cache
+from screening.candidate_cache import (
+    build_practice_candidates_cache_payload,
+    write_practice_candidates_cache,
+)
+from screening.niuone_mainline_cache import (
+    build_niuone_mainline_summary_cache_payload,
+    write_niuone_mainline_cache,
+    write_niuone_mainline_summary_cache,
+)
 from screening.niuone_minute import NiuOneMinuteEngine
 from screening.stock_universe import (
     DEFAULT_STOCK_UNIVERSE,
@@ -176,9 +200,12 @@ IWENCAI_DRAGON_TIGER_SNAPSHOT_FILE = Path(
     or CRON_OUTPUT_DIR / "iwencai_dragon_tiger_latest.json"
 ).expanduser()
 B1_CACHE_FILE = CRON_OUTPUT_DIR / "b1_screen_latest.json"
+PRACTICE_CANDIDATES_CACHE_FILE = CRON_OUTPUT_DIR / "practice_candidates_latest.json"
 NIUONE_MAINLINE_CACHE_FILE = CRON_OUTPUT_DIR / "niuone_mainline_latest.json"
 NIUONE_MAINLINE_MINUTE_CACHE_FILE = CRON_OUTPUT_DIR / "niuone_mainline_minute_latest.json"
+NIUONE_MAINLINE_SUMMARY_CACHE_FILE = CRON_OUTPUT_DIR / "niuone_mainline_summary_latest.json"
 STOCK_INDUSTRY_CACHE_FILE = CRON_OUTPUT_DIR / "stock_industry_cache.json"
+EASTMONEY_BOARD_CACHE_FILE = CRON_OUTPUT_DIR / "eastmoney_stock_boards.json"
 MONEY_FLOW_SNAPSHOT_FILE = CRON_OUTPUT_DIR / "industry_main_money_flow_cache.json"
 TURNOVER_PROFILE_CACHE_FILE = CRON_OUTPUT_DIR / "turnover_profile_cache.json"
 # Main-net samples use a new history file so legacy total-flow observations
@@ -267,6 +294,8 @@ B1_SCAN_TIMEOUT_SECONDS = int(os.environ.get("DASHBOARD_B1_SCAN_TIMEOUT_SECONDS"
 PRACTICE_SCHEDULE_TIMES_ENV = "DASHBOARD_PRACTICE_SCHEDULE_TIMES"
 LEGACY_B1_SCHEDULE_TIMES_ENV = "DASHBOARD_B1_SCHEDULE_TIMES"
 DEFAULT_PRACTICE_SCHEDULE_TIMES = "09:25,10:00,10:30,11:00,11:20,13:00,13:30,14:00,14:30,14:50"
+NIUONE_FORWARD_COHORT_START_ENV = "DASHBOARD_NIUONE_FORWARD_COHORT_START"
+DEFAULT_NIUONE_FORWARD_COHORT_START = "2026-08-04"
 
 
 def resolve_practice_schedule_times(values: Mapping[str, str] | None = None) -> tuple[str, ...]:
@@ -287,6 +316,7 @@ def resolve_practice_schedule_times(values: Mapping[str, str] | None = None) -> 
 PRACTICE_SCHEDULE_TIMES = resolve_practice_schedule_times()
 B1_SCHEDULE_ENABLED = os.environ.get("DASHBOARD_B1_SCHEDULE_ENABLED", "1").lower() not in {"0", "false", "no"}
 B1_SCHEDULE_STATE_FILE = CRON_STATE_DIR / "b1_schedule_state.json"
+B1_SCHEDULE_HISTORY_RETENTION_DAYS = 400
 B1_SCHEDULE_CATCHUP_MINUTES = int(os.environ.get("DASHBOARD_B1_SCHEDULE_CATCHUP_MINUTES", "35") or "35")
 B1_SCHEDULE_STALE_SECONDS = int(os.environ.get("DASHBOARD_B1_SCHEDULE_STALE_SECONDS", "900") or "900")
 B1_SCHEDULE_RUN_KEYS: set[str] = set()
@@ -301,10 +331,24 @@ KLINE_PREWARM_TIME = os.environ.get("DASHBOARD_KLINE_PREWARM_TIME", DEFAULT_KLIN
 KLINE_PREWARM_CATCHUP_MINUTES = int(os.environ.get("DASHBOARD_KLINE_PREWARM_CATCHUP_MINUTES", "15") or "15")
 KLINE_PREWARM_TIMEOUT_SECONDS = int(os.environ.get("DASHBOARD_KLINE_PREWARM_TIMEOUT_SECONDS", "600") or "600")
 KLINE_PREWARM_RETRY_SECONDS = int(os.environ.get("DASHBOARD_KLINE_PREWARM_RETRY_SECONDS", "300") or "300")
+KLINE_BOOTSTRAP_ENABLED = os.environ.get(
+    "DASHBOARD_KLINE_BOOTSTRAP_ENABLED", "1"
+).lower() not in {"0", "false", "no", "off"}
+KLINE_BOOTSTRAP_MAX_ATTEMPTS = _bounded_int_value(
+    os.environ.get("DASHBOARD_KLINE_BOOTSTRAP_MAX_ATTEMPTS", "3"), 3, 1, 12
+)
+KLINE_READINESS_MIN_COVERAGE_PERCENT = _bounded_int_value(
+    os.environ.get("DASHBOARD_KLINE_READINESS_MIN_COVERAGE_PERCENT", "90"),
+    90,
+    90,
+    100,
+)
+KLINE_READINESS_MIN_COVERAGE = KLINE_READINESS_MIN_COVERAGE_PERCENT / 100
 KLINE_PREWARM_LOCK = threading.Lock()
 KLINE_PREWARM_RUN_THREAD: threading.Thread | None = None
 KLINE_PREWARM_SCHEDULER_THREAD: threading.Thread | None = None
 KLINE_PREWARM_LAST_ATTEMPT_TS = 0.0
+KLINE_PREWARM_ATTEMPTS_BY_DATE: dict[str, int] = {}
 NIUONE_MAINLINE_MINUTE_REFRESH_ENABLED = str(
     os.environ.get("DASHBOARD_NIUONE_MAINLINE_MINUTE_REFRESH_ENABLED", "1") or "1"
 ).strip().lower() not in {"0", "false", "no", "off"}
@@ -313,6 +357,11 @@ NIUONE_MAINLINE_MINUTE_PENDING: dict[str, Any] | None = None
 NIUONE_MAINLINE_MINUTE_THREAD: threading.Thread | None = None
 NIUONE_MAINLINE_MINUTE_ENGINE: NiuOneMinuteEngine | None = None
 NIUONE_MAINLINE_MINUTE_ENGINE_PATHS: tuple[str, str] = ("", "")
+NIUONE_MAINLINE_MINUTE_NEXT_ALLOWED_MONOTONIC = 0.0
+NIUONE_MAINLINE_MINUTE_MAX_CPU_SHARE = 0.25
+NIUONE_MAINLINE_MINUTE_MAX_COOLDOWN_SECONDS = 300.0
+NIUONE_MAINLINE_MINUTE_PROCESS_TIMEOUT_SECONDS = 180.0
+NIUONE_MAINLINE_MINUTE_BUSY_RETRY_SECONDS = 15.0
 PENDING_DECISION_THREAD: threading.Thread | None = None
 PENDING_DECISION_POLL_SECONDS = float(os.environ.get("DASHBOARD_PENDING_DECISION_POLL_SECONDS", "5") or "5")
 PRACTICE_EQUITY_HEARTBEAT_LOCK = threading.Lock()
@@ -362,6 +411,7 @@ TRADER_MODULE_MTIME = 0.0
 TRADER_SELL_SIGNALS_FILE = SCRIPT_DIR / "trading" / "sell_signals.py"
 TRADER_SELL_SIGNALS_MTIME = 0.0
 TRADER_MODULE_LOCK = threading.Lock()
+PRACTICE_DECISION_LOCK = threading.Lock()
 PRACTICE_DECISION_KEYS: set[str] = set()
 PRACTICE_MANUAL_CYCLE_LOCK = threading.Lock()
 PRACTICE_MANUAL_CYCLE_STATE_LOCK = threading.RLock()
@@ -377,14 +427,25 @@ PRACTICE_MANUAL_CYCLE_STATE: dict[str, Any] = {
     "error": "",
 }
 PRACTICE_MANUAL_CYCLE_PUBLIC_FIELDS = (
+    "job_id",
     "running",
     "stage",
     "stage_label",
+    "completed",
+    "total",
+    "progress_pct",
+    "cache_hits",
+    "network_fallbacks",
+    "worker_count",
+    "source",
     "started_at",
+    "updated_at",
     "finished_at",
     "generated_at",
     "candidate_count",
     "manual_scan_reused",
+    "failure_stage",
+    "error_code",
     "error",
 )
 PRACTICE_MARKET_SUMMARY_LOCK = threading.Lock()
@@ -565,16 +626,25 @@ ENV_CONFIG_SCHEMA: list[dict[str, Any]] = [
     {"name": "DASHBOARD_TRADE_CANDIDATE_LIMIT", "label": "买卖决策候选数量", "group": "选股与买卖设置", "kind": "int", "default": "10", "effect": "runtime"},
     {"name": "DASHBOARD_B3_EXIT_TIME", "label": "B3开盘离场检查时间", "group": "选股与买卖设置", "kind": "time", "default": "09:37", "effect": "runtime"},
     {"name": "DASHBOARD_TIME_EXIT_TIME", "label": "尾盘离场检查时间", "group": "选股与买卖设置", "kind": "time", "default": "14:45", "effect": "runtime"},
+    {"name": "DASHBOARD_NIUONE_FORWARD_PREFLIGHT_CRON", "label": "牛牛严格前向开盘前协议预检", "group": "选股与买卖设置", "kind": "cron_time", "default": "5 9 * * 1-5", "effect": "next_run"},
+    {"name": "DASHBOARD_NIUONE_EQUITY_SNAPSHOT_CRON", "label": "牛牛严格前向盘后净值快照", "group": "选股与买卖设置", "kind": "cron_time", "default": "15 15 * * 1-5", "effect": "next_run"},
+    {"name": "DASHBOARD_NIUONE_FORWARD_CRON", "label": "牛牛严格前向评估时间", "group": "选股与买卖设置", "kind": "cron_time", "default": "20 15 * * 1-5", "effect": "next_run"},
+    {"name": NIUONE_FORWARD_COHORT_START_ENV, "label": "牛牛严格前向队列起始日", "group": "选股与买卖设置", "kind": "text", "default": DEFAULT_NIUONE_FORWARD_COHORT_START, "effect": "next_run"},
     {"name": ACTIVE_STRATEGY_ENV, "label": "当前独立策略", "group": "选股与交易策略", "kind": "strategy_suite", "default": default_enabled_persona_strategies_value(), "effect": "runtime"},
     {"name": PRESET_STRATEGY_TEXT_ENV, "label": "预设文字策略", "group": "选股与交易策略", "kind": "preset_strategy_text", "default": "", "effect": "runtime"},
-    {"name": "DASHBOARD_B1_SCAN_TIMEOUT_SECONDS", "label": "实战选股扫描超时秒数", "group": "任务调度", "kind": "int", "default": "480", "effect": "restart"},
-    {"name": "DASHBOARD_B1_SCAN_WORKERS", "label": "实战选股并发数", "group": "任务调度", "kind": "int", "default": "6", "effect": "restart"},
+    {"name": "DASHBOARD_B1_SCAN_TIMEOUT_SECONDS", "label": "实战选股扫描超时秒数", "group": "任务调度", "kind": "int", "default": "480", "effect": "restart", "min": "60", "max": "1800"},
+    {"name": "DASHBOARD_B1_SCAN_WORKERS", "label": "实战选股并发数", "group": "任务调度", "kind": "int", "default": "6", "effect": "restart", "min": "1", "max": "16"},
+    {"name": "DASHBOARD_TENCENT_QUOTE_STAGE_TIMEOUT_SECONDS", "label": "腾讯全市场行情阶段总超时秒数", "group": "任务调度", "kind": "int", "default": "90", "effect": "restart", "min": "15", "max": "300"},
     {"name": "DASHBOARD_KLINE_CACHE_ENABLED", "label": "启用本地日K缓存", "group": "任务调度", "kind": "bool", "default": "1", "effect": "restart"},
     {"name": "DASHBOARD_KLINE_PREWARM_ENABLED", "label": "启用盘前日K预热", "group": "任务调度", "kind": "bool", "default": "1", "effect": "restart"},
     {"name": "DASHBOARD_KLINE_PREWARM_TIME", "label": "盘前日K预热时间", "group": "任务调度", "kind": "time", "default": DEFAULT_KLINE_PREWARM_TIME, "effect": "restart"},
     {"name": "DASHBOARD_KLINE_PREWARM_WORKERS", "label": "盘前日K预热并发数", "group": "任务调度", "kind": "int", "default": "12", "effect": "restart"},
     {"name": "DASHBOARD_KLINE_PREWARM_TIMEOUT_SECONDS", "label": "盘前日K预热超时秒数", "group": "任务调度", "kind": "int", "default": "600", "effect": "restart"},
     {"name": "DASHBOARD_KLINE_PREWARM_CATCHUP_MINUTES", "label": "盘前日K预热补跑窗口分钟", "group": "任务调度", "kind": "int", "default": "15", "effect": "restart"},
+    {"name": "DASHBOARD_KLINE_BOOTSTRAP_ENABLED", "label": "部署后自动初始化日K", "group": "任务调度", "kind": "bool", "default": "1", "effect": "restart"},
+    {"name": "DASHBOARD_KLINE_BOOTSTRAP_MAX_ATTEMPTS", "label": "日K初始化最大尝试次数", "group": "任务调度", "kind": "int", "default": "3", "effect": "restart"},
+    {"name": "DASHBOARD_KLINE_READINESS_MIN_COVERAGE_PERCENT", "label": "日K安全覆盖率百分比", "group": "任务调度", "kind": "int", "default": "90", "effect": "restart", "min": "90", "max": "100"},
+    {"name": "DASHBOARD_MANUAL_DATA_INITIALIZATION_TIMEOUT_SECONDS", "label": "手动任务等待数据初始化秒数", "group": "任务调度", "kind": "int", "default": "660", "effect": "restart"},
     {"name": "DASHBOARD_MANUAL_SCAN_REUSE_SECONDS", "label": "手动选股复用候选秒数", "group": "任务调度", "kind": "int", "default": "0", "effect": "restart"},
     {"name": "DASHBOARD_B1_SCHEDULE_CATCHUP_MINUTES", "label": "实战选股漏触发补跑窗口分钟", "group": "任务调度", "kind": "int", "default": "35", "effect": "restart"},
     {"name": "DASHBOARD_B1_SCHEDULE_STALE_SECONDS", "label": "实战选股运行中陈旧秒数", "group": "任务调度", "kind": "int", "default": "900", "effect": "restart"},
@@ -699,6 +769,19 @@ ENV_CONFIG_BY_NAME = {item["name"]: item for item in ENV_CONFIG_SCHEMA}
 ADMIN_VISIBLE_ENV_NAMES = [
     "DASHBOARD_ADMIN_PASSWORD",
     "DASHBOARD_PUBLIC_REFRESH_SECONDS",
+    "DASHBOARD_B1_SCAN_TIMEOUT_SECONDS",
+    "DASHBOARD_B1_SCAN_WORKERS",
+    "DASHBOARD_TENCENT_QUOTE_STAGE_TIMEOUT_SECONDS",
+    "DASHBOARD_KLINE_CACHE_ENABLED",
+    "DASHBOARD_KLINE_PREWARM_ENABLED",
+    "DASHBOARD_KLINE_PREWARM_TIME",
+    "DASHBOARD_KLINE_PREWARM_WORKERS",
+    "DASHBOARD_KLINE_PREWARM_TIMEOUT_SECONDS",
+    "DASHBOARD_KLINE_PREWARM_CATCHUP_MINUTES",
+    "DASHBOARD_KLINE_BOOTSTRAP_ENABLED",
+    "DASHBOARD_KLINE_BOOTSTRAP_MAX_ATTEMPTS",
+    "DASHBOARD_KLINE_READINESS_MIN_COVERAGE_PERCENT",
+    "DASHBOARD_MANUAL_DATA_INITIALIZATION_TIMEOUT_SECONDS",
     "DASHBOARD_NIUONE_MAINLINE_MINUTE_REFRESH_ENABLED",
     "DASHBOARD_MARKET_BREADTH_SAMPLE_INTERVAL_SECONDS",
     "DASHBOARD_US_FEATURES_ENABLED",
@@ -769,6 +852,10 @@ ADMIN_VISIBLE_ENV_NAMES = [
     "DASHBOARD_TRADE_CANDIDATE_LIMIT",
     "DASHBOARD_B3_EXIT_TIME",
     "DASHBOARD_TIME_EXIT_TIME",
+    "DASHBOARD_NIUONE_FORWARD_PREFLIGHT_CRON",
+    "DASHBOARD_NIUONE_EQUITY_SNAPSHOT_CRON",
+    "DASHBOARD_NIUONE_FORWARD_CRON",
+    NIUONE_FORWARD_COHORT_START_ENV,
     ACTIVE_STRATEGY_ENV,
     PRESET_STRATEGY_TEXT_ENV,
     "DASHBOARD_US_MARKET_SUMMARY_CRON",
@@ -1065,6 +1152,147 @@ def dashboard_trading_day_status(now: datetime | None = None) -> dict[str, Any]:
     return trading_day_status(current)
 
 
+def accepted_kline_dates_for_dashboard(now: datetime | None = None) -> set[str]:
+    """Return dates whose completed history is safe for the next live scan."""
+    current = now or current_cn_datetime()
+    try:
+        calendar = trading_day_status(current, allow_refresh=False)
+    except Exception:
+        calendar = {
+            "date": current.strftime("%Y-%m-%d"),
+            "is_trading_day": current.weekday() < 5,
+            "previous_trading_day": "",
+        }
+    accepted = {
+        str(calendar.get("previous_trading_day") or "")[:10],
+    }
+    if calendar.get("is_trading_day"):
+        accepted.add(str(calendar.get("date") or current.strftime("%Y-%m-%d"))[:10])
+    return {
+        value
+        for value in accepted
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value)
+    }
+
+
+def practice_scan_requires_full_kline_cache() -> bool:
+    """Dashboard trading suites consume daily history only after cache readiness."""
+    return True
+
+
+def _runtime_storage_status() -> dict[str, Any]:
+    home = Path(DASHBOARD_HOME).expanduser()
+    data_dir = Path(os.environ.get("NIUONE_CONTAINER_DATA_DIR") or LOCAL_DATA_DIR).expanduser()
+    writable = home.exists() and home.is_dir() and os.access(home, os.W_OK)
+    containerized = bool(os.environ.get("NIUONE_CONTAINER_DATA_DIR"))
+    persistent_detected = os.path.ismount(data_dir) if containerized else True
+    return {
+        "writable": writable,
+        "containerized": containerized,
+        "persistent_storage_detected": persistent_detected,
+        "error_code": (
+            "runtime_storage_not_writable"
+            if not writable
+            else "runtime_storage_not_persistent"
+            if containerized and not persistent_detected
+            else ""
+        ),
+    }
+
+
+def market_data_readiness(now: datetime | None = None) -> dict[str, Any]:
+    """Build the public, non-sensitive deployment and market-data readiness view."""
+    current = now or current_cn_datetime()
+    accepted_dates = accepted_kline_dates_for_dashboard(current)
+    cache = kline_cache_readiness(
+        accepted_last_dates=accepted_dates,
+        path=kline_cache_path(),
+        minimum_coverage=KLINE_READINESS_MIN_COVERAGE,
+    )
+    try:
+        active_strategy = active_strategy_suite()
+    except (TypeError, ValueError):
+        active_strategy = "invalid"
+    requires_full_cache = practice_scan_requires_full_kline_cache()
+    storage = _runtime_storage_status()
+    offset = datetime.now().astimezone().utcoffset()
+    timezone_ok = offset == timedelta(hours=8)
+    try:
+        configured_workers = int(os.environ.get("DASHBOARD_B1_SCAN_WORKERS", "6") or "6")
+    except (TypeError, ValueError):
+        configured_workers = 6
+    cpu_count = max(1, int(os.cpu_count() or 1))
+    effective_workers = max(1, min(16, configured_workers, cpu_count * 2))
+    data_ready = bool(cache.get("ready")) or not requires_full_cache
+    blockers = []
+    warnings = []
+    if requires_full_cache and not cache.get("ready"):
+        if not KLINE_CACHE_ENABLED:
+            blockers.append("kline_cache_disabled")
+        elif not KLINE_PREWARM_ENABLED:
+            blockers.append("kline_prewarm_disabled")
+        else:
+            blockers.append(str(cache.get("error_code") or "kline_cache_incomplete"))
+    if not storage["writable"]:
+        blockers.append("runtime_storage_not_writable")
+    elif storage["containerized"] and not storage["persistent_storage_detected"]:
+        warnings.append("runtime_storage_not_persistent")
+    if not timezone_ok:
+        warnings.append("timezone_not_asia_shanghai")
+    ready = data_ready and storage["writable"]
+    if ready and warnings:
+        status = "degraded"
+    elif ready:
+        status = "ready"
+    elif KLINE_PREWARM_ENABLED and (
+        cache.get("status") == "running" or KLINE_PREWARM_LOCK.locked()
+    ):
+        status = "initializing"
+    else:
+        status = "not_ready"
+    requested = int(cache.get("requested_count") or 0)
+    completed = int(cache.get("completed_count") or 0)
+    progress_pct = round(completed / requested * 100, 1) if requested else 0.0
+    return {
+        "ready": ready,
+        "data_ready": data_ready,
+        "status": status,
+        "status_label": {
+            "ready": "市场数据已就绪",
+            "degraded": "市场数据可用，部署环境有提醒",
+            "initializing": "正在初始化市场数据",
+            "not_ready": "市场数据尚未就绪",
+        }[status],
+        "checked_at": current.strftime("%Y-%m-%d %H:%M:%S"),
+        "active_strategy": active_strategy,
+        "requires_full_kline_cache": requires_full_cache,
+        "blockers": list(dict.fromkeys(blockers)),
+        "warnings": list(dict.fromkeys(warnings)),
+        "kline": {
+            **cache,
+            "progress_pct": progress_pct,
+            "initializing": bool(
+                KLINE_PREWARM_ENABLED
+                and (cache.get("status") == "running" or KLINE_PREWARM_LOCK.locked())
+            ),
+        },
+        "deployment": {
+            "storage": storage,
+            "timezone": {
+                "ok": timezone_ok,
+                "expected": "Asia/Shanghai",
+                "utc_offset_seconds": int(offset.total_seconds()) if offset is not None else None,
+            },
+            "runtime": {
+                "python": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+                "cpu_count": cpu_count,
+                "configured_scan_workers": configured_workers,
+                "effective_scan_workers": effective_workers,
+            },
+        },
+    }
+
+
 def annotate_practice_payload_clock(payload: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
     current = now or current_cn_datetime()
     current_date = current_cn_date_key(current)
@@ -1164,6 +1392,18 @@ def get_practice_payload() -> dict[str, Any]:
         payload = trader.enrich_portfolio(state)
         equity_history = state.get("equity_history", []) or []
         daily_equity_history = state.get("daily_equity_history", []) or []
+        history_loader = getattr(trader, "load_account_history", None)
+        if callable(history_loader):
+            equity_history = history_loader(
+                "equity_history",
+                equity_history,
+                limit=2000,
+            )
+            daily_equity_history = history_loader(
+                "daily_equity_history",
+                daily_equity_history,
+                limit=500,
+            )
         payload["equity_history"] = filter_future_equity_points(
             equity_history,
             now=now,
@@ -1430,7 +1670,18 @@ def _candidate_rows(payload: dict[str, Any], *keys: str) -> list[Any]:
 
 def normalize_b1_payload_for_trader(b1_payload: dict[str, Any]) -> dict[str, Any]:
     items = _candidate_rows(b1_payload, "trade_items", "items", "candidates")
-    payload = {"items": items, "generated_at": b1_payload.get("generated_at", "")}
+    observed_items = _candidate_rows(
+        b1_payload,
+        "observed_items",
+        "items",
+        "candidates",
+        "trade_items",
+    )
+    payload = {
+        "items": items,
+        "observed_items": observed_items,
+        "generated_at": b1_payload.get("generated_at", ""),
+    }
     if isinstance(b1_payload.get("market_snapshot"), dict):
         payload["market_snapshot"] = b1_payload.get("market_snapshot")
     if isinstance(b1_payload.get("sector_tide_context"), dict):
@@ -1447,7 +1698,11 @@ def normalize_b1_payload_for_trader(b1_payload: dict[str, Any]) -> dict[str, Any
     return payload
 
 def run_practice_decision(b1_payload: dict[str, Any]) -> dict[str, Any]:
-    return get_trader_module().run_decision_after_b1(b1_payload)
+    # Different schedule slots may finish their scans out of order. Serialize
+    # the account read/decision/execute/save transaction so a later slot cannot
+    # trade against a portfolio snapshot captured before an earlier fill.
+    with PRACTICE_DECISION_LOCK:
+        return get_trader_module().run_decision_after_b1(b1_payload)
 
 
 def _tencent_key_for_code(code: str) -> str:
@@ -1497,10 +1752,19 @@ def refresh_b1_candidate_cache_from_current_pool() -> dict[str, Any]:
             parsed["candidates"] = []
             parsed["count"] = 0
             parsed["refreshed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            B1_CACHE_FILE.write_text(json.dumps(parsed, ensure_ascii=False), encoding="utf-8")
-            MULTI_STRATEGY_CACHE_FILE.write_text(
-                json.dumps(parsed, ensure_ascii=False, indent=2),
-                encoding="utf-8",
+            multi_cache_file = _derived_read_model_path(
+                MULTI_STRATEGY_CACHE_FILE,
+                B1_CACHE_FILE,
+            )
+            write_json_cache(B1_CACHE_FILE, parsed)
+            write_json_cache(multi_cache_file, parsed)
+            write_practice_candidates_cache(
+                _derived_read_model_path(
+                    PRACTICE_CANDIDATES_CACHE_FILE,
+                    B1_CACHE_FILE,
+                ),
+                parsed,
+                source_path=multi_cache_file,
             )
             B1_CANDIDATE_REFRESH_LAST_TS = time.time()
             return {"updated": 0, "count": 0}
@@ -1551,7 +1815,28 @@ def refresh_b1_candidate_cache_from_current_pool() -> dict[str, Any]:
             )
             if not multi:
                 continue
-            best = multi["strategies"].get(multi["best_strategy"], {})
+            best_strategy = str(multi["best_strategy"] or "")
+            best = multi["strategies"].get(best_strategy, {})
+            niuone_best = best_strategy in scanner.NIUONE_STRATEGY_IDS
+            factual_industry = scanner.normalize_industry_name(
+                best.get("classification_industry")
+                or old.get("industry")
+                or old.get("sector")
+            )
+            signal_theme = (
+                scanner.normalize_industry_name(
+                    best.get("signal_theme") or best.get("industry")
+                )
+                if niuone_best
+                else ""
+            )
+            candidate_industry = (
+                factual_industry
+                if niuone_best
+                else scanner.normalize_industry_name(
+                    best.get("industry") or factual_industry
+                )
+            )
             item = {
                 **old,
                 "code": code,
@@ -1573,7 +1858,7 @@ def refresh_b1_candidate_cache_from_current_pool() -> dict[str, Any]:
                 "j_recovering": best.get("j_recovering", False),
                 "j_oversold": best.get("j_oversold", False),
                 "risk_flags": best.get("risk_flags", []),
-                "best_strategy": multi["best_strategy"],
+                "best_strategy": best_strategy,
                 "best_score": multi["best_score"],
                 "best_decision_score": multi.get("best_decision_score", multi["best_score"]),
                 "best_verdict": multi["best_verdict"],
@@ -1584,8 +1869,57 @@ def refresh_b1_candidate_cache_from_current_pool() -> dict[str, Any]:
                 "time_stop": best.get("time_stop"),
                 "actionable": best.get("actionable"),
                 "hard_blockers": best.get("hard_blockers", []),
-                "industry": best.get("industry") or old.get("industry") or old.get("sector") or "",
-                "sector": best.get("industry") or old.get("sector") or old.get("industry") or "",
+                "industry": candidate_industry,
+                "sector": candidate_industry,
+                "signal_theme": signal_theme,
+                "theme_memberships": list(
+                    best.get("theme_memberships") or []
+                ),
+                "theme_attributions": list(
+                    best.get("theme_attributions") or []
+                ),
+                "signal_theme_attribution_score": best.get(
+                    "signal_theme_attribution_score"
+                ),
+                "signal_theme_attribution_weight": best.get(
+                    "signal_theme_attribution_weight"
+                ),
+                "signal_theme_historical_prior_score": best.get(
+                    "signal_theme_historical_prior_score"
+                ),
+                "signal_theme_cohort_alignment_score": best.get(
+                    "signal_theme_cohort_alignment_score"
+                ),
+                "signal_theme_peer_resonance_score": best.get(
+                    "signal_theme_peer_resonance_score"
+                ),
+                "signal_theme_return_correlation_score": best.get(
+                    "signal_theme_return_correlation_score"
+                ),
+                "signal_theme_return_correlation_rank_score": best.get(
+                    "signal_theme_return_correlation_rank_score"
+                ),
+                "signal_theme_return_correlation_observation_count": best.get(
+                    "signal_theme_return_correlation_observation_count"
+                ),
+                "signal_theme_return_correlation_peer_count": best.get(
+                    "signal_theme_return_correlation_peer_count"
+                ),
+                "signal_theme_specificity_score": best.get(
+                    "signal_theme_specificity_score"
+                ),
+                "signal_theme_membership_source": best.get(
+                    "signal_theme_membership_source"
+                ),
+                "unattributed_theme_weight": best.get(
+                    "unattributed_theme_weight"
+                ),
+                "theme_attribution_confident": best.get(
+                    "theme_attribution_confident"
+                ),
+                "theme_attribution_gap": best.get(
+                    "theme_attribution_gap"
+                ),
                 "market_regime": best.get("market_regime"),
                 "market_score": best.get("market_score"),
                 "market_hard_stop": best.get("market_hard_stop"),
@@ -1701,9 +2035,20 @@ def refresh_b1_candidate_cache_from_current_pool() -> dict[str, Any]:
             },
             "refreshed_at": refreshed_at,
         }
-        json_text = json.dumps(output, ensure_ascii=False, indent=2)
-        B1_CACHE_FILE.write_text(json_text + "\n", encoding="utf-8")
-        MULTI_STRATEGY_CACHE_FILE.write_text(json_text + "\n", encoding="utf-8")
+        multi_cache_file = _derived_read_model_path(
+            MULTI_STRATEGY_CACHE_FILE,
+            B1_CACHE_FILE,
+        )
+        write_json_cache(B1_CACHE_FILE, output)
+        write_json_cache(multi_cache_file, output)
+        write_practice_candidates_cache(
+            _derived_read_model_path(
+                PRACTICE_CANDIDATES_CACHE_FILE,
+                B1_CACHE_FILE,
+            ),
+            output,
+            source_path=multi_cache_file,
+        )
         with API_RESPONSE_LOCK:
             API_RESPONSE_CACHE.pop(PRACTICE_CANDIDATES_CACHE_KEY, None)
         B1_CANDIDATE_REFRESH_LAST_TS = time.time()
@@ -1778,6 +2123,7 @@ def run_practice_decision_logged(
     except Exception as exc:
         print(f"[WARN] 此刻盘面总结与评价刷新失败: {type(exc).__name__}: {exc}", flush=True)
     item_count = len(payload.get("items") or [])
+    observed_count = len(payload.get("observed_items") or [])
     slot_note = ""
     if payload.get("schedule_slot"):
         kind_label = "补跑" if payload.get("schedule_run_kind") == "catchup" else "定时"
@@ -1785,14 +2131,16 @@ def run_practice_decision_logged(
     if not item_count:
         record_practice_decision_event(
             payload,
-            f"选股完成{slot_note}但没有候选股，继续检查已有持仓的原策略退出规则。",
-            f"选股完成{slot_note}：0只候选，开始持仓退出检查",
+            f"选股完成{slot_note}：候选池{observed_count}只，其中0只进入买卖决策，"
+            "继续检查已有持仓的原策略退出规则。",
+            f"选股完成{slot_note}：候选池{observed_count}只，0只进入买卖决策，开始持仓退出检查",
         )
     elif record_start:
         record_practice_decision_event(
             payload,
-            f"选股完成{slot_note}：{item_count}只候选，开始生成买卖决策。",
-            f"选股后买卖决策开始{slot_note}",
+            f"选股完成{slot_note}：候选池{observed_count}只，其中{item_count}只进入买卖决策，"
+            "开始生成买卖决策。",
+            f"选股后买卖决策开始{slot_note}：候选池{observed_count}只，决策池{item_count}只",
         )
     try:
         return run_practice_decision(payload)
@@ -1825,6 +2173,50 @@ def maybe_run_practice_decision_async(b1_payload: dict[str, Any]) -> None:
         PRACTICE_DECISION_KEYS.clear()
     threading.Thread(target=_worker, name="niuniu-practice-decision", daemon=True).start()
 
+
+def _derived_read_model_path(configured: Path, reference: Path) -> Path:
+    """Keep compatibility tests that relocate legacy cache globals isolated."""
+    if configured.parent == CRON_OUTPUT_DIR and reference.parent != CRON_OUTPUT_DIR:
+        return reference.parent / configured.name
+    return configured
+
+
+def _file_mtime_ns(path: Path) -> int:
+    try:
+        return int(path.stat().st_mtime_ns)
+    except OSError:
+        return 0
+
+
+def _read_model_is_current(
+    snapshot_path: Path,
+    snapshot: Mapping[str, Any],
+    source_paths: tuple[Path, ...],
+) -> bool:
+    snapshot_mtime = _file_mtime_ns(snapshot_path)
+    if not snapshot_mtime:
+        return False
+    source_name = str(snapshot.get("source_cache") or "").strip()
+    if source_name:
+        source = next((path for path in source_paths if path.name == source_name), None)
+        if source is None or not source.exists():
+            return False
+        version = snapshot.get("source_version")
+        if isinstance(version, Mapping):
+            try:
+                stat = source.stat()
+                current_version = {
+                    "device": int(stat.st_dev),
+                    "inode": int(stat.st_ino),
+                    "size": int(stat.st_size),
+                    "mtime_ns": int(stat.st_mtime_ns),
+                }
+            except OSError:
+                return False
+            if current_version != dict(version):
+                return False
+    return snapshot_mtime >= max((_file_mtime_ns(path) for path in source_paths), default=0)
+
 def load_practice_candidates_cache() -> dict[str, Any]:
     strategy_suite = active_strategy_suite(
         os.environ.get(ACTIVE_STRATEGY_ENV),
@@ -1847,11 +2239,29 @@ def load_practice_candidates_cache() -> dict[str, Any]:
     }
     errors: list[str] = []
     stale_cache_found = False
-    for cache_file in (MULTI_STRATEGY_CACHE_FILE, B1_CACHE_FILE):
+    multi_cache_file = _derived_read_model_path(
+        MULTI_STRATEGY_CACHE_FILE,
+        B1_CACHE_FILE,
+    )
+    compact_cache_file = _derived_read_model_path(
+        PRACTICE_CANDIDATES_CACHE_FILE,
+        multi_cache_file,
+    )
+    source_cache_files = (multi_cache_file, B1_CACHE_FILE)
+    compact = read_versioned_json_cache(compact_cache_file)
+    cache_files: list[tuple[Path, dict[str, Any] | None, bool]] = []
+    if isinstance(compact, dict) and _read_model_is_current(
+        compact_cache_file,
+        compact,
+        source_cache_files,
+    ):
+        cache_files.append((compact_cache_file, compact, True))
+    cache_files.extend((path, None, False) for path in source_cache_files)
+    for cache_file, cached_payload, is_compact in cache_files:
         try:
-            if not cache_file.exists():
+            if cached_payload is None and not cache_file.exists():
                 continue
-            parsed = json.loads(cache_file.read_text(encoding="utf-8"))
+            parsed = cached_payload or read_json_cache(cache_file, None)
             if not isinstance(parsed, dict):
                 raise ValueError(f"候选缓存格式无效：{cache_file}")
             items = parsed.get("items") or parsed.get("candidates") or []
@@ -1898,6 +2308,19 @@ def load_practice_candidates_cache() -> dict[str, Any]:
             trade_items = sort_candidates_by_score(
                 active_rows(_candidate_rows(parsed, "trade_items", "items", "candidates"))
             )
+            if not is_compact:
+                parsed = build_practice_candidates_cache_payload(
+                    parsed,
+                    source_cache_name=cache_file.name,
+                )
+                try:
+                    write_practice_candidates_cache(
+                        compact_cache_file,
+                        parsed,
+                        source_path=cache_file,
+                    )
+                except OSError:
+                    pass
             return {
                 **parsed,
                 "generated_at": parsed.get("generated_at", ""),
@@ -1937,34 +2360,66 @@ def load_practice_candidates_cache() -> dict[str, Any]:
 
 
 def load_niuone_mainline_cache_payload() -> dict[str, Any]:
-    """Load the newest dedicated or migration-era NiuOne mainline payload."""
+    """Load operational NiuOne state, using legacy full scans only as fallback."""
     payloads: list[dict[str, Any]] = []
     for cache_file in (
         NIUONE_MAINLINE_MINUTE_CACHE_FILE,
         NIUONE_MAINLINE_CACHE_FILE,
-        MULTI_STRATEGY_CACHE_FILE,
-        B1_CACHE_FILE,
     ):
-        try:
-            parsed = json.loads(cache_file.read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError):
-            continue
+        parsed = read_json_cache(cache_file, None)
         if isinstance(parsed, dict) and isinstance(parsed.get("niuone_context"), dict):
             payloads.append(parsed)
-    if not payloads:
-        return {}
-    return max(payloads, key=lambda payload: str(payload.get("generated_at") or ""))
+    if payloads:
+        return max(payloads, key=lambda payload: str(payload.get("generated_at") or ""))
+    for cache_file in (MULTI_STRATEGY_CACHE_FILE, B1_CACHE_FILE):
+        parsed = read_json_cache(cache_file, None)
+        if isinstance(parsed, dict) and isinstance(parsed.get("niuone_context"), dict):
+            payloads.append(parsed)
+    return (
+        max(payloads, key=lambda payload: str(payload.get("generated_at") or ""))
+        if payloads
+        else {}
+    )
+
+
+def load_niuone_mainline_summary_payload() -> dict[str, Any]:
+    """Load the bounded Dashboard theme model and lazily migrate old caches."""
+    summary_path = _derived_read_model_path(
+        NIUONE_MAINLINE_SUMMARY_CACHE_FILE,
+        NIUONE_MAINLINE_CACHE_FILE,
+    )
+    summary = read_versioned_json_cache(summary_path)
+    operational_paths = (
+        NIUONE_MAINLINE_MINUTE_CACHE_FILE,
+        NIUONE_MAINLINE_CACHE_FILE,
+    )
+    if (
+        isinstance(summary, dict)
+        and isinstance(summary.get("niuone_context"), dict)
+        and _file_mtime_ns(summary_path)
+        >= max((_file_mtime_ns(path) for path in operational_paths), default=0)
+    ):
+        return summary
+    operational = load_niuone_mainline_cache_payload()
+    if not operational:
+        return summary if isinstance(summary, dict) else {}
+    compact = build_niuone_mainline_summary_cache_payload(operational)
+    try:
+        write_niuone_mainline_summary_cache(summary_path, operational)
+    except OSError:
+        pass
+    return compact
 
 
 def load_niuone_mainline_view() -> dict[str, Any]:
-    return build_niuone_mainline_view(load_niuone_mainline_cache_payload())
+    return build_niuone_mainline_view(load_niuone_mainline_summary_payload())
 
 
 def get_niuone_mainline_minute_engine() -> NiuOneMinuteEngine:
     """Return one in-process engine for the active private cache paths."""
 
     global NIUONE_MAINLINE_MINUTE_ENGINE, NIUONE_MAINLINE_MINUTE_ENGINE_PATHS
-    resolved_paths = (str(kline_cache_path()), str(STOCK_INDUSTRY_CACHE_FILE))
+    resolved_paths = (str(kline_cache_path()), str(EASTMONEY_BOARD_CACHE_FILE))
     with NIUONE_MAINLINE_MINUTE_STATE_LOCK:
         if (
             NIUONE_MAINLINE_MINUTE_ENGINE is None
@@ -1996,13 +2451,34 @@ def run_niuone_mainline_minute_refresh(
     flow_rows = read_json_cache(MONEY_FLOW_SNAPSHOT_FILE, None) or {}
     if str(flow_rows.get("generated_at") or "")[:10] != quote_generated_at[:10]:
         flow_rows = {}
+    resolved_now = current_cn_datetime()
     scan = (engine or get_niuone_mainline_minute_engine()).build_scan(
         quote_snapshot,
         previous_payload=previous_payload,
         flow_rows=flow_rows,
-        now=current_cn_datetime(),
+        now=resolved_now,
     )
+    try:
+        scan["eastmoney_concept_signal"] = (
+            load_eastmoney_concept_board_signal().to_dict()
+        )
+    except Exception:
+        scan["eastmoney_concept_signal"] = {
+            "schema_version": EASTMONEY_CONCEPT_BOARD_SCHEMA_VERSION,
+            "source": EASTMONEY_CONCEPT_BOARD_SOURCE,
+            "captured_at": resolved_now.strftime("%Y-%m-%d %H:%M:%S"),
+            "available": False,
+            "status": "upstream_unavailable",
+            "boards": [],
+        }
     payload = write_niuone_mainline_cache(NIUONE_MAINLINE_MINUTE_CACHE_FILE, scan)
+    write_niuone_mainline_summary_cache(
+        _derived_read_model_path(
+            NIUONE_MAINLINE_SUMMARY_CACHE_FILE,
+            NIUONE_MAINLINE_CACHE_FILE,
+        ),
+        scan,
+    )
     invalidate_api_cache(NIUONE_MAINLINE_CACHE_KEY)
     print(
         "[Theme strength] minute quotes updated "
@@ -2014,26 +2490,129 @@ def run_niuone_mainline_minute_refresh(
         "updated": True,
         "quote_generated_at": payload.get("quote_generated_at") or "",
         "generated_at": payload.get("generated_at") or "",
+        "calculation_duration_ms": max(
+            0, int(payload.get("calculation_duration_ms") or 0)
+        ),
     }
 
 
+def niuone_mainline_minute_cooldown_seconds(
+    calculation_duration_ms: object,
+    *,
+    sample_interval_seconds: float | None = None,
+) -> float:
+    """Keep expensive theme refreshes within a bounded single-core duty cycle."""
+
+    try:
+        duration_seconds = max(0.0, float(calculation_duration_ms) / 1000.0)
+    except (TypeError, ValueError):
+        duration_seconds = 0.0
+    interval_seconds = max(
+        1.0,
+        float(
+            MARKET_BREADTH_SAMPLE_INTERVAL_SECONDS
+            if sample_interval_seconds is None
+            else sample_interval_seconds
+        ),
+    )
+    cadence_wait = max(0.0, interval_seconds - duration_seconds)
+    guarded_wait = duration_seconds * (
+        (1.0 / NIUONE_MAINLINE_MINUTE_MAX_CPU_SHARE) - 1.0
+    )
+    return min(
+        NIUONE_MAINLINE_MINUTE_MAX_COOLDOWN_SECONDS,
+        max(cadence_wait, guarded_wait),
+    )
+
+
+def run_niuone_mainline_minute_refresh_isolated(
+    quote_snapshot: Mapping[str, Any],
+    *,
+    timeout_seconds: float = NIUONE_MAINLINE_MINUTE_PROCESS_TIMEOUT_SECONDS,
+) -> bool:
+    """Run the CPU-heavy refresh in a bounded interpreter process."""
+
+    request_body = json.dumps(
+        dict(quote_snapshot),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    process = subprocess.Popen(
+        [sys.executable, "-B", str(ENTRYPOINT_DIR / "niuone_minute_refresh.py")],
+        stdin=subprocess.PIPE,
+    )
+    try:
+        process.communicate(
+            input=request_body,
+            timeout=max(1.0, float(timeout_seconds)),
+        )
+    except subprocess.TimeoutExpired:
+        process.terminate()
+        try:
+            process.communicate(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+        print(
+            "[WARN] Minute theme-strength refresh retained previous cache: "
+            "isolated compute timed out",
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
+    return process.returncode == 0
+
+
+def niuone_mainline_heavy_scan_in_progress() -> bool:
+    """Prefer complete research and trading scans over the derived minute view."""
+
+    return (
+        B1_FULL_SCAN_LOCK.locked()
+        or NIUONE_MAINLINE_SCAN_LOCK.locked()
+        or KLINE_PREWARM_LOCK.locked()
+    )
+
+
 def _niuone_mainline_minute_worker() -> None:
+    global NIUONE_MAINLINE_MINUTE_NEXT_ALLOWED_MONOTONIC
     global NIUONE_MAINLINE_MINUTE_PENDING, NIUONE_MAINLINE_MINUTE_THREAD
     while True:
         with NIUONE_MAINLINE_MINUTE_STATE_LOCK:
             snapshot = NIUONE_MAINLINE_MINUTE_PENDING
-            NIUONE_MAINLINE_MINUTE_PENDING = None
             if snapshot is None:
                 NIUONE_MAINLINE_MINUTE_THREAD = None
                 return
+            wait_seconds = max(
+                0.0,
+                NIUONE_MAINLINE_MINUTE_NEXT_ALLOWED_MONOTONIC - time.monotonic(),
+            )
+            if wait_seconds <= 0 and niuone_mainline_heavy_scan_in_progress():
+                wait_seconds = NIUONE_MAINLINE_MINUTE_BUSY_RETRY_SECONDS
+            if wait_seconds <= 0:
+                NIUONE_MAINLINE_MINUTE_PENDING = None
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+            continue
+        started = time.monotonic()
         try:
-            run_niuone_mainline_minute_refresh(snapshot)
+            updated = run_niuone_mainline_minute_refresh_isolated(snapshot)
         except Exception as exc:
+            updated = False
             print(
                 f"[WARN] Minute theme-strength refresh retained previous cache: "
                 f"{type(exc).__name__}: {exc}",
                 file=sys.stderr,
                 flush=True,
+            )
+        elapsed_ms = max(0, int((time.monotonic() - started) * 1000))
+        cooldown_seconds = niuone_mainline_minute_cooldown_seconds(
+            elapsed_ms
+        )
+        if updated:
+            invalidate_api_cache(NIUONE_MAINLINE_CACHE_KEY)
+        with NIUONE_MAINLINE_MINUTE_STATE_LOCK:
+            NIUONE_MAINLINE_MINUTE_NEXT_ALLOWED_MONOTONIC = (
+                time.monotonic() + cooldown_seconds
             )
 
 
@@ -2071,6 +2650,22 @@ def summarize_b1_scan_failure(stderr: str, stdout: str, limit: int = 900) -> str
     return detail
 
 
+def b1_scan_stage_error_code(stage: str, *, timed_out: bool = False) -> str:
+    """Map scanner progress stages to stable, actionable public error codes."""
+    suffix = "timeout" if timed_out else "failed"
+    prefix = {
+        "code_pool": "code_pool",
+        "quotes": "quote_source",
+        "cache_check": "kline_cache",
+        "industry_context": "industry_context",
+        "kline_prepare": "kline_prepare",
+        "scoring": "strategy_scoring",
+        "news_precheck": "news_precheck",
+        "persisting": "candidate_persist",
+    }.get(str(stage or ""), "scan_aggregate" if timed_out else "candidate_scan")
+    return f"{prefix}_{suffix}"
+
+
 def niuone_mainline_cache_generated_for_slot(slot_key: str) -> bool:
     """Return whether the independent cache already covers a schedule slot."""
     if not slot_key:
@@ -2093,6 +2688,13 @@ def run_independent_niuone_mainline_scan(
         return {"skipped": True, "reason": "slot_already_generated"}
     if not NIUONE_MAINLINE_SCAN_LOCK.acquire(blocking=False):
         return {"skipped": True, "reason": "scan_in_progress"}
+    process_lease = FileLease(
+        CRON_STATE_DIR / "niuone_mainline_scan.lock",
+        stale_after_seconds=B1_SCAN_TIMEOUT_SECONDS + 120,
+    )
+    if not process_lease.acquire():
+        NIUONE_MAINLINE_SCAN_LOCK.release()
+        return {"skipped": True, "reason": "scan_in_progress_other_process"}
     try:
         script = Path(
             os.environ.get("DASHBOARD_B1_SCANNER", ENTRYPOINT_DIR / "multi_strategy_screen.py")
@@ -2128,6 +2730,7 @@ def run_independent_niuone_mainline_scan(
         print(f"[WARN] Independent theme-strength scan error: {error}", file=sys.stderr, flush=True)
         return {"error": error}
     finally:
+        process_lease.release()
         NIUONE_MAINLINE_SCAN_LOCK.release()
 
 
@@ -2169,6 +2772,40 @@ def kline_prewarm_due(now: datetime | None = None) -> bool:
     return time.time() - KLINE_PREWARM_LAST_ATTEMPT_TS >= max(30, KLINE_PREWARM_RETRY_SECONDS)
 
 
+def kline_bootstrap_due(now: datetime | None = None) -> bool:
+    """Return whether a cold or incomplete deployment should prewarm immediately."""
+    if not KLINE_PREWARM_ENABLED or not KLINE_BOOTSTRAP_ENABLED:
+        return False
+    current = now or current_cn_datetime()
+    run_date = current.strftime("%Y-%m-%d")
+    if KLINE_PREWARM_LOCK.locked():
+        return False
+    if KLINE_PREWARM_ATTEMPTS_BY_DATE.get(run_date, 0) >= KLINE_BOOTSTRAP_MAX_ATTEMPTS:
+        return False
+    readiness = market_data_readiness(current)
+    if "runtime_storage_not_writable" in (readiness.get("blockers") or []):
+        return False
+    if readiness.get("data_ready"):
+        return False
+    return time.time() - KLINE_PREWARM_LAST_ATTEMPT_TS >= max(30, KLINE_PREWARM_RETRY_SECONDS)
+
+
+def record_kline_prewarm_failure(target_date: str, error_code: str) -> None:
+    """Best-effort terminal diagnostics must not replace the original failure."""
+    try:
+        mark_prewarm_run_failed(
+            str(target_date)[:10],
+            error_code,
+            path=kline_cache_path(),
+        )
+    except (OSError, sqlite3.Error, ValueError):
+        print(
+            "[WARN] Unable to persist K-line prewarm failure status",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 def run_kline_prewarm(
     target_date: str = "",
     *,
@@ -2178,6 +2815,13 @@ def run_kline_prewarm(
     global KLINE_PREWARM_LAST_ATTEMPT_TS
     if not KLINE_PREWARM_LOCK.acquire(blocking=False):
         return {"skipped": True, "reason": "prewarm_in_progress"}
+    process_lease = FileLease(
+        CRON_STATE_DIR / "kline_prewarm.lock",
+        stale_after_seconds=KLINE_PREWARM_TIMEOUT_SECONDS + 120,
+    )
+    if not process_lease.acquire():
+        KLINE_PREWARM_LOCK.release()
+        return {"skipped": True, "reason": "prewarm_in_progress_other_process"}
     KLINE_PREWARM_LAST_ATTEMPT_TS = time.time()
     try:
         run_date = str(target_date or datetime.now().strftime("%Y-%m-%d"))[:10]
@@ -2189,15 +2833,29 @@ def run_kline_prewarm(
         if not script.exists():
             return {"error": f"扫描脚本不存在：{script}"}
         active_runner = runner or subprocess.run
+        child_env = os.environ.copy()
+        child_env["DASHBOARD_KLINE_PREWARM_TARGET_DATE"] = run_date
+        previous = kline_cache_readiness(
+            accepted_last_dates=accepted_kline_dates_for_dashboard(),
+            path=kline_cache_path(),
+            minimum_coverage=KLINE_READINESS_MIN_COVERAGE,
+        )
+        if (
+            str(previous.get("target_date") or "") == run_date
+            and str(previous.get("status") or "") in {"running", "error"}
+        ):
+            child_env["DASHBOARD_KLINE_PREWARM_RESUME"] = "1"
         result = active_runner(
             [sys.executable, str(script), "--json", "--prewarm-kline-cache"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
             timeout=KLINE_PREWARM_TIMEOUT_SECONDS,
+            env=child_env,
         )
         if result.returncode != 0:
             error = summarize_b1_scan_failure(str(result.stderr or ""), "")
+            record_kline_prewarm_failure(run_date, "prewarm_process_failed")
             print(f"[WARN] Pre-market K-line prewarm failed: {error}", file=sys.stderr, flush=True)
             return {"error": error, "target_date": run_date}
         if runner is None and not prewarm_completed_for_date(run_date, path=kline_cache_path()):
@@ -2206,25 +2864,49 @@ def run_kline_prewarm(
         return {"updated": True, "target_date": run_date}
     except subprocess.TimeoutExpired:
         error = f"盘前日K预热超时（{KLINE_PREWARM_TIMEOUT_SECONDS}s）"
+        record_kline_prewarm_failure(
+            str(target_date or datetime.now().strftime("%Y-%m-%d"))[:10],
+            "aggregate_timeout",
+        )
         print(f"[WARN] {error}", file=sys.stderr, flush=True)
         return {"error": error, "target_date": str(target_date or "")[:10]}
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
+        record_kline_prewarm_failure(
+            str(target_date or datetime.now().strftime("%Y-%m-%d"))[:10],
+            "prewarm_internal_error",
+        )
         print(f"[WARN] Pre-market K-line prewarm error: {error}", file=sys.stderr, flush=True)
         return {"error": error, "target_date": str(target_date or "")[:10]}
     finally:
+        process_lease.release()
         KLINE_PREWARM_LOCK.release()
 
 
-def start_kline_prewarm(target_date: str = "") -> bool:
+def start_kline_prewarm(
+    target_date: str = "",
+    *,
+    reason: str = "scheduled",
+    force: bool = False,
+) -> bool:
     """Start one pre-market cache refresh in the background."""
     global KLINE_PREWARM_RUN_THREAD
     if KLINE_PREWARM_LOCK.locked():
         return False
+    run_date = str(target_date or current_cn_date_key())[:10]
+    if (
+        not force
+        and reason == "bootstrap"
+        and KLINE_PREWARM_ATTEMPTS_BY_DATE.get(run_date, 0) >= KLINE_BOOTSTRAP_MAX_ATTEMPTS
+    ):
+        return False
+    KLINE_PREWARM_ATTEMPTS_BY_DATE[run_date] = (
+        KLINE_PREWARM_ATTEMPTS_BY_DATE.get(run_date, 0) + 1
+    )
     thread = threading.Thread(
         target=run_kline_prewarm,
-        args=(target_date,),
-        name="kline-cache-prewarm",
+        args=(run_date,),
+        name=f"kline-cache-prewarm-{reason}",
         daemon=True,
     )
     KLINE_PREWARM_RUN_THREAD = thread
@@ -2234,9 +2916,17 @@ def start_kline_prewarm(target_date: str = "") -> bool:
 
 def kline_prewarm_schedule_loop() -> None:
     while True:
-        current = datetime.now()
-        if kline_prewarm_due(current):
-            start_kline_prewarm(current.strftime("%Y-%m-%d"))
+        current = current_cn_datetime()
+        if kline_bootstrap_due(current):
+            start_kline_prewarm(
+                current.strftime("%Y-%m-%d"),
+                reason="bootstrap",
+            )
+        elif kline_prewarm_due(current):
+            start_kline_prewarm(
+                current.strftime("%Y-%m-%d"),
+                reason="scheduled",
+            )
         time.sleep(15)
 
 
@@ -2246,6 +2936,8 @@ def _trigger_b1_scan_unlocked(
     *,
     schedule_slot: str = "",
     schedule_run_kind: str = "",
+    job_id: str = "",
+    require_ready_cache: bool = True,
 ) -> dict[str, Any]:
     import subprocess, sys
     script = Path(os.environ.get("DASHBOARD_B1_SCANNER", ENTRYPOINT_DIR / "multi_strategy_screen.py")).expanduser()
@@ -2253,19 +2945,48 @@ def _trigger_b1_scan_unlocked(
         return {"error": f"扫描脚本不存在：{script}", "items": [], "count": 0, "generated_at": "", "running": False}
     try:
         args = [sys.executable, str(script), "--json"] + (["--force"] if force else [])
-        result = subprocess.run(args, capture_output=True, text=True, timeout=B1_SCAN_TIMEOUT_SECONDS)
+        resolved_job_id = str(job_id or f"scan-{int(time.time())}-{os.getpid()}")[:120]
+        progress_file = Path(
+            os.environ.get("DASHBOARD_B1_PROGRESS_FILE")
+            or CRON_STATE_DIR / "b1_scan_progress.json"
+        ).expanduser()
+        write_json_cache(progress_file, {
+            "job_id": resolved_job_id,
+            "stage": "starting",
+            "stage_label": "正在启动选股扫描",
+            "completed": 0,
+            "total": 0,
+            "updated_at": _b1_schedule_now_text(),
+        })
+        child_env = os.environ.copy()
+        child_env["DASHBOARD_B1_PROGRESS_FILE"] = str(progress_file)
+        child_env["DASHBOARD_B1_JOB_ID"] = resolved_job_id
+        child_env["DASHBOARD_B1_REQUIRE_READY_CACHE"] = (
+            "1" if require_ready_cache else "0"
+        )
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=B1_SCAN_TIMEOUT_SECONDS,
+            env=child_env,
+        )
         if result.returncode == 0:
             data = json.loads(result.stdout)
             items = _candidate_rows(data, "items", "candidates")
             candidates = _candidate_rows(data, "candidates", "items")
             trade_items = _candidate_rows(data, "trade_items", "items", "candidates")
-            schedule_meta = {}
+            schedule_meta = {
+                "schedule_run_kind": schedule_run_kind or "manual",
+                "schedule_triggered_at": datetime.now().strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+            }
             if schedule_slot:
-                schedule_meta = {
+                schedule_meta.update({
                     "schedule_slot": schedule_slot,
                     "schedule_run_kind": schedule_run_kind or "scheduled",
-                    "schedule_triggered_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                }
+                })
             cache = {**data, "items": items, "candidates": candidates, "count": len(items),
                      "trade_items": trade_items, "trade_count": len(trade_items),
                      "total_analyzed": data.get("total_analyzed", 0),
@@ -2273,19 +2994,78 @@ def _trigger_b1_scan_unlocked(
                      "running": False, "error": "", "cooldown_remaining_seconds": 0,
                      **schedule_meta}
             with B1_CANDIDATE_REFRESH_LOCK:
-                B1_CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+                write_json_cache(B1_CACHE_FILE, cache)
+                write_practice_candidates_cache(
+                    _derived_read_model_path(
+                        PRACTICE_CANDIDATES_CACHE_FILE,
+                        B1_CACHE_FILE,
+                    ),
+                    cache,
+                    source_path=B1_CACHE_FILE,
+                )
             if decision_mode == "sync":
                 cache["decision_result"] = run_practice_decision_logged(cache, record_start=True)
             elif decision_mode == "async":
                 maybe_run_practice_decision_async(cache)
             return cache
         error_detail = summarize_b1_scan_failure(result.stderr, result.stdout)
+        progress = read_json_cache(progress_file, None) or {}
+        stage = str(progress.get("stage") or "scan")
         print(f"[WARN] B1 scan failed: {error_detail}", file=sys.stderr, flush=True)
-        return {"error": error_detail, "items": [], "count": 0, "generated_at": "", "running": False}
-    except subprocess.TimeoutExpired:
-        return {"error": f"扫描超时（{B1_SCAN_TIMEOUT_SECONDS}s）", "items": [], "count": 0, "generated_at": "", "running": False}
+        return {
+            "error": error_detail,
+            "error_code": b1_scan_stage_error_code(stage),
+            "stage": stage,
+            "items": [],
+            "count": 0,
+            "generated_at": "",
+            "running": False,
+        }
+    except subprocess.TimeoutExpired as exc:
+        raw_stderr = exc.stderr or ""
+        if isinstance(raw_stderr, bytes):
+            raw_stderr = raw_stderr.decode("utf-8", "replace")
+        progress = read_json_cache(
+            Path(
+                os.environ.get("DASHBOARD_B1_PROGRESS_FILE")
+                or CRON_STATE_DIR / "b1_scan_progress.json"
+            ).expanduser(),
+            None,
+        ) or {}
+        stage = str(progress.get("stage") or "scan")
+        error_code = b1_scan_stage_error_code(stage, timed_out=True)
+        detail = summarize_b1_scan_failure(str(raw_stderr), "") if raw_stderr else ""
+        stage_label = str(progress.get("stage_label") or "选股扫描")
+        error = f"{stage_label}超时（{B1_SCAN_TIMEOUT_SECONDS}s）"
+        if detail and detail != "扫描进程未返回错误详情":
+            error += f"；{detail}"
+        return {
+            "error": error[:900],
+            "error_code": error_code,
+            "stage": stage,
+            "items": [],
+            "count": 0,
+            "generated_at": "",
+            "running": False,
+        }
     except Exception as exc:
-        return {"error": f"{type(exc).__name__}: {exc}", "items": [], "count": 0, "generated_at": "", "running": False}
+        progress = read_json_cache(
+            Path(
+                os.environ.get("DASHBOARD_B1_PROGRESS_FILE")
+                or CRON_STATE_DIR / "b1_scan_progress.json"
+            ).expanduser(),
+            None,
+        ) or {}
+        stage = str(progress.get("stage") or "scan")
+        return {
+            "error": f"{type(exc).__name__}: {exc}"[:900],
+            "error_code": b1_scan_stage_error_code(stage),
+            "stage": stage,
+            "items": [],
+            "count": 0,
+            "generated_at": "",
+            "running": False,
+        }
 
 
 def trigger_b1_scan(
@@ -2294,10 +3074,69 @@ def trigger_b1_scan(
     *,
     schedule_slot: str = "",
     schedule_run_kind: str = "",
+    job_id: str = "",
+    require_ready: bool = True,
 ) -> dict[str, Any]:
+    require_ready_cache = False
+    if require_ready:
+        readiness = market_data_readiness()
+        require_ready_cache = bool(readiness.get("requires_full_kline_cache"))
+        if not readiness.get("ready"):
+            blockers = [str(item) for item in readiness.get("blockers") or []]
+            storage_blocked = "runtime_storage_not_writable" in blockers
+            initialization_started = False
+            if (
+                not storage_blocked
+                and KLINE_PREWARM_ENABLED
+                and readiness.get("requires_full_kline_cache")
+            ):
+                initialization_started = start_kline_prewarm(
+                    current_cn_date_key(),
+                    reason="scan-gate",
+                    force=True,
+                )
+            error_code = (
+                "runtime_storage_not_writable"
+                if storage_blocked
+                else blockers[0]
+                if blockers
+                else "market_data_not_ready"
+            )
+            return {
+                "error": (
+                    "运行数据目录不可写，请检查目录权限后重启服务"
+                    if storage_blocked
+                    else "日K缓存或初始化已禁用，请在设置页启用后重启服务"
+                    if error_code in {"kline_cache_disabled", "kline_prewarm_disabled"}
+                    else "市场数据尚未达到安全覆盖率，已在后台初始化日K缓存"
+                ),
+                "error_code": error_code,
+                "stage": "deployment_check" if storage_blocked else "data_initializing",
+                "items": [],
+                "count": 0,
+                "generated_at": "",
+                "running": False,
+                "initializing": bool(initialization_started),
+                "readiness": readiness,
+            }
     if not B1_FULL_SCAN_LOCK.acquire(blocking=False):
         return {
             "error": "已有选股扫描正在运行，请等待当前扫描完成",
+            "items": [],
+            "count": 0,
+            "generated_at": "",
+            "running": True,
+            "busy": True,
+        }
+    process_lease = FileLease(
+        CRON_STATE_DIR / "b1_full_scan.lock",
+        stale_after_seconds=B1_SCAN_TIMEOUT_SECONDS + 120,
+    )
+    if not process_lease.acquire():
+        B1_FULL_SCAN_LOCK.release()
+        return {
+            "error": "其他服务实例正在运行选股扫描，请等待当前扫描完成",
+            "error_code": "scan_in_progress_other_process",
             "items": [],
             "count": 0,
             "generated_at": "",
@@ -2310,24 +3149,252 @@ def trigger_b1_scan(
             decision_mode,
             schedule_slot=schedule_slot,
             schedule_run_kind=schedule_run_kind,
+            job_id=job_id,
+            require_ready_cache=require_ready_cache,
         )
     finally:
+        process_lease.release()
         B1_FULL_SCAN_LOCK.release()
 
 
-def practice_manual_cycle_status() -> dict[str, Any]:
+class PracticeCycleError(RuntimeError):
+    def __init__(self, message: str, *, code: str, stage: str = "error") -> None:
+        super().__init__(message)
+        self.code = str(code or "practice_cycle_failed")[:120]
+        self.stage = str(stage or "error")[:80]
+
+
+def practice_manual_cycle_state_file() -> Path:
+    return Path(
+        os.environ.get("DASHBOARD_PRACTICE_MANUAL_CYCLE_STATE_FILE")
+        or CRON_STATE_DIR / "practice_manual_cycle.json"
+    ).expanduser()
+
+
+def b1_scan_progress_file() -> Path:
+    return Path(
+        os.environ.get("DASHBOARD_B1_PROGRESS_FILE")
+        or CRON_STATE_DIR / "b1_scan_progress.json"
+    ).expanduser()
+
+
+def _public_practice_manual_cycle_state(source: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        field: source[field]
+        for field in PRACTICE_MANUAL_CYCLE_PUBLIC_FIELDS
+        if field in source
+    }
+
+
+def restore_practice_manual_cycle_state() -> dict[str, Any]:
+    """Restore terminal task metadata and safely close interrupted trading work."""
+    stored = read_json_cache(practice_manual_cycle_state_file(), None)
+    if not isinstance(stored, dict):
+        return practice_manual_cycle_status()
+    restored = _public_practice_manual_cycle_state(stored)
+    if restored.get("running"):
+        restored.update({
+            "running": False,
+            "stage": "interrupted",
+            "stage_label": "上一次任务因服务重启而中断",
+            "finished_at": _b1_schedule_now_text(),
+            "error_code": "service_restarted",
+            "error": "服务重启中断了未完成任务；为避免重复交易，本轮不会自动重放",
+        })
     with PRACTICE_MANUAL_CYCLE_STATE_LOCK:
-        return {
-            field: PRACTICE_MANUAL_CYCLE_STATE[field]
-            for field in PRACTICE_MANUAL_CYCLE_PUBLIC_FIELDS
-            if field in PRACTICE_MANUAL_CYCLE_STATE
-        }
+        PRACTICE_MANUAL_CYCLE_STATE.clear()
+        PRACTICE_MANUAL_CYCLE_STATE.update(restored)
+    return _set_practice_manual_cycle_state()
+
+
+def practice_manual_cycle_status() -> dict[str, Any]:
+    stored = read_json_cache(practice_manual_cycle_state_file(), None)
+    if isinstance(stored, dict):
+        stored_public = _public_practice_manual_cycle_state(stored)
+        with PRACTICE_MANUAL_CYCLE_STATE_LOCK:
+            current_updated_at = str(
+                PRACTICE_MANUAL_CYCLE_STATE.get("updated_at") or ""
+            )
+            stored_updated_at = str(stored_public.get("updated_at") or "")
+            if stored_updated_at >= current_updated_at:
+                PRACTICE_MANUAL_CYCLE_STATE.clear()
+                PRACTICE_MANUAL_CYCLE_STATE.update(stored_public)
+    with PRACTICE_MANUAL_CYCLE_STATE_LOCK:
+        status = _public_practice_manual_cycle_state(PRACTICE_MANUAL_CYCLE_STATE)
+    if status.get("running") and status.get("stage") in {
+        "screening",
+        "code_pool",
+        "quotes",
+        "cache_check",
+        "industry_context",
+        "kline_prepare",
+        "scoring",
+        "news_precheck",
+        "persisting",
+    }:
+        progress = read_json_cache(b1_scan_progress_file(), None) or {}
+        if str(progress.get("job_id") or "") == str(status.get("job_id") or ""):
+            for name in (
+                "stage",
+                "stage_label",
+                "completed",
+                "total",
+                "cache_hits",
+                "network_fallbacks",
+                "worker_count",
+                "source",
+                "updated_at",
+            ):
+                if name in progress:
+                    status[name] = progress[name]
+    completed = int(status.get("completed") or 0)
+    total = int(status.get("total") or 0)
+    status["progress_pct"] = round(completed / total * 100, 1) if total else 0.0
+    return status
 
 
 def _set_practice_manual_cycle_state(**updates: Any) -> dict[str, Any]:
     with PRACTICE_MANUAL_CYCLE_STATE_LOCK:
+        updates.setdefault("updated_at", _b1_schedule_now_text())
         PRACTICE_MANUAL_CYCLE_STATE.update(updates)
-        return dict(PRACTICE_MANUAL_CYCLE_STATE)
+        snapshot = dict(PRACTICE_MANUAL_CYCLE_STATE)
+        public = _public_practice_manual_cycle_state(snapshot)
+        try:
+            write_json_cache(practice_manual_cycle_state_file(), public)
+        except OSError as exc:
+            print(
+                f"[WARN] Manual practice task state persistence failed: {type(exc).__name__}",
+                file=sys.stderr,
+                flush=True,
+            )
+        return snapshot
+
+
+def _wait_for_manual_cycle_market_data() -> None:
+    readiness = market_data_readiness()
+    if readiness.get("ready"):
+        return
+    blockers = [str(item) for item in readiness.get("blockers") or []]
+    if "runtime_storage_not_writable" in blockers:
+        raise PracticeCycleError(
+            "运行数据目录不可写，请检查目录权限后重启服务",
+            code="runtime_storage_not_writable",
+            stage="deployment_check",
+        )
+    if "kline_cache_disabled" in blockers or "kline_prewarm_disabled" in blockers:
+        raise PracticeCycleError(
+            "日K缓存或初始化已禁用，请在设置页启用后重启服务",
+            code=(
+                "kline_cache_disabled"
+                if "kline_cache_disabled" in blockers
+                else "kline_prewarm_disabled"
+            ),
+            stage="deployment_check",
+        )
+    if not readiness.get("requires_full_kline_cache"):
+        raise PracticeCycleError(
+            "部署环境尚未达到运行条件",
+            code=str(blockers[0] if blockers else "deployment_not_ready"),
+            stage="deployment_check",
+        )
+    _set_practice_manual_cycle_state(
+        stage="data_initializing",
+        stage_label="正在初始化全市场日K数据",
+        completed=int((readiness.get("kline") or {}).get("completed_count") or 0),
+        total=int((readiness.get("kline") or {}).get("requested_count") or 0),
+        error_code="",
+        error="",
+    )
+    start_kline_prewarm(
+        current_cn_date_key(),
+        reason="manual",
+        force=True,
+    )
+    wait_seconds = _bounded_int_value(
+        os.environ.get(
+            "DASHBOARD_MANUAL_DATA_INITIALIZATION_TIMEOUT_SECONDS",
+            str(KLINE_PREWARM_TIMEOUT_SECONDS + 60),
+        ),
+        KLINE_PREWARM_TIMEOUT_SECONDS + 60,
+        60,
+        3600,
+    )
+    deadline = time.monotonic() + wait_seconds
+    terminal_check_after = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        readiness = market_data_readiness()
+        kline = readiness.get("kline") if isinstance(readiness.get("kline"), dict) else {}
+        _set_practice_manual_cycle_state(
+            stage="data_initializing",
+            stage_label="正在初始化全市场日K数据",
+            completed=int(kline.get("completed_count") or 0),
+            total=int(kline.get("requested_count") or 0),
+            cache_hits=int(kline.get("fresh_count") or 0),
+            network_fallbacks=int(kline.get("failure_count") or 0),
+            source="tencent_kline",
+        )
+        if readiness.get("ready"):
+            return
+        blockers = [str(item) for item in readiness.get("blockers") or []]
+        if "runtime_storage_not_writable" in blockers:
+            raise PracticeCycleError(
+                "运行数据目录不可写，请检查目录权限后重启服务",
+                code="runtime_storage_not_writable",
+                stage="deployment_check",
+            )
+        kline_status = str(kline.get("status") or "")
+        if (
+            kline_status in {"completed", "error"}
+            and not KLINE_PREWARM_LOCK.locked()
+            and time.monotonic() >= terminal_check_after
+        ):
+            raise PracticeCycleError(
+                (
+                    "全市场日K初始化完成，但有效覆盖率仍低于安全阈值"
+                    if kline_status == "completed"
+                    else "全市场日K初始化失败，请检查腾讯行情连通性和持久化目录"
+                ),
+                code=(
+                    "kline_coverage_insufficient"
+                    if kline_status == "completed"
+                    else str(kline.get("error_code") or "kline_prewarm_failed")
+                ),
+                stage="data_initializing",
+            )
+        time.sleep(2)
+    raise PracticeCycleError(
+        f"市场数据初始化未在{wait_seconds}秒内达到安全覆盖率",
+        code="kline_initialization_timeout",
+        stage="data_initializing",
+    )
+
+
+def _load_practice_candidate_decision_context(
+    generated_at: str,
+) -> dict[str, Any]:
+    """Read full scan context only for an explicitly reused trading cycle."""
+    for path in (B1_CACHE_FILE, MULTI_STRATEGY_CACHE_FILE):
+        payload = read_json_cache(path, None)
+        if not isinstance(payload, dict):
+            continue
+        if str(payload.get("generated_at") or "")[:19] != generated_at[:19]:
+            continue
+        return {
+            key: payload.get(key)
+            for key in (
+                "market_snapshot",
+                "sector_tide_context",
+                "niuone_context",
+                "zettaranc_context",
+                "market_summary",
+                "market_decision_context",
+                "schedule_slot",
+                "schedule_run_kind",
+                "schedule_triggered_at",
+            )
+            if key in payload
+        }
+    return {}
 
 
 def recent_practice_candidates_for_manual_cycle() -> dict[str, Any] | None:
@@ -2346,21 +3413,38 @@ def recent_practice_candidates_for_manual_cycle() -> dict[str, Any] | None:
         return None
     return {
         **cache,
+        **_load_practice_candidate_decision_context(generated_at),
         "manual_scan_reused": True,
         "manual_scan_age_seconds": round(max(0.0, age_seconds), 1),
     }
 
 
-def _run_practice_manual_cycle() -> None:
+def _run_practice_manual_cycle(process_lease: FileLease | None = None) -> None:
     try:
+        _wait_for_manual_cycle_market_data()
         _set_practice_manual_cycle_state(stage="screening", stage_label="正在检查候选")
         cache = recent_practice_candidates_for_manual_cycle()
         if cache is None:
-            cache = trigger_b1_scan(force=True, decision_mode="none")
+            cache = trigger_b1_scan(
+                force=True,
+                decision_mode="none",
+                job_id=str(PRACTICE_MANUAL_CYCLE_STATE.get("job_id") or ""),
+            )
         if cache.get("error"):
-            raise RuntimeError(str(cache.get("error")))
+            raise PracticeCycleError(
+                str(cache.get("error")),
+                code=str(cache.get("error_code") or "candidate_scan_failed"),
+                stage=str(cache.get("stage") or "screening"),
+            )
         if not isinstance(cache.get("niuone_context"), dict):
             start_independent_niuone_mainline_scan()
+        cache = {
+            **cache,
+            "schedule_run_kind": "manual",
+            "schedule_triggered_at": datetime.now().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+        }
 
         _set_practice_manual_cycle_state(
             stage="trading",
@@ -2376,26 +3460,71 @@ def _run_practice_manual_cycle() -> None:
             stage_label="本轮选股及买卖已完成",
             finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             decision_result=decision_result,
+            error_code="",
             error="",
         )
     except Exception as exc:
+        error_code = (
+            exc.code if isinstance(exc, PracticeCycleError) else type(exc).__name__
+        )
+        failure_stage = exc.stage if isinstance(exc, PracticeCycleError) else "error"
         _set_practice_manual_cycle_state(
             running=False,
             stage="error",
             stage_label="本轮执行失败",
             finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            failure_stage=failure_stage,
+            error_code=error_code,
             error=f"{type(exc).__name__}: {exc}",
         )
     finally:
         invalidate_api_cache(PRACTICE_CANDIDATES_CACHE_KEY, "niuniu_practice", PRACTICE_FAST_CACHE_KEY)
+        if process_lease is not None:
+            process_lease.release()
         PRACTICE_MANUAL_CYCLE_LOCK.release()
 
 
 def start_practice_manual_cycle() -> dict[str, Any]:
     if not PRACTICE_MANUAL_CYCLE_LOCK.acquire(blocking=False):
         return {**practice_manual_cycle_status(), "accepted": False}
+    initialization_timeout = _bounded_int_value(
+        os.environ.get(
+            "DASHBOARD_MANUAL_DATA_INITIALIZATION_TIMEOUT_SECONDS",
+            str(KLINE_PREWARM_TIMEOUT_SECONDS + 60),
+        ),
+        KLINE_PREWARM_TIMEOUT_SECONDS + 60,
+        60,
+        3600,
+    )
+    decision_timeout = _bounded_int_value(
+        os.environ.get("DASHBOARD_DECISION_TIMEOUT", "180"),
+        180,
+        10,
+        1800,
+    )
+    process_lease = FileLease(
+        CRON_STATE_DIR / "practice_manual_cycle.lock",
+        stale_after_seconds=(
+            initialization_timeout
+            + B1_SCAN_TIMEOUT_SECONDS
+            + decision_timeout
+            + 300
+        ),
+    )
+    if not process_lease.acquire():
+        PRACTICE_MANUAL_CYCLE_LOCK.release()
+        return {
+            **practice_manual_cycle_status(),
+            "accepted": False,
+            "running": True,
+            "busy": True,
+            "error_code": "manual_cycle_in_progress_other_process",
+            "stage_label": "其他服务实例正在执行选股及买卖策略",
+        }
     started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    job_id = "manual-" + secrets.token_urlsafe(12)
     status = _set_practice_manual_cycle_state(
+        job_id=job_id,
         running=True,
         stage="starting",
         stage_label="正在启动",
@@ -2403,12 +3532,20 @@ def start_practice_manual_cycle() -> dict[str, Any]:
         finished_at="",
         generated_at="",
         candidate_count=0,
+        completed=0,
+        total=0,
+        progress_pct=0.0,
+        cache_hits=0,
+        network_fallbacks=0,
         manual_scan_reused=False,
         decision_result=None,
+        failure_stage="",
+        error_code="",
         error="",
     )
     threading.Thread(
         target=_run_practice_manual_cycle,
+        args=(process_lease,),
         name="niuniu-practice-manual-cycle",
         daemon=True,
     ).start()
@@ -2470,6 +3607,50 @@ def _b1_schedule_slot_lag_seconds(slot_key: str) -> float:
         return 0.0
 
 
+def _remember_b1_schedule_terminal(
+    state: dict[str, Any],
+    slot_key: str,
+    slot: dict[str, Any],
+) -> None:
+    """Retain bounded terminal slot outcomes for strict-forward coverage."""
+    try:
+        scheduled = datetime.strptime(slot_key, "%Y-%m-%d %H:%M")
+    except (TypeError, ValueError):
+        return
+    status = str(slot.get("status") or "")
+    if status not in {"ok", "error", "skipped"}:
+        return
+    raw_history = state.get("day_history")
+    history = raw_history if isinstance(raw_history, dict) else {}
+    day_key = scheduled.strftime("%Y-%m-%d")
+    raw_day = history.get(day_key)
+    day = raw_day if isinstance(raw_day, dict) else {}
+    raw_slots = day.get("slots")
+    slots = raw_slots if isinstance(raw_slots, dict) else {}
+    slots[scheduled.strftime("%H:%M")] = {
+        key: slot.get(key)
+        for key in (
+            "scheduled_at",
+            "status",
+            "started_at",
+            "finished_at",
+            "run_kind",
+            "reason",
+            "error",
+            "error_code",
+            "failure_stage",
+        )
+        if slot.get(key) not in {None, ""}
+    }
+    day["slots"] = slots
+    day["updated_at"] = str(slot.get("updated_at") or "")
+    history[day_key] = day
+    state["day_history"] = {
+        key: history[key]
+        for key in sorted(history)[-B1_SCHEDULE_HISTORY_RETENTION_DAYS:]
+    }
+
+
 def _mark_b1_schedule_slot(slot_key: str, status: str, **fields: Any) -> None:
     with B1_SCHEDULE_LOCK:
         state = _load_b1_schedule_state_unlocked()
@@ -2488,6 +3669,7 @@ def _mark_b1_schedule_slot(slot_key: str, status: str, **fields: Any) -> None:
             slot["finished_at"] = now_text
             slot["finished_ts"] = time.time()
             B1_SCHEDULE_RUN_KEYS.discard(slot_key)
+            _remember_b1_schedule_terminal(state, slot_key, slot)
         state["slots"] = slots
         _save_b1_schedule_state_unlocked(state)
 
@@ -2553,6 +3735,7 @@ def claim_due_b1_schedule_slot(now: datetime | None = None) -> str | None:
                 "finished_at": now_text,
                 "finished_ts": now_float,
             })
+            _remember_b1_schedule_terminal(state, skipped_key, skipped)
         selected_slot = {**(slots.get(selected_key) or {})}
         selected_slot.pop("error", None)
         slots[selected_key] = {
@@ -2576,12 +3759,39 @@ def run_scheduled_b1_scan(slot_key: str) -> None:
         lag_seconds = _b1_schedule_slot_lag_seconds(slot_key)
         run_kind = "catchup" if lag_seconds >= 60 else "scheduled"
         _mark_b1_schedule_slot(slot_key, "running", lag_seconds=round(lag_seconds, 1), run_kind=run_kind)
+        readiness = market_data_readiness()
+        if not readiness.get("ready"):
+            if (
+                readiness.get("requires_full_kline_cache")
+                and "runtime_storage_not_writable" not in (readiness.get("blockers") or [])
+            ):
+                start_kline_prewarm(
+                    current_cn_date_key(),
+                    reason="scheduled-gate",
+                    force=True,
+                )
+            blockers = ",".join(str(item) for item in readiness.get("blockers") or [])
+            error_code = str(
+                (readiness.get("blockers") or ["market_data_not_ready"])[0]
+            )
+            _mark_b1_schedule_slot(
+                slot_key,
+                "error",
+                error=error_code,
+                error_code=error_code,
+                readiness_blockers=blockers[:300],
+            )
+            print(
+                f"[Practice schedule] {slot_key} blocked: market data not ready ({blockers})",
+                flush=True,
+            )
+            return
         summary = refresh_practice_market_summary_for_decision("scheduled")
         if b1_cache_generated_for_slot(slot_key):
             start_independent_niuone_mainline_scan(slot_key)
             _mark_b1_schedule_slot(
                 slot_key,
-                "ok",
+                "skipped",
                 reason="cache_already_generated_for_slot",
                 market_summary_generated_at=str(summary.get("generated_at") or ""),
             )
@@ -2597,16 +3807,61 @@ def run_scheduled_b1_scan(slot_key: str) -> None:
             API_RESPONSE_CACHE.pop(PRACTICE_CANDIDATES_CACHE_KEY, None)
         start_independent_niuone_mainline_scan(slot_key)
         if cache.get("error"):
-            _mark_b1_schedule_slot(slot_key, "error", error=str(cache.get("error") or "")[:500])
+            _mark_b1_schedule_slot(
+                slot_key,
+                "error",
+                error=str(cache.get("error") or "")[:500],
+                error_code=str(cache.get("error_code") or "candidate_scan_failed")[:120],
+                failure_stage=str(cache.get("stage") or "screening")[:80],
+            )
             print(f"[Practice schedule] {slot_key} failed: {cache.get('error')}", flush=True)
         else:
             if isinstance(summary, dict):
                 cache["market_summary"] = summary
-            cache["decision_result"] = run_practice_decision_logged(
+            decision_result = run_practice_decision_logged(
                 cache,
                 record_start=True,
                 refresh_market_summary=False,
             )
+            cache["decision_result"] = decision_result
+            decision = (
+                decision_result.get("decision")
+                if isinstance(decision_result, dict)
+                else None
+            )
+            if not isinstance(decision_result, dict):
+                decision_error = "invalid_practice_decision_result"
+            elif decision_result.get("error"):
+                decision_error = str(decision_result.get("error") or "")[:500]
+            elif isinstance(decision, dict) and decision.get("error"):
+                decision_error = str(decision.get("error") or "")[:500]
+            elif decision_result.get("durable_evidence_persisted") is not True:
+                decision_error = "practice_decision_evidence_not_persisted"
+            elif isinstance(decision, dict):
+                decision_error = ""
+            elif (
+                decision_result.get("skipped") is True
+                and decision_result.get("reason") == "already_decided_for_this_b1"
+            ):
+                decision_error = ""
+            else:
+                decision_error = "missing_practice_decision_payload"
+            if decision_error:
+                _mark_b1_schedule_slot(
+                    slot_key,
+                    "error",
+                    error=decision_error,
+                    count=int(cache.get("count") or 0),
+                    generated_at=cache.get("generated_at") or "",
+                    run_kind=run_kind,
+                    reason="practice_decision_failed",
+                )
+                print(
+                    f"[Practice schedule] {slot_key} decision failed: "
+                    f"{decision_error}",
+                    flush=True,
+                )
+                return
             _mark_b1_schedule_slot(
                 slot_key,
                 "ok",
@@ -2633,7 +3888,8 @@ def pending_decision_loop() -> None:
         try:
             trader = get_trader_module()
             if hasattr(trader, "execute_due_pending_decisions"):
-                result = trader.execute_due_pending_decisions()
+                with PRACTICE_DECISION_LOCK:
+                    result = trader.execute_due_pending_decisions()
                 if result.get("attempted"):
                     print(
                         f"[practice pending] attempted={result.get('attempted')} "
@@ -4370,6 +5626,9 @@ CRON_CONFIG_NAMES = {
     "DASHBOARD_MARKET_AUCTION_CRON",
     "DASHBOARD_MARKET_MIDDAY_CRON",
     "DASHBOARD_MARKET_CLOSE_CRON",
+    "DASHBOARD_NIUONE_FORWARD_PREFLIGHT_CRON",
+    "DASHBOARD_NIUONE_EQUITY_SNAPSHOT_CRON",
+    "DASHBOARD_NIUONE_FORWARD_CRON",
     "DASHBOARD_US_RATING_CRON",
 }
 CRON_TIME_CONFIGS = {
@@ -4378,6 +5637,9 @@ CRON_TIME_CONFIGS = {
     "DASHBOARD_MARKET_AUCTION_CRON": {"day_label": "周一至周五"},
     "DASHBOARD_MARKET_MIDDAY_CRON": {"day_label": "周一至周五"},
     "DASHBOARD_MARKET_CLOSE_CRON": {"day_label": "周一至周五"},
+    "DASHBOARD_NIUONE_FORWARD_PREFLIGHT_CRON": {"day_label": "A股交易日"},
+    "DASHBOARD_NIUONE_EQUITY_SNAPSHOT_CRON": {"day_label": "A股交易日"},
+    "DASHBOARD_NIUONE_FORWARD_CRON": {"day_label": "A股交易日"},
     "DASHBOARD_US_RATING_CRON": {"day_label": "每天"},
 }
 ADMIN_GROUP_NOTES = {
@@ -4386,7 +5648,7 @@ ADMIN_GROUP_NOTES = {
     "买卖决策模型": "推荐使用 deepseek-v4-pro；也可填写其他兼容 /chat/completions 的模型服务。长度默认：上下文 128000 tokens，最大输出 4096 tokens。",
     "交易规则与风控": "约束买卖决策必须遵守的交易纪律、持仓数量、仓位比例、现金缓冲与盘面控仓规则。交易纪律 Prompt 会直接写入决策模型的必须遵守段。",
     "交易通知": "模拟买入或卖出成交落盘后推送。从下拉框按需添加渠道并分块配置；每个渠道可独立启用或关闭，关闭会保留配置，移除并保存后才会清除配置。Webhook、Bot Token 和签名密钥只保存、不回显。",
-    "选股与买卖设置": "配置主板、创业板、科创板和 ST 选股范围、候选数量，并维护北京时间 HH:MM 的选股、决策及离场时间。",
+    "选股与买卖设置": "配置选股范围、候选数量和北京时间交易时点；板块分类固定使用东方财富概念与行业。",
     "综合决策参考": "为买卖决策汇总指数、板块、资金流向、热门股票等参考数据。缓存秒数控制数据复用周期，单类参考数据上限可设置为 1～8。",
     "选股与交易策略": "选择一套独立策略；基础策略、Z哥、李大霄、板块潮汐、牛牛战法和预设文字策略的候选、买入、卖出、仓位与 Prompt 规则互不混用。",
     "盘面监控生产时间点": "直接填写北京时间 HH:MM；隔夜美股总结默认交易日 08:00 生成，A 股盘面监控在交易时段触发；长度默认：上下文 128000 tokens，最大输出 4096 tokens。",
@@ -4808,6 +6070,18 @@ def validate_business_updates(updates: dict[str, str]) -> None:
                 raise ValueError(f"{name} 必须在 {minimum} 到 {maximum} 之间")
         elif name == PRACTICE_SCHEDULE_TIMES_ENV:
             normalize_time_list_update(value)
+        elif name == NIUONE_FORWARD_COHORT_START_ENV:
+            raw_date = str(value or "").strip()
+            try:
+                parsed_date = date.fromisoformat(raw_date)
+            except ValueError:
+                raise ValueError(
+                    f"{name} 必须使用 YYYY-MM-DD，例如 2026-08-03"
+                ) from None
+            if parsed_date.isoformat() != raw_date:
+                raise ValueError(
+                    f"{name} 必须使用 YYYY-MM-DD，例如 2026-08-03"
+                )
         elif name in {
             "DASHBOARD_B3_EXIT_TIME",
             "DASHBOARD_TIME_EXIT_TIME",
@@ -4817,15 +6091,27 @@ def validate_business_updates(updates: dict[str, str]) -> None:
         }:
             normalize_env_update(name, value, "time")
         elif name in {
+            "DASHBOARD_B1_SCAN_TIMEOUT_SECONDS",
+            "DASHBOARD_B1_SCAN_WORKERS",
+            "DASHBOARD_TENCENT_QUOTE_STAGE_TIMEOUT_SECONDS",
             "DASHBOARD_KLINE_PREWARM_WORKERS",
             "DASHBOARD_KLINE_PREWARM_TIMEOUT_SECONDS",
             "DASHBOARD_KLINE_PREWARM_CATCHUP_MINUTES",
+            "DASHBOARD_KLINE_BOOTSTRAP_MAX_ATTEMPTS",
+            "DASHBOARD_KLINE_READINESS_MIN_COVERAGE_PERCENT",
+            "DASHBOARD_MANUAL_DATA_INITIALIZATION_TIMEOUT_SECONDS",
         } and str(value or "").strip():
             number = int(value)
             minimum, maximum = {
+                "DASHBOARD_B1_SCAN_TIMEOUT_SECONDS": (60, 1800),
+                "DASHBOARD_B1_SCAN_WORKERS": (1, 16),
+                "DASHBOARD_TENCENT_QUOTE_STAGE_TIMEOUT_SECONDS": (15, 300),
                 "DASHBOARD_KLINE_PREWARM_WORKERS": (1, 16),
                 "DASHBOARD_KLINE_PREWARM_TIMEOUT_SECONDS": (60, 1800),
                 "DASHBOARD_KLINE_PREWARM_CATCHUP_MINUTES": (0, 120),
+                "DASHBOARD_KLINE_BOOTSTRAP_MAX_ATTEMPTS": (1, 12),
+                "DASHBOARD_KLINE_READINESS_MIN_COVERAGE_PERCENT": (90, 100),
+                "DASHBOARD_MANUAL_DATA_INITIALIZATION_TIMEOUT_SECONDS": (60, 3600),
             }[name]
             if number < minimum or number > maximum:
                 raise ValueError(f"{name} 必须在 {minimum} 到 {maximum} 之间")

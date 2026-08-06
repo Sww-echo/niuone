@@ -8,8 +8,10 @@ from pathlib import Path
 from app.dashboard.niuone_mainline import build_niuone_mainline_view
 from app.screening.niuone_mainline_cache import (
     build_niuone_mainline_cache_payload,
+    build_niuone_mainline_summary_cache_payload,
     load_cached_niuone_context,
     write_niuone_mainline_cache,
+    write_niuone_mainline_summary_cache,
 )
 
 
@@ -71,7 +73,18 @@ def sample_scan() -> dict[str, object]:
                     },
                 ],
             },
-            "stocks": {"603979": {"raw_news": "private"}},
+            "stocks": {
+                "603979": {
+                    "raw_news": "private",
+                    "theme_attributions": [{
+                        "theme": "工业金属",
+                        "membership_source": "eastmoney_concept",
+                        "attribution_score": 82.0,
+                        "attribution_weight": 0.8,
+                        "peer_resonance_score": 78.0,
+                    }],
+                }
+            },
             "industry_money_flow": [{"raw": "private"}],
             "market": {
                 "score": 34,
@@ -84,11 +97,11 @@ def sample_scan() -> dict[str, object]:
                 "primary": "",
                 "intraday_primary": "银行",
                 "intraday_primary_score": 79.03,
-                "observation_reason": "日内强势仅观察",
+                "observation_reason": "日内V形修复已完成分时双确认，仅作题材研究观察",
                 "today_primary": "工业金属",
                 "today_primary_score": 80.0,
                 "today_primary_breadth_pct": 87.5,
-                "today_observation_reason": "今日强度仅作观察",
+                "today_observation_reason": "日内V形修复已完成分时双确认，仅作题材研究观察",
                 "reversal_primary": "工业金属",
                 "reversal_primary_score": 82.5,
                 "reversal_confirmation_count": 2,
@@ -98,6 +111,10 @@ def sample_scan() -> dict[str, object]:
                     "industry": "工业金属",
                     "score": 72.5,
                     "state": "emerging",
+                    "niuone_lifecycle_stage": "markup",
+                    "niuone_lifecycle_label": "主线主升",
+                    "niuone_lifecycle_order": 20,
+                    "niuone_lifecycle_entry_policy": "participate",
                     "intraday_state": "intraday_mainline",
                     "member_count": 8,
                     "strong_stock_count": 4,
@@ -188,7 +205,20 @@ class NiuOneMainlineViewTests(unittest.TestCase):
         self.assertNotIn("configured_stock_universe_label", payload)
         self.assertNotIn("items", payload)
         self.assertNotIn("trade_items", payload)
-        self.assertNotIn("stocks", payload["niuone_context"])
+        self.assertEqual(
+            payload["niuone_context"]["stocks"],
+            {
+                "603979": {
+                    "theme_attributions": [{
+                        "theme": "工业金属",
+                        "membership_source": "eastmoney_concept",
+                        "attribution_score": 82.0,
+                        "attribution_weight": 0.8,
+                        "peer_resonance_score": 78.0,
+                    }],
+                }
+            },
+        )
         self.assertNotIn("industry_money_flow", payload["niuone_context"])
         self.assertIn("工业金属", payload["niuone_context"]["themes"])
 
@@ -209,25 +239,36 @@ class NiuOneMainlineViewTests(unittest.TestCase):
         self.assertEqual(view["mainline"]["intraday_primary"], "银行")
         self.assertEqual(view["mainline"]["today_primary"], "工业金属")
         self.assertEqual(view["mainline"]["today_primary_breadth_pct"], 87.5)
-        self.assertEqual(view["mainline"]["reversal_primary"], "工业金属")
-        self.assertEqual(view["mainline"]["reversal_confirmation_count"], 2)
+        self.assertEqual(
+            view["mainline"]["today_observation_reason"],
+            "今日强度仅作观察，不改变原有跨日主线确认门槛",
+        )
+        self.assertNotIn("observation_reason", view["mainline"])
+        self.assertNotIn("reversal_primary", view["mainline"])
         self.assertEqual([theme["industry"] for theme in view["themes"]], ["银行", "工业金属"])
         self.assertEqual([theme["industry"] for theme in view["today_themes"]], ["工业金属", "银行"])
-        self.assertEqual([theme["industry"] for theme in view["reversal_themes"]], ["工业金属"])
+        self.assertNotIn("reversal_themes", view)
         industrial_metals = next(theme for theme in view["themes"] if theme["industry"] == "工业金属")
         self.assertEqual(industrial_metals["effective_strong_count"], 3.2)
+        self.assertEqual(industrial_metals["niuone_lifecycle_stage"], "markup")
+        self.assertEqual(industrial_metals["niuone_lifecycle_label"], "主线主升")
+        self.assertEqual(industrial_metals["niuone_lifecycle_order"], 20)
+        self.assertEqual(
+            industrial_metals["niuone_lifecycle_entry_policy"],
+            "participate",
+        )
         self.assertEqual(industrial_metals["effective_breadth_pct"], 40)
         self.assertEqual(industrial_metals["leader_stock"]["code"], "603979")
         self.assertEqual(industrial_metals["leader_stock"]["role"], "leader")
         self.assertEqual(industrial_metals["leader_stock"]["change_pct"], 5.26)
         self.assertEqual(industrial_metals["today_strength_score"], 80)
         self.assertEqual(industrial_metals["today_breadth_pct"], 87.5)
-        self.assertTrue(industrial_metals["reversal_confirmed"])
-        self.assertEqual(industrial_metals["reversal_sample_gap_minutes"], 25)
-        self.assertEqual(industrial_metals["today_median_rebound_pct"], 2.4)
+        self.assertNotIn("reversal_confirmed", industrial_metals)
+        self.assertNotIn("reversal_score", industrial_metals)
+        self.assertNotIn("today_median_rebound_pct", industrial_metals)
         self.assertEqual(industrial_metals["today_leader_stock"]["code"], "603979")
-        self.assertEqual(industrial_metals["leader_stock"]["rebound_from_low_pct"], 3.1)
-        self.assertTrue(industrial_metals["leader_stock"]["reclaim_previous_close"])
+        self.assertNotIn("rebound_from_low_pct", industrial_metals["leader_stock"])
+        self.assertNotIn("reclaim_previous_close", industrial_metals["leader_stock"])
         self.assertEqual(
             [(stock["code"], stock["change_pct"]) for stock in industrial_metals["strong_stocks"]],
             [("603979", 5.26), ("600111", -1.35)],
@@ -247,6 +288,117 @@ class NiuOneMainlineViewTests(unittest.TestCase):
         self.assertNotIn("provider_token", serialized)
         self.assertNotIn("raw_news", serialized)
         self.assertNotIn("internal_samples", serialized)
+        self.assertNotIn("V形修复", serialized)
+
+    def test_summary_snapshot_preserves_view_without_per_stock_state(self) -> None:
+        scan = sample_scan()
+        summary = build_niuone_mainline_summary_cache_payload(scan)
+
+        self.assertEqual(
+            build_niuone_mainline_view(summary),
+            build_niuone_mainline_view(scan),
+        )
+        self.assertNotIn("stocks", summary["niuone_context"])
+        self.assertNotIn("industry_money_flow", summary["niuone_context"])
+        self.assertNotIn(
+            "internal_samples",
+            summary["niuone_context"]["themes"]["工业金属"],
+        )
+
+        with tempfile.TemporaryDirectory(prefix="niuone-summary-") as directory:
+            path = Path(directory) / "niuone_mainline_summary_latest.json"
+            written = write_niuone_mainline_summary_cache(path, scan)
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(loaded, written)
+
+    def test_eastmoney_concept_rank_is_a_sanitized_today_cross_check_only(self) -> None:
+        scan = sample_scan()
+        scan["eastmoney_concept_signal"] = {
+            "schema_version": 1,
+            "source": "eastmoney_concept_board_rank",
+            "source_url": "https://quote.eastmoney.com/center/boardlist.html",
+            "captured_at": "2026-07-28 14:12:12",
+            "quote_generated_at": "2026-07-28 14:12:08",
+            "sort": "change_pct_desc",
+            "total_count": 503,
+            "covered_count": 100,
+            "stale": False,
+            "raw_response": "must-not-survive",
+            "boards": [
+                {
+                    "code": "BK0999",
+                    "name": "工业金属概念",
+                    "normalized_name": "工业金属",
+                    "rank": 12,
+                    "change_pct": 4.2,
+                    "main_net_yi": 3.5,
+                    "up_count": 7,
+                    "down_count": 1,
+                    "flat_count": 0,
+                    "leader_code": "603979",
+                    "leader_name": "金诚信",
+                    "leader_market": 1,
+                    "leader_change_pct": 5.26,
+                    "private": "must-not-survive",
+                },
+                {
+                    "code": "BK0475",
+                    "name": "银行",
+                    "rank": 3,
+                    "change_pct": 1.1,
+                    "up_count": 30,
+                    "down_count": 10,
+                    "flat_count": 2,
+                },
+            ],
+        }
+
+        summary = build_niuone_mainline_summary_cache_payload(scan)
+        view = build_niuone_mainline_view(summary)
+
+        self.assertEqual(
+            [theme["industry"] for theme in view["today_themes"]],
+            ["工业金属", "银行"],
+        )
+        signal = view["eastmoney_concept_signal"]
+        self.assertTrue(signal["available"])
+        self.assertEqual(signal["covered_count"], 100)
+        self.assertEqual(signal["matched_theme_count"], 2)
+        industrial_metals = view["today_themes"][0]["eastmoney"]
+        self.assertEqual(industrial_metals["board_name"], "工业金属概念")
+        self.assertEqual(industrial_metals["rank"], 12)
+        self.assertEqual(industrial_metals["breadth_pct"], 87.5)
+        self.assertEqual(industrial_metals["leader"]["name"], "金诚信")
+        serialized = json.dumps(summary, ensure_ascii=False)
+        self.assertNotIn("raw_response", serialized)
+        self.assertNotIn("must-not-survive", serialized)
+
+    def test_unavailable_eastmoney_signal_does_not_hide_niuone_today_rank(self) -> None:
+        scan = sample_scan()
+        scan["eastmoney_concept_signal"] = {
+            "schema_version": 1,
+            "source": "eastmoney_concept_board_rank",
+            "captured_at": "2026-07-28 14:12:12",
+            "available": False,
+            "status": "upstream_unavailable",
+            "boards": [],
+        }
+
+        view = build_niuone_mainline_view(
+            build_niuone_mainline_summary_cache_payload(scan)
+        )
+
+        self.assertEqual(
+            [theme["industry"] for theme in view["today_themes"]],
+            ["工业金属", "银行"],
+        )
+        self.assertFalse(view["eastmoney_concept_signal"]["available"])
+        self.assertEqual(
+            view["eastmoney_concept_signal"]["status"],
+            "upstream_unavailable",
+        )
+        self.assertNotIn("eastmoney", view["today_themes"][0])
 
     def test_empty_payload_returns_stable_unavailable_view(self) -> None:
         view = build_niuone_mainline_view(None)
@@ -254,7 +406,7 @@ class NiuOneMainlineViewTests(unittest.TestCase):
         self.assertFalse(view["available"])
         self.assertEqual(view["themes"], [])
         self.assertEqual(view["today_themes"], [])
-        self.assertEqual(view["reversal_themes"], [])
+        self.assertNotIn("reversal_themes", view)
 
     def test_legacy_snapshot_marks_uncovered_reason_as_pending(self) -> None:
         scan = sample_scan()
@@ -316,31 +468,64 @@ class NiuOneMainlineViewTests(unittest.TestCase):
             ["题材1", "题材2", "题材3", "题材4", "题材5"],
         )
 
-    def test_public_view_keeps_reversal_list_independent_of_structure_top_five(self) -> None:
+    def test_public_view_collapses_overlapping_label_clones(self) -> None:
         scan = sample_scan()
+        shared = [
+            {
+                "code": "002149",
+                "name": "西部材料",
+                "strong_score": 92,
+                "change_pct": 7.4,
+                "attribution_weight": 0.1,
+                "role": "leader",
+            },
+            {
+                "code": "600111",
+                "name": "共同核心",
+                "strong_score": 86,
+                "change_pct": 4.0,
+                "attribution_weight": 0.2,
+                "role": "core",
+            },
+        ]
         scan["niuone_context"]["themes"] = {
-            f"题材{index}": {
-                "industry": f"题材{index}",
-                "score": index,
+            "商业航天": {
+                "industry": "商业航天",
+                "score": 82,
+                "state": "emerging",
+                "strong_stocks": [
+                    {**shared[0], "attribution_weight": 0.8},
+                    {**shared[1], "attribution_weight": 0.7},
+                ],
+            },
+            "纳米银": {
+                "industry": "纳米银",
+                "score": 70,
                 "state": "candidate",
-                "reversal_candidate": index == 1,
-                "reversal_confirmed": index == 1,
-                "reversal_score": 88 if index == 1 else 0,
-            }
-            for index in range(1, 9)
+                "strong_stocks": shared,
+            },
+            "独立题材": {
+                "industry": "独立题材",
+                "score": 68,
+                "state": "candidate",
+                "strong_stocks": [{
+                    "code": "600999",
+                    "name": "独立龙头",
+                    "strong_score": 85,
+                    "change_pct": 5.0,
+                    "attribution_weight": 1.0,
+                    "role": "leader",
+                }],
+            },
         }
 
         view = build_niuone_mainline_view(scan)
 
         self.assertEqual(
             [theme["industry"] for theme in view["themes"]],
-            ["题材8", "题材7", "题材6", "题材5", "题材4"],
+            ["商业航天", "独立题材"],
         )
-        self.assertEqual(
-            [theme["industry"] for theme in view["reversal_themes"]],
-            ["题材1"],
-        )
-
+        self.assertEqual(view["themes"][0]["related_themes"], ["纳米银"])
 
 if __name__ == "__main__":
     unittest.main()

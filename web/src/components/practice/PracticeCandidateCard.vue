@@ -4,6 +4,7 @@ import {
   formatPracticeNumber,
   PRACTICE_TIDE_STATUS_LABELS,
   practiceCandidateIndustryLabel,
+  practiceNiuoneLifecycleLabel,
   practiceCandidateTier,
 } from '../../utils/practiceCandidateDisplay.js'
 
@@ -36,6 +37,11 @@ const riskFlags = computed(() => {
 const tier = computed(() => practiceCandidateTier(props.item))
 const tierLabel = computed(() => ({ high: '交易达标', mid: hardBlockers.value.length ? '未达标' : '等确认', low: '仅观察' })[tier.value])
 const industryLabel = computed(() => practiceCandidateIndustryLabel(props.item))
+const signalThemeLabel = computed(() => String(props.item.signal_theme || '').trim())
+const attributionWeightText = computed(() => {
+  const value = Number(props.item.signal_theme_attribution_weight)
+  return Number.isFinite(value) ? `${(value * 100).toFixed(1)}%` : '--'
+})
 const change = computed(() => Number(props.item.change_pct))
 const changeText = computed(() => Number.isFinite(change.value)
   ? `${change.value > 0 ? '+' : ''}${change.value.toFixed(2)}%`
@@ -64,6 +70,7 @@ const mainlineModeLabel = computed(() => ({
 const mainlineStateLabel = computed(() => (
   PRACTICE_TIDE_STATUS_LABELS[props.item.mainline_state] || props.item.mainline_state || '--'
 ))
+const lifecycleLabel = computed(() => practiceNiuoneLifecycleLabel(props.item))
 const mainlineThemes = computed(() => [props.item.mainline_primary, props.item.mainline_secondary]
   .filter(Boolean)
   .join(' / ') || '--')
@@ -89,7 +96,7 @@ function toggleCandidateDetails() {
   >
     <div
       class="candidate-summary"
-      :class="{ 'has-industry': industryLabel }"
+      :class="{ 'has-industry': industryLabel || signalThemeLabel }"
       :role="niuoneStrategy ? 'button' : undefined"
       :tabindex="niuoneStrategy ? 0 : undefined"
       :aria-expanded="niuoneStrategy ? detailsExpanded : undefined"
@@ -114,8 +121,9 @@ function toggleCandidateDetails() {
           >{{ strategy.label }}</span>
         </div>
       </div>
-      <div v-if="industryLabel" class="candidate-industry">
-        <span class="candidate-industry-badge">{{ industryLabel }}</span>
+      <div v-if="industryLabel || signalThemeLabel" class="candidate-industry">
+        <span v-if="signalThemeLabel" class="candidate-industry-badge candidate-theme-badge">题材 · {{ signalThemeLabel }}</span>
+        <span v-if="industryLabel" class="candidate-industry-badge">行业 · {{ industryLabel }}</span>
       </div>
       <span class="candidate-tier" :class="tier">{{ tierLabel }}</span>
     </div>
@@ -149,8 +157,32 @@ function toggleCandidateDetails() {
               <strong>{{ marketRegimeLabel }} · {{ formatPracticeNumber(item.market_score) }}</strong>
             </div>
             <div class="niuone-fact">
+              <span>生命周期</span>
+              <strong>{{ lifecycleLabel }}</strong>
+            </div>
+            <div class="niuone-fact">
               <span>主线状态</span>
               <strong>{{ mainlineStateLabel }} · {{ formatPracticeNumber(item.mainline_score) }}</strong>
+            </div>
+            <div class="niuone-fact">
+              <span>本次入选题材</span>
+              <strong>{{ signalThemeLabel || '--' }}</strong>
+            </div>
+            <div class="niuone-fact">
+              <span>题材归因 / 权重</span>
+              <strong>{{ formatPracticeNumber(item.signal_theme_attribution_score) }} · {{ attributionWeightText }}</strong>
+            </div>
+            <div class="niuone-fact">
+              <span>历史先验 / 同题材共振</span>
+              <strong>{{ formatPracticeNumber(item.signal_theme_historical_prior_score) }} · {{ formatPracticeNumber(item.signal_theme_cohort_alignment_score) }}</strong>
+            </div>
+            <div class="niuone-fact">
+              <span>20日波形 / 候选相对</span>
+              <strong>{{ formatPracticeNumber(item.signal_theme_return_correlation_score) }} · {{ formatPracticeNumber(item.signal_theme_return_correlation_rank_score) }}</strong>
+            </div>
+            <div class="niuone-fact">
+              <span>题材特异度 / 波形样本</span>
+              <strong>{{ formatPracticeNumber(item.signal_theme_specificity_score) }} · {{ item.signal_theme_return_correlation_observation_count ?? 0 }}日</strong>
             </div>
             <div class="niuone-fact">
               <span>核心题材</span>
@@ -173,12 +205,16 @@ function toggleCandidateDetails() {
               <strong>#{{ item.stock_leader_rank ?? '--' }} · 强度 {{ formatPracticeNumber(item.stock_strong_score) }}</strong>
             </div>
             <div v-if="reversalStrategy" class="niuone-fact">
-              <span>反转双确认</span>
-              <strong>{{ item.reversal_confirmed ? '已完成' : '待完成' }} · {{ item.reversal_confirmation_count ?? 0 }}次</strong>
+              <span>日线V型区间</span>
+              <strong>{{ item.daily_v_left_days ?? '--' }}日回落 · {{ item.daily_v_right_days ?? '--' }}日修复</strong>
             </div>
             <div v-if="reversalStrategy" class="niuone-fact">
-              <span>日内领涨 / 低点反弹</span>
-              <strong>#{{ item.stock_reversal_leader_rank ?? '--' }} · {{ formatPracticeNumber(item.rebound_from_low_pct) }}%</strong>
+              <span>左侧跌幅 / 右侧反弹</span>
+              <strong>{{ formatPracticeNumber(item.daily_v_decline_pct) }}% · {{ formatPracticeNumber(item.daily_v_rebound_pct) }}%</strong>
+            </div>
+            <div v-if="reversalStrategy" class="niuone-fact">
+              <span>阶段低点 / 跌幅收复</span>
+              <strong>{{ item.daily_v_trough_date || '--' }} · {{ formatPracticeNumber(Number(item.daily_v_recovery_ratio) * 100) }}%</strong>
             </div>
             <div class="niuone-fact">
               <span>主线内排名 / 龙头集中度</span>
@@ -187,8 +223,8 @@ function toggleCandidateDetails() {
           </div>
           <p v-if="reversalStrategy || item.mainline_intraday_state === 'intraday_mainline'" class="niuone-observation-note">
             {{ reversalStrategy
-              ? '反转试仓已完成分时双确认，但不等同于主线确认；T+0不加仓，跨日延续后再升级。'
-              : '日内强势仅用于观察；只有独立的反转试仓满足双确认时才允许小仓试错。' }}
+              ? '牛牛试仓依据日线区间V型结构，右侧修复确认后轻仓参与；日内观察数据不作为该策略的必要条件。'
+              : '日内强势仅作为题材研究观察，不会直接触发牛牛试仓。' }}
           </p>
         </section>
 
@@ -355,9 +391,18 @@ function toggleCandidateDetails() {
 }
 
 .candidate-industry {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
   grid-area: industry;
   justify-self: start;
   min-width: 0;
+}
+
+.candidate-theme-badge {
+  background: var(--green-soft);
+  border-color: var(--green-border);
+  color: var(--green-text);
 }
 
 .candidate-industry-badge {

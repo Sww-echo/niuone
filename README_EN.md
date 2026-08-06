@@ -1,4 +1,4 @@
-<img width="2115" height="744" alt="niuone" src="https://github.com/user-attachments/assets/50dd932a-5af9-441a-b17a-d63a0b6801ac" />
+<img width="1200" alt="NiuOne logo" src="docs/assets/readme/niuone.webp" />
 
 # NiuOne · 牛牛1号
 
@@ -13,11 +13,11 @@
 
 ## Introduction
 
-NiuOne is a research and simulated trading system for China's A-share market. LLMs drive market analysis and trading decisions, while the system provides market data aggregation, news retrieval, strategy configuration, and simulated portfolio tracking.
+NiuOne is a local-first market research and simulated trading system. Its main focus is China's A-share market, with additional coverage of overnight U.S. markets, institutional ratings, and selected Twitter/X sources. Market data, news, strategies, and simulated portfolios come together in a single web dashboard, with optional LLM support for research and trading decisions.
 
-The web dashboard provides a unified view of market data, analysis results, and simulated portfolio status. Scheduled jobs automatically collect pre-open call auction data, intraday and post-market activity, capital flows, sector performance, overnight U.S. market activity, institutional ratings, and content from a Twitter/X watchlist. Guided by user-configured strategy rules, LLMs perform news retrieval, market analysis, and simulated buy and sell decisions. Portfolio state, trade records, and decision rationale are stored locally, while simulated execution alerts can be delivered through Feishu, DingTalk, WeCom, or Telegram.
+Scheduled jobs collect pre-open auction data, intraday and post-market activity, capital flows, sector performance, and overseas market information. When a model service is enabled, NiuOne can retrieve news, analyze the market, and make simulated buy and sell decisions within user-defined strategy rules. Portfolio state, trade records, and decision rationale remain local, while execution alerts can be sent through Feishu, DingTalk, WeCom, or Telegram.
 
-NiuOne connects information collection, market analysis, trading decisions, and portfolio records into an automated, traceable, and reviewable simulated trading loop. The system can be deployed on a personal computer or server, with configuration and research data managed by the user. All trades are executed in a simulated account; NiuOne does not connect to brokerage trading interfaces or use real funds.
+NiuOne runs on a personal computer or server, and its configuration and research data stay under the user's control. It works only with simulated accounts: there is no brokerage connection and no real-money execution.
 
 ## Live Demo
 
@@ -27,7 +27,7 @@ NiuOne connects information collection, market analysis, trading decisions, and 
 
 ## Product Tour
 
-Each feature below has its own dark-theme, 1200-pixel-wide animation, using either a full-page or focused-panel view as appropriate, with visible pointer movement, click feedback, and scrolling. Click an animation to open the corresponding live page.
+Click an animation to open the corresponding live page.
 
 ### Simulated Trading and Portfolio Review
 
@@ -37,17 +37,17 @@ Each feature below has its own dark-theme, 1200-pixel-wide animation, using eith
   </a>
 </p>
 
-<p align="center"><sub>Keep the portfolio overview, positions, and logs in view while switching daily and cumulative returns and opening the trading calendar.</sub></p>
+<p align="center"><sub>Portfolio summary, return charts, open positions, and the trading calendar are available in one place.</sub></p>
 
 ### Theme Strength Radar
 
 <p align="center">
   <a href="https://niuone.cn/niuone-mainline">
-    <img width="1200" alt="Theme-strength interaction: compare cross-session and intraday themes, expand representative stocks, and filter confirmed themes" src="docs/assets/readme/theme-strength.gif" />
+    <img width="1200" alt="Theme-strength interaction: compare today's and structural rankings, expand leading and structural stocks, and inspect coverage gaps" src="docs/assets/readme/theme-strength.gif" />
   </a>
 </p>
 
-<p align="center"><sub>Compare confirmed cross-session and intraday themes, market state, and coverage, then expand representative stocks and filter confirmed themes.</sub></p>
+<p align="center"><sub>Today's theme strength sits beside cross-session structural rankings, with Eastmoney rankings, breadth, and leading stocks as additional context.</sub></p>
 
 ### Capital Inflows and Outflows
 
@@ -57,7 +57,7 @@ Each feature below has its own dark-theme, 1200-pixel-wide animation, using eith
   </a>
 </p>
 
-<p align="center"><sub>Open A-share data, inspect sectors and active stocks, scroll through the leading net inflow and outflow lists, then replay the industry-flow timeline.</sub></p>
+<p align="center"><sub>A-share quotes, active sectors, stock-level inflows and outflows, and industry capital movements share one view.</sub></p>
 
 ### Market Breadth and Red/Green Counts
 
@@ -67,7 +67,7 @@ Each feature below has its own dark-theme, 1200-pixel-wide animation, using eith
   </a>
 </p>
 
-<p align="center"><sub>Move across the intraday chart to inspect the selected time, limit-up, limit-down, failed-breakout, red/green counts, and projected, actual, and incremental turnover.</sub></p>
+<p align="center"><sub>The intraday chart links price breadth with limit-up, limit-down, failed-breakout, red/green counts, and turnover data.</sub></p>
 
 ### Automated Market Monitoring
 
@@ -77,7 +77,7 @@ Each feature below has its own dark-theme, 1200-pixel-wide animation, using eith
   </a>
 </p>
 
-<p align="center"><sub>Expand a post-market summary and scroll through its core view, capital flows, leading sectors, risk notes, and next-session watchlist.</sub></p>
+<p align="center"><sub>Pre-open, midday, and post-market reports cover the main view, capital flows, leading sectors, risks, and next-session watchlist.</sub></p>
 
 ### Twitter/X Monitoring
 
@@ -87,7 +87,7 @@ Each feature below has its own dark-theme, 1200-pixel-wide animation, using eith
   </a>
 </p>
 
-<p align="center"><sub>Browse posts, replies, and quotes in a chronological feed, expand full content, and open media in the image viewer.</sub></p>
+<p align="center"><sub>Posts, replies, quotes, and media from watched accounts are collected in a chronological feed.</sub></p>
 
 ### U.S. Institutional Ratings
 
@@ -97,7 +97,7 @@ Each feature below has its own dark-theme, 1200-pixel-wide animation, using eith
   </a>
 </p>
 
-<p align="center"><sub>Compare current and target prices and implied upside, then inspect the institution, analyst, catalysts, risks, and historical daily reports.</sub></p>
+<p align="center"><sub>Review current and target prices, implied upside, institutional views, catalysts, and risks.</sub></p>
 
 ### Local Configuration Center
 
@@ -105,39 +105,34 @@ Each feature below has its own dark-theme, 1200-pixel-wide animation, using eith
   <img width="1200" alt="Local-configuration interaction: browse groups, switch trading strategies, and open market and capital-flow settings" src="docs/assets/readme/dashboard-settings.gif" />
 </p>
 
-<p align="center"><sub>Open strategy settings and switch strategies, return to browse every configuration group, then open market and capital-flow settings.</sub></p>
+<p align="center"><sub>Manage data sources, models, strategies, notifications, and runtime options from the local settings page.</sub></p>
 
-> Market and simulated-portfolio values in these animations are for interface demonstration only and are not investment advice. The configuration-center animation comes from an isolated temporary runtime and contains no secrets or private runtime data.
+> Market and simulated-portfolio values in these animations are for interface demonstration only and are not investment advice.
 
 ## Feature Overview
 
-- **Unified dashboard**: View theme strength, indices, sectors, market sentiment, industry capital flows, Dragon-Tiger data, and historical news in one place.
-- **Theme-strength and strategy research**: Reuse the default 30-second full-market quote sample for intraday theme updates. Built-in suites cover Base, Z-ge, Li Daxiao, Sector Tide, and NiuOne; NiuOne includes cross-session mainline confirmation, emerging/leader/pullback paths, and a twice-confirmed V-reversal probe.
-- **Information aggregation**: Organize A-share auction/midday/close reports, U.S. market summaries, institutional ratings, Twitter/X watchlists, and iWencai Dragon-Tiger data. Limit-up-streak and consecutively listed stocks can receive a structured news precheck.
-- **Intelligent summaries**: Connect compatible large-model services to summarize and structure information from multiple sources.
-- **Custom trading strategies**: Choose a built-in strategy or describe your own candidate-selection, buy, sell, position-sizing, and timing rules in natural language.
-- **Simulated trading and portfolio tracking**: Use your own simulated account for candidate screening, buy and sell decisions, position and P&L tracking, and access to the equity curve and trading logs—all without connecting to a brokerage or using real funds.
-- **Execution notifications**: After a simulated execution is persisted, send alerts to Feishu, DingTalk, WeCom, and Telegram, with independent enable/disable and test controls for each channel.
-- **Automated tasks**: Schedule data collection, summary generation, database ingestion, and background monitoring.
-- **Local configuration and version notices**: Configuration, databases, logs, and task output stay in a separate runtime directory. The settings page can test connections, display the current version, and check Docker Hub for a newer release, but it never downloads or installs an update automatically.
+- **Market dashboard**: View theme strength, indices, sectors, market breadth, industry capital flows, Dragon-Tiger data, and historical news in one place.
+- **Theme and strategy research**: Compare today's theme strength with cross-session structural rankings, using full-market quotes, theme attribution, and Eastmoney rankings as context. NiuOne includes Base, Z-ge, Li Daxiao, Sector Tide, and NiuOne strategies, and also accepts natural-language rules for candidates, entries, exits, position sizing, and timing.
+- **Information and model-assisted analysis**: Collect A-share auction, midday, and close reports alongside overnight U.S. markets, institutional ratings, Twitter/X watchlists, and iWencai Dragon-Tiger data. Compatible model services can support retrieval, summarization, and structured analysis.
+- **Simulated trading**: Track candidates, decisions, positions, P&L, equity curves, and trade logs without connecting to a brokerage or using real funds.
+- **Automation and notifications**: Schedule data collection, report generation, database ingestion, and monitoring. Simulated execution alerts can be sent to Feishu, DingTalk, WeCom, and Telegram.
+- **Local data management**: Configuration, databases, logs, and task output stay in a separate runtime directory. The settings page supports connection tests and update checks, but never installs updates automatically.
 
 Primary pages and dependencies:
 
 | Page | Capability | Additional configuration |
 |---|---|---|
 | `/practice` | Simulated account, candidates, market summary, model decisions, equity curve, and trading calendar | Model decisions require `DASHBOARD_DECISION_*` |
-| `/niuone-mainline` | Full-market cross-session mainlines, intraday strength, V-reversal observations, and representative stocks | Uses public market data; news-confirmation model is optional |
+| `/niuone-mainline` | Full-market today/structural theme rankings, cross-session mainlines, effective coverage, representative stocks, and an Eastmoney live cross-check | No key; market sources must be reachable |
 | `/indices`, `/industry-flow` | Indices, sectors, active stocks, industry main-fund flow, market sentiment, and turnover | No key; market sources must be reachable |
 | `/dragon-tiger` | Dated Dragon-Tiger seats, limit-up/consecutive-list signals, and news prechecks | Enable and configure iWencai; news-precheck model is optional |
 | `/market-monitor` | A-share auction/midday/close and overnight U.S. summaries | Keep the scheduler running; model enhancement is optional |
 | `/x-monitor`, `/us-ratings` | Twitter/X watchlists and U.S. institutional ratings | Enable “NiuNiu U.S. Stocks” and configure the relevant model |
 | `/admin` | Configuration, connection tests, version, and runtime status | Administrator authentication is always required |
 
-The main README does not cover specific research methods or experimental strategies in detail. See the [Strategy Research Notes](docs/strategies/README_EN.md).
+See the [Strategy Research Guide](docs/strategies/README_EN.md) for methodology and the [app module architecture](docs/APP_ARCHITECTURE.md) for code structure and extension points.
 
-When contributing or extending the application, see the [app module architecture](docs/APP_ARCHITECTURE.md) for domain boundaries and compatibility-entrypoint conventions.
-
-The Dashboard has migrated to Vue 3 + Vite and FastAPI/Uvicorn while preserving its existing page layout. Same-origin incremental snapshots reduce public traffic, and trading, market requests, and record computation remain server-side. The public page, `/admin`, and every API share one production port. See [Dashboard Incremental Delivery and Deployment](docs/DASHBOARD_V2_EN.md) for architecture, caching, and CDN/cloud/Tunnel deployment guidance.
+The dashboard is built with Vue 3 + Vite and FastAPI/Uvicorn. Market requests, trading decisions, and record calculations run on the server, while the frontend receives same-origin incremental snapshots. See [Dashboard Incremental Delivery and Deployment](docs/DASHBOARD_V2_EN.md) for architecture, caching, and deployment details.
 
 ## System Requirements
 
@@ -243,7 +238,7 @@ docker compose down
 Deploy a specific version from Docker Hub:
 
 ```bash
-export NIUONE_IMAGE=kunkundi/niuone:v0.0.6
+export NIUONE_IMAGE=kunkundi/niuone:v0.0.7
 docker compose pull
 docker compose up -d --no-build
 ```
@@ -459,10 +454,11 @@ After starting the service, run these health checks:
 
 ```bash
 curl -s -o /dev/null -w 'HEALTH HTTP:%{http_code} TOTAL:%{time_total}\n' http://127.0.0.1:8787/healthz
+curl -s -o /dev/null -w 'READY HTTP:%{http_code} TOTAL:%{time_total}\n' http://127.0.0.1:8787/readyz
 curl -s -o /dev/null -w 'SNAPSHOT HTTP:%{http_code} TOTAL:%{time_total}\n' http://127.0.0.1:8787/api/v2/public/latest
 ```
 
-Both are expected to return `HTTP:200`.
+`healthz` and the public snapshot should return `HTTP:200`. On a first deployment, NiuOne immediately initializes the full-market daily-K-line data required by the NiuOne strategy. A `503` from `readyz` is expected during this interval and changes to `200` when initialization is complete. The Practice page displays counts, coverage, and deployment notices.
 
 Development validation:
 
@@ -493,6 +489,10 @@ Specify another port:
 ### The Page Is Accessible, but Some Content Is Missing
 
 Check the data sources, model services, feature switches, and task times on the settings page, and confirm that the relevant external services are reachable. For additional troubleshooting, see the [Deployment, Validation, and Rollback Manual](docs/OPERATIONS_EN.md).
+
+### A Manual Candidate Scan Always Times Out After 480 Seconds
+
+Exactly 480 seconds means that the full scanner reached its server-side hard timeout; it is usually not a browser problem. Check the data-preparation card on the Practice page or request `/api/system/data-readiness`. A first deployment must reach the safe daily-K-line coverage threshold. If initialization fails, verify Tencent market-data connectivity, runtime-directory write access, and the Docker `/data` persistent volume. The current service initializes the cache immediately after startup, exposes the active task stage, and returns distinct timeout codes for quote, daily-K-line, scoring, and other stages. Increasing 480 seconds alone is not a substitute for fixing cold-start or upstream failures.
 
 ## Documentation
 

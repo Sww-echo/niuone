@@ -35,8 +35,6 @@
 """
 import concurrent.futures
 import http.client
-import importlib
-import io
 import json
 import os
 import re
@@ -52,11 +50,15 @@ from pathlib import Path
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from core.model_api import build_model_request, request_model
+from core.json_cache import write_json_cache
 from niuone_paths import get_dashboard_env_file, get_dashboard_home
 from market_data.news_precheck import (
     NewsPrecheckConfig,
     fetch_candidate_news_records,
+)
+from market_data.eastmoney_boards import (
+    EastmoneyStockBoard,
+    load_eastmoney_board_snapshot,
 )
 from market_data.tencent_kline_cache import (
     DEFAULT_KLINE_COUNT,
@@ -68,6 +70,7 @@ from market_data.tencent_kline_cache import (
     prewarm_kline_cache,
     store_kline_series,
 )
+from screening.candidate_cache import write_practice_candidates_cache
 from screening.stock_universe import (
     DEFAULT_STOCK_UNIVERSE,
     FULL_SUPPORTED_NON_ST_UNIVERSE,
@@ -83,6 +86,7 @@ from screening.stock_universe import (
 from screening.niuone_mainline_cache import (
     load_cached_niuone_context,
     write_niuone_mainline_cache,
+    write_niuone_mainline_summary_cache,
 )
 from strategies.registry import (
     ACTIVE_STRATEGY_ENV,
@@ -156,14 +160,18 @@ TENCENT_KLINE = "https://ifzq.gtimg.cn/appstock/app/fqkline/get"
 TENCENT_QUOTE_TIMEOUT_SECONDS = 10
 TENCENT_QUOTE_MAX_ATTEMPTS = 3
 TENCENT_QUOTE_BACKOFF_SECONDS = 0.5
+DEFAULT_TENCENT_QUOTE_STAGE_TIMEOUT_SECONDS = 90
 DASHBOARD_HOME = get_dashboard_home(Path(__file__).resolve().parents[1])
 DASHBOARD_ENV_FILE = get_dashboard_env_file(Path(__file__).resolve().parents[1])
 B1_OUTPUT_DIR = DASHBOARD_HOME / "cron" / "output"
 B1_CACHE_FILE = B1_OUTPUT_DIR / "b1_screen_latest.json"
 MULTI_STRATEGY_CACHE = B1_OUTPUT_DIR / "multi_strategy_latest.json"
+PRACTICE_CANDIDATES_CACHE = B1_OUTPUT_DIR / "practice_candidates_latest.json"
 NIUONE_MAINLINE_CACHE = B1_OUTPUT_DIR / "niuone_mainline_latest.json"
 NIUONE_MAINLINE_MINUTE_CACHE = B1_OUTPUT_DIR / "niuone_mainline_minute_latest.json"
+NIUONE_MAINLINE_SUMMARY_CACHE = B1_OUTPUT_DIR / "niuone_mainline_summary_latest.json"
 STOCK_INDUSTRY_CACHE = B1_OUTPUT_DIR / "stock_industry_cache.json"
+EASTMONEY_BOARD_CACHE = B1_OUTPUT_DIR / "eastmoney_stock_boards.json"
 B1_HISTORY_DIR = B1_OUTPUT_DIR / "b1_history"
 MULTI_STRATEGY_HISTORY = B1_OUTPUT_DIR / "multi_strategy_history"
 DISPLAY_CANDIDATE_LIMIT = 16
@@ -174,21 +182,7 @@ NIUONE_MAINLINE_ONLY_FLAG = "--niuone-mainline-only"
 KLINE_PREWARM_ONLY_FLAG = "--prewarm-kline-cache"
 HIGH_LIQUIDITY_MIN_AMOUNT = 8e8
 MAX_TRADE_ANALYSIS_COUNT = 500
-SW_STOCK_CLASSIFICATION_URL = (
-    "https://www.swsresearch.com/swindex/pdf/SwClass2021/StockClassifyUse_stock.xls"
-)
-SW_INDUSTRY_TAXONOMY_URL = "https://webapi.cninfo.com.cn/api/stock/p_public0002"
-SW_INDUSTRY_HTTP_TIMEOUT_SECONDS = 10
-SW_INDUSTRY_HTTP_MAX_ATTEMPTS = 2
-THS_INDUSTRY_DETAIL_URL = "https://q.10jqka.com.cn/thshy/detail/code/{code}/page/{page}/"
-THS_INDUSTRY_INDEX_CODE = "881272"
-THS_INDUSTRY_PAGE_LIMIT = 20
-THS_INDUSTRY_WORKERS = 4
-THS_INDUSTRY_MIN_REQUEST_INTERVAL_SECONDS = 0.18
-THS_INDUSTRY_LOGIN_RETRY_ATTEMPTS = 3
 STOCK_INDUSTRY_BULK_CACHE_MIN_COVERAGE = 0.85
-NIUONE_INDUSTRY_FALLBACK_LOOKUP_LIMIT = 128
-_LOCAL_SITE_PACKAGES_READY = False
 _STOCK_INDUSTRY_MEMORY_CACHE: dict[str, str] | None = None
 _MARGIN_DETAIL_CACHE: dict[tuple[str, str], Any] = {}
 _MARGIN_DETAIL_CACHE_LOCK = threading.Lock()
@@ -196,6 +190,41 @@ _BLOCK_TRADE_CACHE: dict[tuple[str, str], Any] = {}
 _BLOCK_TRADE_CACHE_LOCK = threading.Lock()
 _NATIVE_JAVASCRIPT_CONTEXT: Any | None = None
 _NATIVE_JAVASCRIPT_CONTEXT_LOCK = threading.Lock()
+
+
+def report_scan_progress(
+    stage: str,
+    *,
+    stage_label: str,
+    completed: int = 0,
+    total: int = 0,
+    **fields: Any,
+) -> None:
+    """Publish bounded scanner progress when launched by the Dashboard."""
+    raw_path = str(os.environ.get("DASHBOARD_B1_PROGRESS_FILE") or "").strip()
+    if not raw_path:
+        return
+    payload = {
+        "job_id": str(os.environ.get("DASHBOARD_B1_JOB_ID") or "").strip(),
+        "stage": str(stage or "running")[:80],
+        "stage_label": str(stage_label or "正在运行选股扫描")[:160],
+        "completed": max(0, int(completed or 0)),
+        "total": max(0, int(total or 0)),
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    for name in (
+        "cache_hits",
+        "network_fallbacks",
+        "worker_count",
+        "source",
+        "error_code",
+    ):
+        if name in fields:
+            payload[name] = fields[name]
+    try:
+        write_json_cache(Path(raw_path).expanduser(), payload)
+    except OSError:
+        pass
 
 
 # ========== helpers ==========
@@ -360,6 +389,21 @@ def candidate_in_configured_stock_universe(candidate: dict[str, Any]) -> bool:
     )
 
 
+def niuone_lifecycle_candidate_metadata(
+    scored: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project the complete five-stage contract into candidate telemetry."""
+    return {
+        key: scored.get(key)
+        for key in (
+            "niuone_lifecycle_stage",
+            "niuone_lifecycle_label",
+            "niuone_lifecycle_order",
+            "niuone_lifecycle_entry_policy",
+        )
+    }
+
+
 # ========== Tencent data fetchers ==========
 
 class TencentQuoteBatchError(RuntimeError):
@@ -478,6 +522,21 @@ def tencent_batch_quote(
         f"Tencent quote{scope} failed after {attempts_used}/{attempts} attempts: "
         f"{_tencent_quote_error_label(last_error or RuntimeError())}"
     ) from last_error
+
+
+def bounded_quote_request_timeout(
+    remaining_seconds: float,
+    *,
+    max_attempts: int = TENCENT_QUOTE_MAX_ATTEMPTS,
+    backoff_seconds: float = TENCENT_QUOTE_BACKOFF_SECONDS,
+) -> float:
+    """Keep one retrying quote batch inside the remaining stage budget."""
+    attempts = max(1, int(max_attempts))
+    backoff_budget = max(0.0, float(backoff_seconds)) * sum(
+        2 ** index for index in range(max(0, attempts - 1))
+    )
+    request_budget = max(0.1, float(remaining_seconds) - backoff_budget)
+    return max(0.1, min(TENCENT_QUOTE_TIMEOUT_SECONDS, request_budget / attempts))
 
 
 def build_market_snapshot(
@@ -1214,106 +1273,14 @@ def normalize_stock_code(code: Any) -> str:
     return digits.zfill(6) if digits else ""
 
 
-def _record_value(row: Any, key: str) -> Any:
-    if hasattr(row, "get"):
-        return row.get(key)
-    try:
-        return row[key]
-    except Exception:
-        return None
-
-
-def _iter_record_rows(data: Any):
-    if data is None:
-        return
-    iterrows = getattr(data, "iterrows", None)
-    if callable(iterrows):
-        for _, row in iterrows():
-            yield row
-        return
-    if isinstance(data, dict):
-        yield data
-        return
-    try:
-        for row in data:
-            yield row
-    except TypeError:
-        return
-
-
-def extract_industry_from_individual_info(info: Any) -> str:
-    """Read the industry/sector name from akshare.stock_individual_info_em output."""
-    direct_keys = ("行业", "所属行业", "板块", "所属板块")
-    item_keys = ("item", "项目", "指标")
-    value_keys = ("value", "值", "内容")
-
-    for row in _iter_record_rows(info):
-        for key in direct_keys:
-            industry = normalize_industry_name(_record_value(row, key))
-            if industry:
-                return industry
-
-        item_name = ""
-        for key in item_keys:
-            item_name = str(_record_value(row, key) or "").strip()
-            if item_name:
-                break
-        if item_name not in direct_keys:
-            continue
-
-        for key in value_keys:
-            industry = normalize_industry_name(_record_value(row, key))
-            if industry:
-                return industry
-    return ""
-
-
-def extract_industry_from_cninfo_change(info: Any) -> str:
-    rows = list(_iter_record_rows(info) or [])
-    standard_priority = (
-        "申银万国行业分类标准",
-        "中证行业分类标准",
-        "巨潮行业分类标准",
-        "中国上市公司协会上市公司行业分类标准",
-    )
-    value_keys = ("行业中类", "行业大类", "行业次类", "行业门类")
-
-    def row_date(row: Any) -> str:
-        return str(_record_value(row, "变更日期") or "")
-
-    def row_industry(row: Any) -> str:
-        for key in value_keys:
-            industry = normalize_industry_name(_record_value(row, key))
-            if industry:
-                return industry
-        return ""
-
-    for standard in standard_priority:
-        selected = [
-            row for row in rows
-            if standard in str(_record_value(row, "分类标准") or "")
-        ]
-        for row in sorted(selected, key=row_date, reverse=True):
-            industry = row_industry(row)
-            if industry:
-                return industry
-
-    for row in sorted(rows, key=row_date, reverse=True):
-        industry = row_industry(row)
-        if industry:
-            return industry
-    return ""
-
-
-def _add_local_runtime_site_packages() -> None:
-    global _LOCAL_SITE_PACKAGES_READY
-    if _LOCAL_SITE_PACKAGES_READY:
-        return
-    _LOCAL_SITE_PACKAGES_READY = True
-    version_dir = f"python{sys.version_info.major}.{sys.version_info.minor}"
-    site_packages = DASHBOARD_HOME.parent / ".venv" / "lib" / version_dir / "site-packages"
-    if site_packages.exists() and str(site_packages) not in sys.path:
-        sys.path.insert(0, str(site_packages))
+def load_bulk_stock_board_map(codes: set[str]) -> dict[str, EastmoneyStockBoard]:
+    """Load one batch of current Eastmoney industries and concepts."""
+    targets = {normalize_stock_code(code) for code in codes}
+    targets.discard("")
+    if not targets:
+        return {}
+    snapshot = load_eastmoney_board_snapshot(cache_path=EASTMONEY_BOARD_CACHE)
+    return snapshot.subset(targets)
 
 
 def load_stock_industry_cache() -> dict[str, str]:
@@ -1350,281 +1317,22 @@ def save_stock_industry_cache(cache: dict[str, str]) -> None:
         print(f"[WARN] stock industry cache save failed: {type(exc).__name__}", file=sys.stderr)
 
 
-def _bounded_requests_get(
-    requests_module: Any,
-    url: str,
-    *,
-    headers: Mapping[str, str] | None = None,
-    params: Mapping[str, str] | None = None,
-    timeout: int = SW_INDUSTRY_HTTP_TIMEOUT_SECONDS,
-    max_attempts: int = SW_INDUSTRY_HTTP_MAX_ATTEMPTS,
-) -> Any:
-    """GET one bounded external resource with a small retry budget."""
-    last_error: Exception | None = None
-    for attempt in range(max(1, int(max_attempts or 1))):
-        try:
-            response = requests_module.get(
-                url,
-                headers=dict(headers or {}),
-                params=dict(params or {}),
-                timeout=max(1, int(timeout)),
-            )
-            raise_for_status = getattr(response, "raise_for_status", None)
-            if callable(raise_for_status):
-                raise_for_status()
-            return response
-        except Exception as exc:
-            last_error = exc
-            if attempt + 1 < max_attempts:
-                time.sleep(0.4 * (attempt + 1))
-    if last_error is not None:
-        raise last_error
-    raise RuntimeError("industry data request failed")
-
-
-def load_sw_stock_industry_map(
-    codes: set[str] | list[str] | tuple[str, ...],
-    *,
-    ak_module: Any | None = None,
-) -> dict[str, str]:
-    """Load a consistent SW level-2 industry map in two bounded requests.
-
-    The all-market NiuOne scan must not fan out thousands of per-stock industry
-    calls.  SW publishes one classification workbook, while CNInfo publishes
-    the matching taxonomy.  Joining both locally keeps the scan bounded and
-    gives every stock in the same run one consistent classification standard.
-    """
-    targets = {normalize_stock_code(code) for code in codes}
-    targets.discard("")
-    if not targets:
-        return {}
-
-    _add_local_runtime_site_packages()
-    if ak_module is None:
-        import akshare as ak_module
-    import pandas as pd
-
-    taxonomy_module = importlib.import_module(
-        ak_module.stock_industry_category_cninfo.__module__
-    )
-    javascript = taxonomy_module.py_mini_racer.MiniRacer()
-    javascript.eval(taxonomy_module._get_file_content_ths("cninfo.js"))
-    enckey = javascript.call("getResCode1")
-    taxonomy_response = _bounded_requests_get(
-        taxonomy_module.requests,
-        SW_INDUSTRY_TAXONOMY_URL,
-        params={"indcode": "", "indtype": "008003", "format": "json"},
-        headers={
-            "Accept": "*/*",
-            "Accept-Enckey": str(enckey),
-            "Origin": "https://webapi.cninfo.com.cn",
-            "Referer": "https://webapi.cninfo.com.cn/",
-            "User-Agent": UA,
-            "X-Requested-With": "XMLHttpRequest",
-        },
-    )
-    taxonomy_payload = taxonomy_response.json()
-    taxonomy_rows = taxonomy_payload.get("records") if isinstance(taxonomy_payload, dict) else []
-    taxonomy: dict[str, tuple[bool, str]] = {}
-    for row in taxonomy_rows or []:
-        if not isinstance(row, Mapping):
-            continue
-        category_code = re.sub(r"^S", "", str(row.get("SORTCODE") or "").strip())
-        industry = normalize_industry_name(row.get("SORTNAME"))
-        if not category_code or not industry:
-            continue
-        active = not str(row.get("F002D") or "").strip()
-        if active or category_code not in taxonomy:
-            taxonomy[category_code] = (active, industry)
-
-    workbook_module = importlib.import_module(
-        ak_module.stock_industry_clf_hist_sw.__module__
-    )
-    workbook_response = _bounded_requests_get(
-        workbook_module.requests,
-        SW_STOCK_CLASSIFICATION_URL,
-        headers=getattr(workbook_module, "headers", {}),
-    )
-    frame = pd.read_excel(
-        io.BytesIO(workbook_response.content),
-        dtype={"股票代码": "str", "行业代码": "str"},
-    )
-    required_columns = {"股票代码", "行业代码", "计入日期", "更新日期"}
-    if not required_columns.issubset(frame.columns):
-        raise ValueError("unexpected SW industry workbook columns")
-
-    current: dict[str, tuple[tuple[int, int, int], str]] = {}
-    for row_index, row in frame.iterrows():
-        code = normalize_stock_code(row.get("股票代码"))
-        if code not in targets:
-            continue
-        industry_code = re.sub(r"\.0$", "", str(row.get("行业代码") or "").strip())
-        if not industry_code:
-            continue
-        start_date = pd.to_datetime(row.get("计入日期"), errors="coerce")
-        update_date = pd.to_datetime(row.get("更新日期"), errors="coerce")
-        rank = (
-            int(start_date.value) if not pd.isna(start_date) else -1,
-            int(update_date.value) if not pd.isna(update_date) else -1,
-            int(row_index),
-        )
-        existing = current.get(code)
-        if existing is None or rank > existing[0]:
-            current[code] = (rank, industry_code)
-
-    result: dict[str, str] = {}
-    for code, (_rank, industry_code) in current.items():
-        # SW level 2 is a useful theme proxy: broad enough to show resonance,
-        # but more actionable than grouping the whole market into 31 sectors.
-        industry = (
-            taxonomy.get(industry_code[:4])
-            or taxonomy.get(industry_code[:2])
-            or taxonomy.get(industry_code)
-        )
-        normalized = normalize_industry_name(industry[1] if industry else "")
-        if normalized:
-            result[code] = normalized
-    return result
-
-
-def load_ths_stock_industry_map(
-    codes: set[str] | list[str] | tuple[str, ...],
-    *,
-    ak_module: Any | None = None,
-) -> dict[str, str]:
-    """Build one all-market industry map from bounded THS industry pages."""
-    targets = {normalize_stock_code(code) for code in codes}
-    targets.discard("")
-    if not targets:
-        return {}
-
-    _add_local_runtime_site_packages()
-    if ak_module is None:
-        import akshare as ak_module
-    ths_module = importlib.import_module(ak_module.stock_board_industry_name_ths.__module__)
-    javascript = ths_module.py_mini_racer.MiniRacer()
-    javascript.eval(ths_module._get_file_content_ths("ths.js"))
-    cookie = javascript.call("v")
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/89.0.4389.90 Safari/537.36"
-        ),
-        "Cookie": f"v={cookie}",
-    }
-    request_lock = threading.Lock()
-    last_request_at = [0.0]
-
-    def fetch_page(industry_code: str, page: int) -> str:
-        for attempt in range(THS_INDUSTRY_LOGIN_RETRY_ATTEMPTS):
-            with request_lock:
-                elapsed = time.monotonic() - last_request_at[0]
-                delay = THS_INDUSTRY_MIN_REQUEST_INTERVAL_SECONDS - elapsed
-                if delay > 0:
-                    time.sleep(delay)
-                response = _bounded_requests_get(
-                    ths_module.requests,
-                    THS_INDUSTRY_DETAIL_URL.format(code=industry_code, page=page),
-                    headers=headers,
-                )
-                last_request_at[0] = time.monotonic()
-            if "account/login" not in str(getattr(response, "url", "")):
-                return response.content.decode("gb18030", "ignore")
-            if attempt + 1 < THS_INDUSTRY_LOGIN_RETRY_ATTEMPTS:
-                time.sleep(attempt + 1)
-        raise RuntimeError("THS industry page redirected to login")
-
-    index_html = fetch_page(THS_INDUSTRY_INDEX_CODE, 1)
-    industries: list[tuple[str, str]] = []
-    seen_industries: set[str] = set()
-    for industry_code, raw_name in re.findall(
-        r"/thshy/detail/code/(\d+)/[^>]*>([^<]+)</a>",
-        index_html,
-    ):
-        industry = normalize_industry_name(raw_name)
-        if industry_code in seen_industries or not industry:
-            continue
-        seen_industries.add(industry_code)
-        industries.append((industry_code, industry))
-    if not industries:
-        raise ValueError("THS industry index contained no industries")
-
-    def fetch_industry(industry_item: tuple[str, str]) -> tuple[str, set[str], str]:
-        industry_code, industry = industry_item
-        members: set[str] = set()
-        page_total = 1
-        for page in range(1, THS_INDUSTRY_PAGE_LIMIT + 1):
-            try:
-                html = fetch_page(industry_code, page)
-            except Exception as exc:
-                return industry, members, type(exc).__name__
-            members.update(
-                code for code in re.findall(r"stockpage\.10jqka\.com\.cn/(\d{6})", html)
-                if code in targets
-            )
-            page_match = re.search(r'class="page_info">\s*\d+/(\d+)', html)
-            page_total = max(1, int(page_match.group(1))) if page_match else 1
-            if page >= page_total:
-                break
-            time.sleep(0.12)
-        return industry, members, ""
-
-    result: dict[str, str] = {}
-    failures: list[str] = []
-    workers = min(THS_INDUSTRY_WORKERS, len(industries))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        for industry, members, error in pool.map(fetch_industry, industries):
-            for code in members:
-                result.setdefault(code, industry)
-            if error:
-                failures.append(f"{industry}:{error}")
-    if failures:
-        print(
-            f"[WARN] THS bulk industry lookup was partial: {len(failures)}/{len(industries)} industries",
-            file=sys.stderr,
-        )
-    return result
-
-
 def load_bulk_stock_industry_map(codes: set[str]) -> dict[str, str]:
-    """Prefer the compact SW download and fall back to bounded THS pages."""
-    try:
-        return load_sw_stock_industry_map(codes)
-    except Exception as exc:
-        print(
-            f"[WARN] SW bulk industry lookup failed: {type(exc).__name__}; trying THS",
-            file=sys.stderr,
-        )
-    return load_ths_stock_industry_map(codes)
+    """Return only Eastmoney ``f100`` industries for compatibility callers."""
+    return {
+        code: stock.industry
+        for code, stock in load_bulk_stock_board_map(codes).items()
+        if stock.industry
+    }
 
 
 def lookup_stock_industry(code: str, ak_module: Any | None = None) -> str:
+    """Resolve one industry from the same Eastmoney batch source."""
     code = normalize_stock_code(code)
     if not code:
         return ""
-    if ak_module is None:
-        _add_local_runtime_site_packages()
-        import akshare as ak_module
-
-    for attempt in range(2):
-        try:
-            info = ak_module.stock_industry_change_cninfo(
-                symbol=code,
-                start_date="19900101",
-                end_date=time.strftime("%Y%m%d"),
-            )
-            industry = extract_industry_from_cninfo_change(info)
-            if industry:
-                return industry
-        except Exception:
-            if attempt == 0:
-                time.sleep(0.4)
-                continue
-            break
-
-    info = ak_module.stock_individual_info_em(symbol=code)
-    return extract_industry_from_individual_info(info)
+    stock = load_bulk_stock_board_map({code}).get(code)
+    return stock.industry if stock is not None else ""
 
 
 def annotate_candidate_industries(
@@ -1634,7 +1342,49 @@ def annotate_candidate_industries(
     max_fallback_lookups: int | None = None,
     max_workers: int = 1,
 ) -> None:
-    """Attach industry/sector labels to candidate rows without making them required."""
+    """Attach Eastmoney industry plus multi-label concepts to candidate rows."""
+    if lookup is None and bulk_lookup is None:
+        items = [
+            item
+            for group in groups
+            for item in (group or [])
+            if isinstance(item, dict)
+        ]
+        codes = {
+            code for item in items if (code := normalize_stock_code(item.get("code")))
+        }
+        boards = load_bulk_stock_board_map(codes)
+        industry_cache: dict[str, str] = {}
+        for item in items:
+            code = normalize_stock_code(item.get("code"))
+            stock = boards.get(code)
+            if stock is None:
+                item.pop("industry", None)
+                item.pop("sector", None)
+                item.pop("themes", None)
+                continue
+            industry = normalize_industry_name(stock.industry)
+            themes = list(dict.fromkeys(
+                label
+                for raw in stock.themes
+                if (label := normalize_industry_name(raw))
+            ))
+            if industry:
+                item["industry"] = industry
+                item["sector"] = industry
+                industry_cache[code] = industry
+            else:
+                item.pop("industry", None)
+                item.pop("sector", None)
+            if themes:
+                item["themes"] = themes
+            else:
+                item.pop("themes", None)
+        save_stock_industry_cache(industry_cache)
+        return
+
+    # Explicit test/compatibility hooks retain the former single-label contract,
+    # but production does not call them and never reads a non-Eastmoney cache.
     missing_by_code: dict[str, list[dict[str, Any]]] = {}
 
     for group in groups:
@@ -1753,55 +1503,25 @@ def annotate_candidate_industries(
 
 # ========== Main ==========
 
-def grok_industry_classify(candidates: list[dict]) -> None:
-    """用 Grok 一次性查询所有候选股的行业分类。"""
-    if not candidates:
-        return
-    try:
-        import yaml
-        cfg_path = Path(os.environ.get("DASHBOARD_CONFIG", DASHBOARD_HOME / "config.yaml")).expanduser()
-        cfg = yaml.safe_load(cfg_path.read_text()) if cfg_path.exists() else {}
-        providers = cfg.get("custom_providers", [])
-        crossdesk = next((p for p in providers if "crossdesk" in str(p.get("name","")).lower()), None)
-        if not crossdesk: return
-        base = crossdesk["base_url"].rstrip("/"); api_key = crossdesk["api_key"]
-        stock_list = "\n".join(f"{c['code']} {c['name']}" for c in candidates)
-        prompt = f"对以下A股每只给一个简短行业标签（如通信设备、半导体、汽车零部件）。只输出：代码 名称：行业\n\n{stock_list}"
-        model = "grok-4.20-multi-agent-xhigh"
-        model_request = build_model_request(
-            base,
-            model,
-            [{"role": "user", "content": prompt}],
-            max_tokens=200,
-            api_mode="chat",
-        )
-        parsed = request_model(
-            model_request,
-            api_key,
-            timeout=10,
-            opener=urllib.request.urlopen,
-        )
-        for line in parsed.content.strip().split("\n"):
-            for c in candidates:
-                if c["code"] in line and c["name"] in line:
-                    parts = line.split("：",1) if "：" in line else line.split(":",1) if ":" in line else [line,""]
-                    if len(parts) >= 2: c["industry"] = parts[1].strip()
-                    break
-    except Exception: pass
 
-
-def write_outputs(json_str: str, generated_at: str) -> None:
+def write_outputs(
+    payload: Mapping[str, Any],
+    generated_at: str,
+    *,
+    json_str: str | None = None,
+) -> None:
     """Write B1 cache (backward compat), multi-strategy cache, and archives."""
     B1_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    serialized = json_str or json.dumps(payload, ensure_ascii=False, indent=2)
 
     # Multi-strategy cache (primary)
     tmp_ms = MULTI_STRATEGY_CACHE.with_suffix(MULTI_STRATEGY_CACHE.suffix + ".new")
-    tmp_ms.write_text(json_str + "\n", encoding="utf-8")
+    tmp_ms.write_text(serialized + "\n", encoding="utf-8")
     tmp_ms.replace(MULTI_STRATEGY_CACHE)
 
     # B1 cache (backward compat for dashboard/现有pipeline)
     tmp_b1 = B1_CACHE_FILE.with_suffix(B1_CACHE_FILE.suffix + ".new")
-    tmp_b1.write_text(json_str + "\n", encoding="utf-8")
+    tmp_b1.write_text(serialized + "\n", encoding="utf-8")
     tmp_b1.replace(B1_CACHE_FILE)
 
     # Archive
@@ -1813,8 +1533,15 @@ def write_outputs(json_str: str, generated_at: str) -> None:
         d.mkdir(parents=True, exist_ok=True)
         f = d / f"{safe_ts}.json"
         ft = f.with_suffix(f.suffix + ".new")
-        ft.write_text(json_str + "\n", encoding="utf-8")
+        ft.write_text(serialized + "\n", encoding="utf-8")
         ft.replace(f)
+
+    # The Dashboard polls this bounded read model instead of the full scan.
+    write_practice_candidates_cache(
+        PRACTICE_CANDIDATES_CACHE,
+        payload,
+        source_path=MULTI_STRATEGY_CACHE,
+    )
 
 
 def prewarm_full_market_klines(
@@ -1824,6 +1551,11 @@ def prewarm_full_market_klines(
     fetcher: Callable[[str, int], list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     """Populate the private SQLite cache for every supported non-ST A share."""
+    resolved_target_date = str(
+        target_date
+        or os.environ.get("DASHBOARD_KLINE_PREWARM_TARGET_DATE")
+        or datetime.now().strftime("%Y-%m-%d")
+    )[:10]
     candidates = load_a_share_code_pool(FULL_SUPPORTED_NON_ST_UNIVERSE)
     symbols = [
         ("sh" if code.startswith(("6", "9")) else "sz") + code
@@ -1839,16 +1571,43 @@ def prewarm_full_market_klines(
             workers = DEFAULT_PREWARM_WORKERS
 
     def progress(completed: int, total: int, failures: int) -> None:
+        report_scan_progress(
+            "kline_prewarm",
+            stage_label="正在初始化全市场日K数据",
+            completed=completed,
+            total=total,
+            network_fallbacks=failures,
+            source="tencent_kline",
+        )
         print(
             f"  ... {completed}/{total} daily K-line series prepared; failures={failures}",
             file=sys.stderr,
         )
 
+    accepted_last_dates: set[str] = set()
+    if dashboard_env_enabled("DASHBOARD_KLINE_PREWARM_RESUME", False):
+        try:
+            from a_share_calendar import trading_day_status
+
+            calendar = trading_day_status(resolved_target_date, allow_refresh=False)
+            accepted_last_dates = {
+                str(calendar.get("date") or "")[:10],
+                str(calendar.get("previous_trading_day") or "")[:10],
+            }
+            accepted_last_dates = {
+                value
+                for value in accepted_last_dates
+                if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value)
+            }
+        except Exception:
+            accepted_last_dates = set()
+
     return prewarm_kline_cache(
         symbols,
         path=kline_cache_path(),
-        target_date=target_date,
+        target_date=resolved_target_date,
         workers=workers,
+        accepted_last_dates=accepted_last_dates,
         fetcher=fetcher,
         progress=progress,
     )
@@ -1856,6 +1615,10 @@ def prewarm_full_market_klines(
 
 def main():
     if kline_prewarm_only_mode():
+        report_scan_progress(
+            "kline_prewarm",
+            stage_label="正在初始化全市场日K数据",
+        )
         print("Pre-market task: warming full-market daily K-line SQLite cache...", file=sys.stderr)
         result = prewarm_full_market_klines()
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -1869,6 +1632,7 @@ def main():
         )
         return
 
+    report_scan_progress("code_pool", stage_label="正在加载A股代码池")
     print("Step 1: Loading A-share code pool...", file=sys.stderr)
     niuone_mainline_only = niuone_mainline_only_mode()
     scorers = strategy_scorers_for_run(niuone_mainline_only=niuone_mainline_only)
@@ -1898,6 +1662,7 @@ def main():
             file=sys.stderr,
         )
 
+    report_scan_progress("quotes", stage_label="正在获取全市场实时行情")
     print("Step 2: Fetching real-time batch quotes...", file=sys.stderr)
     tencent_keys = {}
     all_keys = []
@@ -1910,11 +1675,37 @@ def main():
     quotes = {}
     batch_size = 150
     batch_total = max(1, (len(all_keys) + batch_size - 1) // batch_size)
+    try:
+        quote_stage_timeout = float(
+            dashboard_env_value("DASHBOARD_TENCENT_QUOTE_STAGE_TIMEOUT_SECONDS")
+            or DEFAULT_TENCENT_QUOTE_STAGE_TIMEOUT_SECONDS
+        )
+    except (TypeError, ValueError):
+        quote_stage_timeout = DEFAULT_TENCENT_QUOTE_STAGE_TIMEOUT_SECONDS
+    quote_stage_timeout = max(15.0, min(300.0, quote_stage_timeout))
+    quote_stage_deadline = time.monotonic() + quote_stage_timeout
     for i in range(0, len(all_keys), batch_size):
         batch = all_keys[i:i + batch_size]
         batch_number = i // batch_size + 1
-        q = tencent_batch_quote(batch, batch_label=f"{batch_number}/{batch_total}")
+        remaining_seconds = quote_stage_deadline - time.monotonic()
+        if remaining_seconds <= 0:
+            raise TencentQuoteBatchError(
+                "Tencent quote aggregate deadline exceeded after "
+                f"{batch_number - 1}/{batch_total} batches"
+            )
+        q = tencent_batch_quote(
+            batch,
+            batch_label=f"{batch_number}/{batch_total}",
+            timeout_seconds=bounded_quote_request_timeout(remaining_seconds),
+        )
         quotes.update(q)
+        report_scan_progress(
+            "quotes",
+            stage_label="正在获取全市场实时行情",
+            completed=batch_number,
+            total=batch_total,
+            source="tencent_quote",
+        )
         time.sleep(0.05)
     reference_keys = {tencent_keys[code] for code, _name in reference_candidates}
     reference_quotes = {key: quote for key, quote in quotes.items() if key in reference_keys}
@@ -1975,6 +1766,10 @@ def main():
         file=sys.stderr,
     )
     kline_cache_enabled = dashboard_env_enabled("DASHBOARD_KLINE_CACHE_ENABLED", True)
+    strict_kline_cache = dashboard_env_enabled(
+        "DASHBOARD_B1_REQUIRE_READY_CACHE",
+        False,
+    )
     cached_klines_by_symbol: dict[str, list[dict[str, Any]]] = {}
     pending_kline_cache: dict[str, list[dict[str, Any]]] = {}
     pending_kline_cache_lock = threading.Lock()
@@ -1983,6 +1778,12 @@ def main():
         for code, _name, _quote in [*context_candidates, *to_analyze]
         if code in tencent_keys
     ))
+    report_scan_progress(
+        "cache_check",
+        stage_label="正在检查日K缓存",
+        total=len(needed_kline_symbols),
+        worker_count=scan_workers,
+    )
     scan_as_of_date, scan_previous_trading_day = resolve_quote_trading_dates(
         reference_quotes if niuone_enabled else quotes
     )
@@ -2012,6 +1813,41 @@ def main():
             f"previous={scan_previous_trading_day or 'unknown'}",
             file=sys.stderr,
         )
+        report_scan_progress(
+            "cache_check",
+            stage_label="正在检查日K缓存",
+            completed=len(cached_klines_by_symbol),
+            total=len(needed_kline_symbols),
+            cache_hits=len(cached_klines_by_symbol),
+            network_fallbacks=(
+                0
+                if strict_kline_cache
+                else max(0, len(needed_kline_symbols) - len(cached_klines_by_symbol))
+            ),
+            worker_count=scan_workers,
+        )
+
+    if strict_kline_cache:
+        if not kline_cache_enabled:
+            raise RuntimeError("ready K-line cache is required but local cache is disabled")
+        try:
+            minimum_coverage = float(
+                dashboard_env_value("DASHBOARD_KLINE_READINESS_MIN_COVERAGE_PERCENT")
+                or "90"
+            ) / 100
+        except (TypeError, ValueError):
+            minimum_coverage = 0.9
+        minimum_coverage = max(0.9, min(1.0, minimum_coverage))
+        cache_coverage = (
+            len(cached_klines_by_symbol) / len(needed_kline_symbols)
+            if needed_kline_symbols
+            else 1.0
+        )
+        if cache_coverage < minimum_coverage:
+            raise RuntimeError(
+                "ready K-line cache coverage was lost before scanning: "
+                f"{cache_coverage:.1%} < {minimum_coverage:.1%}"
+            )
 
     def remember_fetched_klines(symbol: str, rows: list[dict[str, Any]]) -> None:
         if not kline_cache_enabled or not rows:
@@ -2051,6 +1887,11 @@ def main():
 
     industry_members: list[dict[str, Any]] = []
     if sector_tide_enabled or niuone_enabled or zettaranc_enabled:
+        report_scan_progress(
+            "industry_context",
+            stage_label="正在准备行业与题材分类",
+            total=len(context_candidates),
+        )
         print("  Resolving candidate industries for strategy scoring...", file=sys.stderr)
         industry_members = [
             {"code": code, "name": name, "quote": q}
@@ -2065,11 +1906,6 @@ def main():
         annotate_candidate_industries(
             industry_members,
             trade_only_industry_members,
-            bulk_lookup=load_bulk_stock_industry_map if niuone_enabled else None,
-            max_fallback_lookups=(
-                NIUONE_INDUSTRY_FALLBACK_LOOKUP_LIMIT if niuone_enabled else None
-            ),
-            max_workers=8 if scan_workers > 1 else 1,
         )
         industry_by_code = {
             str(item["code"]): normalize_industry_name(item.get("industry"))
@@ -2082,19 +1918,35 @@ def main():
     if sector_tide_enabled or niuone_enabled:
         label = "market/sector tide" if sector_tide_enabled else "strong-stock mainline"
         print(f"  Building shared {label} context...", file=sys.stderr)
+        report_scan_progress(
+            "kline_prepare",
+            stage_label="正在准备全市场日K与题材上下文",
+            completed=0,
+            total=len(industry_members),
+            cache_hits=len(cached_klines_by_symbol),
+            network_fallbacks=(
+                0
+                if strict_kline_cache
+                else max(0, len(needed_kline_symbols) - len(cached_klines_by_symbol))
+            ),
+            worker_count=scan_workers,
+        )
 
         def prepare_context_member(item: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]] | None]:
             code = str(item["code"])
             name = str(item["name"])
             industry = normalize_industry_name(item.get("industry"))
             quote = item.get("quote") if isinstance(item.get("quote"), dict) else {}
+            historical_rows = cached_klines_by_symbol.get(tencent_keys[code])
+            if strict_kline_cache and not historical_rows:
+                return item, None
             rows = prepare_strategy_rows(
                 code,
                 tencent_keys[code],
                 quote=quote,
                 name=name,
                 industry=industry,
-                historical_rows=cached_klines_by_symbol.get(tencent_keys[code]),
+                historical_rows=historical_rows,
                 fetched_callback=remember_fetched_klines,
             )
             return item, rows
@@ -2110,6 +1962,7 @@ def main():
                 code = str(item["code"])
                 name = str(item["name"])
                 industry = normalize_industry_name(item.get("industry"))
+                themes = list(item.get("themes") or ())
                 quote = item.get("quote") if isinstance(item.get("quote"), dict) else {}
                 if rows:
                     prepared_by_code[code] = rows
@@ -2118,10 +1971,24 @@ def main():
                         "code": code,
                         "name": name,
                         "industry": industry,
+                        "themes": themes,
                         "quote": quote,
                         "rows": rows,
                     })
                 if (index + 1) % 100 == 0:
+                    report_scan_progress(
+                        "kline_prepare",
+                        stage_label="正在准备全市场日K与题材上下文",
+                        completed=index + 1,
+                        total=len(industry_members),
+                        cache_hits=len(cached_klines_by_symbol),
+                        network_fallbacks=(
+                            0
+                            if strict_kline_cache
+                            else max(0, len(needed_kline_symbols) - len(cached_klines_by_symbol))
+                        ),
+                        worker_count=scan_workers,
+                    )
                     print(
                         f"  ... {index + 1}/{len(industry_members)} cross-sectional members prepared",
                         file=sys.stderr,
@@ -2172,6 +2039,7 @@ def main():
                 as_of_date=niuone_as_of_date,
                 previous_trading_day=niuone_previous_trading_day,
                 sample_at=str(market_snapshot.get("captured_at") or ""),
+                theme_basis="eastmoney_concept",
             )
             niuone_context["industry_money_flow"] = sector_tide_flow_rows
             niuone_context["reference_stock_universe"] = list(reference_stock_universe)
@@ -2197,26 +2065,6 @@ def main():
     if niuone_mainline_only:
         if niuone_context is None:
             raise RuntimeError("independent NiuOne mainline context was not generated")
-        news_shortlist = niuone_news_shortlist(niuone_context)
-        news_snapshot = fetch_sector_tide_news_precheck(news_shortlist)
-        niuone_context = build_niuone_context(
-            prepared_items,
-            reference_pool_count=len(reference_candidates),
-            market_snapshot=market_snapshot,
-            flow_rows=sector_tide_flow_rows,
-            previous_context=previous_niuone_context,
-            dragon_tiger_snapshot=dragon_tiger_snapshot,
-            news_snapshot=news_snapshot,
-            as_of_date=niuone_as_of_date,
-            previous_trading_day=niuone_previous_trading_day,
-            sample_at=str(market_snapshot.get("captured_at") or ""),
-        )
-        niuone_context["industry_money_flow"] = sector_tide_flow_rows
-        niuone_context["reference_stock_universe"] = list(reference_stock_universe)
-        niuone_context["reference_stock_universe_label"] = friendly_stock_universe(reference_stock_universe)
-        niuone_context["reference_pool_count"] = len(reference_candidates)
-        niuone_context["reference_prefilter_count"] = len(context_candidates)
-        niuone_context["reference_analysis_count"] = len(context_candidates)
         generated_at = time.strftime("%Y-%m-%d %H:%M:%S")
         output = {
             "generated_at": generated_at,
@@ -2228,13 +2076,15 @@ def main():
             "niuone_context": niuone_context,
         }
         write_niuone_mainline_cache(NIUONE_MAINLINE_CACHE, output)
+        write_niuone_mainline_summary_cache(
+            NIUONE_MAINLINE_SUMMARY_CACHE,
+            output,
+        )
         print(json.dumps(output, ensure_ascii=False, indent=2))
-        news_meta = niuone_context.get("news") or {}
         print(
             "  Independent theme-strength cache updated: "
             f"generated_at={generated_at} themes={niuone_context.get('theme_count')} "
-            f"news_configured={news_meta.get('configured')} "
-            f"news_available={news_meta.get('available')}",
+            "theme_source=eastmoney_concept_and_market_resonance",
             file=sys.stderr,
         )
         return
@@ -2242,6 +2092,12 @@ def main():
     def analyze_candidate(candidate):
         code, name, q = candidate
         tencent_key = tencent_keys[code]
+        if (
+            strict_kline_cache
+            and code not in prepared_by_code
+            and tencent_key not in cached_klines_by_symbol
+        ):
+            return None
         try:
             multi = analyze_all_strategies(
                 code,
@@ -2264,7 +2120,27 @@ def main():
         if multi is None:
             return None
         # Backward compat fields
-        best = multi["strategies"].get(multi["best_strategy"], {})
+        best_strategy = str(multi["best_strategy"] or "")
+        best = multi["strategies"].get(best_strategy, {})
+        niuone_best = best_strategy in NIUONE_STRATEGY_IDS
+        factual_industry = normalize_industry_name(
+            best.get("classification_industry")
+            or industry_by_code.get(code, "")
+        )
+        signal_theme = (
+            normalize_industry_name(
+                best.get("signal_theme") or best.get("industry")
+            )
+            if niuone_best
+            else ""
+        )
+        candidate_industry = (
+            factual_industry
+            if niuone_best
+            else normalize_industry_name(
+                best.get("industry") or factual_industry
+            )
+        )
         return {
             "code": code,
             "name": name,
@@ -2274,8 +2150,51 @@ def main():
             "amount": q.get("amount"),
             "amount_yi": round(q.get("amount", 0) / 1e8, 1) if q.get("amount") else None,
             "turnover": q.get("turnover"),
-            "industry": best.get("industry") or industry_by_code.get(code, ""),
-            "sector": best.get("industry") or industry_by_code.get(code, ""),
+            "industry": candidate_industry,
+            "sector": candidate_industry,
+            "signal_theme": signal_theme,
+            "theme_memberships": list(best.get("theme_memberships") or []),
+            "theme_attributions": list(best.get("theme_attributions") or []),
+            "signal_theme_attribution_score": best.get(
+                "signal_theme_attribution_score"
+            ),
+            "signal_theme_attribution_weight": best.get(
+                "signal_theme_attribution_weight"
+            ),
+            "signal_theme_historical_prior_score": best.get(
+                "signal_theme_historical_prior_score"
+            ),
+            "signal_theme_cohort_alignment_score": best.get(
+                "signal_theme_cohort_alignment_score"
+            ),
+            "signal_theme_peer_resonance_score": best.get(
+                "signal_theme_peer_resonance_score"
+            ),
+            "signal_theme_return_correlation_score": best.get(
+                "signal_theme_return_correlation_score"
+            ),
+            "signal_theme_return_correlation_rank_score": best.get(
+                "signal_theme_return_correlation_rank_score"
+            ),
+            "signal_theme_return_correlation_observation_count": best.get(
+                "signal_theme_return_correlation_observation_count"
+            ),
+            "signal_theme_return_correlation_peer_count": best.get(
+                "signal_theme_return_correlation_peer_count"
+            ),
+            "signal_theme_specificity_score": best.get(
+                "signal_theme_specificity_score"
+            ),
+            "signal_theme_membership_source": best.get(
+                "signal_theme_membership_source"
+            ),
+            "unattributed_theme_weight": best.get(
+                "unattributed_theme_weight"
+            ),
+            "theme_attribution_confident": best.get(
+                "theme_attribution_confident"
+            ),
+            "theme_attribution_gap": best.get("theme_attribution_gap"),
             # backward compat (the practice candidates panel expects these)
             "score": best.get("score", 0),
             "score_total": best.get("score_total", 10),
@@ -2291,7 +2210,7 @@ def main():
             "risk_flags": best.get("risk_flags", []),
             "change_pct": q.get("change_pct"),
             # multi-strategy fields
-            "best_strategy": multi["best_strategy"],
+            "best_strategy": best_strategy,
             "best_score": multi["best_score"],
             "best_decision_score": multi.get("best_decision_score", multi["best_score"]),
             "best_verdict": multi["best_verdict"],
@@ -2310,6 +2229,7 @@ def main():
             "sector_score": best.get("sector_score"),
             "theme_basis": best.get("theme_basis"),
             "mainline_state": best.get("mainline_state"),
+            **niuone_lifecycle_candidate_metadata(best),
             "mainline_raw_state": best.get("mainline_raw_state"),
             "mainline_intraday_state": best.get("mainline_intraday_state"),
             "mainline_score": best.get("mainline_score"),
@@ -2334,22 +2254,20 @@ def main():
             "today_1_5pct_count": best.get("today_1_5pct_count"),
             "today_breadth_pct": best.get("today_breadth_pct"),
             "today_median_change_pct": best.get("today_median_change_pct"),
-            "today_median_rebound_pct": best.get("today_median_rebound_pct"),
-            "today_prior_median_ret5_pct": best.get("today_prior_median_ret5_pct"),
             "today_strength_score": best.get("today_strength_score"),
             "today_leadership_score": best.get("today_leadership_score"),
-            "reversal_candidate": best.get("reversal_candidate"),
-            "reversal_confirmed": best.get("reversal_confirmed"),
-            "reversal_confirmation_count": best.get("reversal_confirmation_count"),
-            "reversal_min_sample_gap_minutes": best.get("reversal_min_sample_gap_minutes"),
-            "reversal_sample_gap_minutes": best.get("reversal_sample_gap_minutes"),
-            "reversal_origin_weak": best.get("reversal_origin_weak"),
-            "reversal_quote_coverage_ok": best.get("reversal_quote_coverage_ok"),
-            "reversal_flow_available": best.get("reversal_flow_available"),
-            "reversal_flow_positive": best.get("reversal_flow_positive"),
-            "reversal_flow_flip": best.get("reversal_flow_flip"),
-            "reversal_flow_improving": best.get("reversal_flow_improving"),
-            "reversal_score": best.get("reversal_score"),
+            "reversal_basis": best.get("reversal_basis"),
+            "daily_v_reversal": best.get("daily_v_reversal"),
+            "daily_v_left_peak_date": best.get("daily_v_left_peak_date"),
+            "daily_v_trough_date": best.get("daily_v_trough_date"),
+            "daily_v_left_days": best.get("daily_v_left_days"),
+            "daily_v_right_days": best.get("daily_v_right_days"),
+            "daily_v_decline_pct": best.get("daily_v_decline_pct"),
+            "daily_v_rebound_pct": best.get("daily_v_rebound_pct"),
+            "daily_v_recovery_ratio": best.get("daily_v_recovery_ratio"),
+            "daily_v_rising_ratio": best.get("daily_v_rising_ratio"),
+            "daily_v_right_trend_confirmed": best.get("daily_v_right_trend_confirmed"),
+            "daily_v_pattern_score": best.get("daily_v_pattern_score"),
             "strong_stock_count": best.get("strong_stock_count"),
             "effective_strong_count": best.get("effective_strong_count"),
             "leader_concentration": best.get("leader_concentration"),
@@ -2458,11 +2376,25 @@ def main():
         }
 
     results = []
+    report_scan_progress(
+        "scoring",
+        stage_label="正在执行本地策略评分",
+        completed=0,
+        total=len(to_analyze),
+        worker_count=scan_workers,
+    )
     with concurrent.futures.ThreadPoolExecutor(max_workers=scan_workers) as pool:
         for completed, item in enumerate(pool.map(analyze_candidate, to_analyze), 1):
             if item is not None:
                 results.append(item)
             if completed % 50 == 0:
+                report_scan_progress(
+                    "scoring",
+                    stage_label="正在执行本地策略评分",
+                    completed=completed,
+                    total=len(to_analyze),
+                    worker_count=scan_workers,
+                )
                 print(f"  ... {completed}/{len(to_analyze)} analyzed", file=sys.stderr)
     flush_fetched_klines()
 
@@ -2475,6 +2407,7 @@ def main():
 
     results.sort(key=sort_key, reverse=True)
     if sector_tide_enabled and sector_tide_context is not None:
+        report_scan_progress("news_precheck", stage_label="正在检查候选股消息面", total=SECTOR_TIDE_NEWS_PRECHECK_LIMIT)
         news_shortlist = [
             item
             for item in results
@@ -2516,51 +2449,6 @@ def main():
             f"configured={news_meta.get('configured')} "
             f"checked={news_meta.get('matched_stock_count', 0)} "
             f"available={news_meta.get('available_stock_count', 0)}",
-            file=sys.stderr,
-        )
-    elif niuone_enabled and niuone_context is not None:
-        news_shortlist = niuone_news_shortlist(niuone_context)
-        news_snapshot = fetch_sector_tide_news_precheck(news_shortlist)
-        niuone_context = build_niuone_context(
-            prepared_items,
-            reference_pool_count=len(reference_candidates),
-            market_snapshot=market_snapshot,
-            flow_rows=sector_tide_flow_rows,
-            previous_context=previous_niuone_context,
-            dragon_tiger_snapshot=dragon_tiger_snapshot,
-            news_snapshot=news_snapshot,
-            as_of_date=niuone_as_of_date,
-            previous_trading_day=niuone_previous_trading_day,
-            sample_at=str(market_snapshot.get("captured_at") or ""),
-        )
-        niuone_context["industry_money_flow"] = sector_tide_flow_rows
-        niuone_context["reference_stock_universe"] = list(reference_stock_universe)
-        niuone_context["reference_stock_universe_label"] = friendly_stock_universe(reference_stock_universe)
-        niuone_context["reference_pool_count"] = len(reference_candidates)
-        niuone_context["reference_prefilter_count"] = len(context_candidates)
-        niuone_context["reference_analysis_count"] = len(context_candidates)
-        strategy_context = niuone_context
-        record_codes = {
-            normalize_stock_code(record.get("code"))
-            for record in news_snapshot.get("records") or []
-            if isinstance(record, dict) and normalize_stock_code(record.get("code"))
-        }
-        source_by_code = {str(candidate[0]): candidate for candidate in to_analyze}
-        refreshed_by_code: dict[str, dict[str, Any]] = {}
-        for code in record_codes:
-            source = source_by_code.get(code)
-            refreshed = analyze_candidate(source) if source else None
-            if refreshed is not None:
-                refreshed_by_code[code] = refreshed
-        if refreshed_by_code:
-            results = [refreshed_by_code.get(str(item.get("code") or ""), item) for item in results]
-            results.sort(key=sort_key, reverse=True)
-        news_meta = niuone_context.get("news") or {}
-        print(
-            "  牛牛消息面预检: "
-            f"configured={news_meta.get('configured')} "
-            f"checked={news_meta.get('matched_stock_count', 0)} "
-            f"available={news_meta.get('available')}",
             file=sys.stderr,
         )
     display_candidates = select_display_candidates(results)
@@ -2625,10 +2513,22 @@ def main():
             "industry_money_flow": sector_tide_flow_rows,
         }
     json_str = json.dumps(output, ensure_ascii=False, indent=2)
+    report_scan_progress("persisting", stage_label="正在保存本轮候选结果")
     print(json_str)
     if niuone_context is not None:
         write_niuone_mainline_cache(NIUONE_MAINLINE_CACHE, output)
-    write_outputs(json_str, generated_at)
+        write_niuone_mainline_summary_cache(
+            NIUONE_MAINLINE_SUMMARY_CACHE,
+            output,
+        )
+    write_outputs(output, generated_at, json_str=json_str)
+    report_scan_progress(
+        "completed",
+        stage_label="选股扫描已完成",
+        completed=len(results),
+        total=len(to_analyze),
+        worker_count=scan_workers,
+    )
 
 
 if __name__ == "__main__":

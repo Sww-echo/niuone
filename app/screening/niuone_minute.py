@@ -13,6 +13,7 @@ import re
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -22,26 +23,26 @@ try:
         DEFAULT_KLINE_COUNT,
         load_kline_series_map,
         merge_live_quote,
+        normalize_kline_rows,
     )
     from app.screening.stock_universe import (
         FULL_SUPPORTED_NON_ST_UNIVERSE,
         friendly_stock_universe,
         stock_in_universe,
     )
-    from app.strategies.scoring.common import compute_ema
     from app.strategies.scoring.niuone import build_niuone_context
 except ImportError:  # pragma: no cover - standalone entrypoints add app/ to sys.path
     from market_data.tencent_kline_cache import (
         DEFAULT_KLINE_COUNT,
         load_kline_series_map,
         merge_live_quote,
+        normalize_kline_rows,
     )
     from screening.stock_universe import (
         FULL_SUPPORTED_NON_ST_UNIVERSE,
         friendly_stock_universe,
         stock_in_universe,
     )
-    from strategies.scoring.common import compute_ema
     from strategies.scoring.niuone import build_niuone_context
 
 try:
@@ -53,6 +54,90 @@ except ImportError:  # pragma: no cover - standalone entrypoints add app/compat 
 MINUTE_REFRESH_MODE = "minute_quotes"
 DEFAULT_MINIMUM_COVERAGE = 0.75
 DEFAULT_MAX_QUOTE_AGE_SECONDS = 120.0
+
+
+@dataclass(frozen=True, slots=True)
+class _EmaState:
+    """Final EMA values for one exact sequence of historical closes."""
+
+    row_count: int
+    ema20: float
+    ema50: float
+
+
+def _next_ema(previous: float, value: float, period: int) -> float:
+    weight = 2 / (period + 1)
+    return value * weight + previous * (1 - weight)
+
+
+def _ema_state_from_rows(rows: Iterable[Mapping[str, Any]]) -> _EmaState | None:
+    """Compute both historical EMA seeds in one pass.
+
+    This work is performed only when a symbol's completed daily history enters
+    the engine cache. Subsequent live quotes advance each seed by one value.
+    """
+
+    ema20: float | None = None
+    ema50: float | None = None
+    row_count = 0
+    for row in rows:
+        close = _finite_float(row.get("close"))
+        if close is None:
+            return None
+        ema20 = close if ema20 is None else _next_ema(ema20, close, 20)
+        ema50 = close if ema50 is None else _next_ema(ema50, close, 50)
+        row_count += 1
+    if ema20 is None or ema50 is None:
+        return None
+    return _EmaState(row_count=row_count, ema20=ema20, ema50=ema50)
+
+
+def _live_ema_seed(
+    historical_rows: list[dict[str, Any]],
+    *,
+    quote_date: str,
+) -> _EmaState | None:
+    """Precompute the exact prefix retained before today's live bar.
+
+    ``merge_live_quote`` bounds the merged series to ``DEFAULT_KLINE_COUNT``.
+    When a full historical window ends on the previous trading day, appending a
+    live bar drops its oldest row. If today's row is already cached, that row is
+    replaced instead. Seeding from these exact prefixes keeps the incremental
+    result bit-for-bit equivalent to recomputing the merged bounded series.
+    """
+
+    if not historical_rows:
+        return None
+    if str(historical_rows[-1].get("date") or "")[:10] == quote_date:
+        prefix = historical_rows[:-1]
+    else:
+        prefix = historical_rows[-max(1, DEFAULT_KLINE_COUNT - 1):]
+    return _ema_state_from_rows(prefix)
+
+
+def _ema_values_for_live_rows(
+    rows: list[dict[str, Any]],
+    *,
+    quote_date: str,
+    seed: _EmaState | None,
+) -> tuple[float, float] | None:
+    """Advance cached EMA seeds once, with an exact full-series fallback."""
+
+    if (
+        seed is not None
+        and len(rows) == seed.row_count + 1
+        and str(rows[-1].get("date") or "")[:10] == quote_date
+    ):
+        close = _finite_float(rows[-1].get("close"))
+        if close is not None:
+            return (
+                _next_ema(seed.ema20, close, 20),
+                _next_ema(seed.ema50, close, 50),
+            )
+    fallback = _ema_state_from_rows(rows)
+    if fallback is None:
+        return None
+    return fallback.ema20, fallback.ema50
 
 
 def _finite_float(value: Any) -> float | None:
@@ -107,6 +192,44 @@ def load_stock_industry_map(path: Path) -> dict[str, str]:
     return result
 
 
+def _classification_record(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        industry = re.sub(r"\s+", "", str(value.get("industry") or "")).strip()
+        raw_themes = value.get("concepts") or value.get("themes") or ()
+    else:
+        industry = re.sub(r"\s+", "", str(value or "")).strip()
+        raw_themes = ()
+    if isinstance(raw_themes, str):
+        raw_themes = raw_themes.split(",")
+    themes = list(dict.fromkeys(
+        label
+        for item in raw_themes
+        if (label := re.sub(r"\s+", "", str(item or "")).strip())
+    ))
+    if not themes and industry:
+        themes = [industry]
+    return {"industry": industry, "themes": themes}
+
+
+def load_stock_board_map(path: Path) -> dict[str, dict[str, Any]]:
+    """Read the private Eastmoney classification snapshot without network I/O."""
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return {}
+    if not isinstance(payload, Mapping):
+        return {}
+    raw_stocks = payload.get("stocks")
+    source = raw_stocks if isinstance(raw_stocks, Mapping) else payload
+    result: dict[str, dict[str, Any]] = {}
+    for raw_code, raw_value in source.items():
+        match = re.search(r"\d{6}", str(raw_code or ""))
+        record = _classification_record(raw_value)
+        if match and (record["industry"] or record["themes"]):
+            result[match.group(0)] = record
+    return result
+
+
 class NiuOneMinuteEngine:
     """Cache slow local inputs and rebuild themes from each fresh quote batch."""
 
@@ -116,7 +239,7 @@ class NiuOneMinuteEngine:
         kline_cache_path: Path,
         industry_cache_path: Path,
         kline_loader: Callable[..., dict[str, list[dict[str, Any]]]] = load_kline_series_map,
-        industry_loader: Callable[[Path], dict[str, str]] = load_stock_industry_map,
+        industry_loader: Callable[[Path], Mapping[str, Any]] = load_stock_board_map,
         trading_day_status_loader: Callable[..., Mapping[str, Any]] = default_trading_day_status,
         minimum_coverage: float = DEFAULT_MINIMUM_COVERAGE,
         max_quote_age_seconds: float = DEFAULT_MAX_QUOTE_AGE_SECONDS,
@@ -131,8 +254,9 @@ class NiuOneMinuteEngine:
         self._lock = threading.Lock()
         self._history_date = ""
         self._histories: dict[str, list[dict[str, Any]]] = {}
+        self._live_ema_seeds: dict[str, _EmaState | None] = {}
         self._industry_signature = (0, 0)
-        self._industries: dict[str, str] = {}
+        self._industries: dict[str, dict[str, Any]] = {}
 
     def _eligible_quotes(
         self,
@@ -169,12 +293,17 @@ class NiuOneMinuteEngine:
         *,
         quote_date: str,
         accepted_last_dates: set[str],
-    ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, str]]:
+    ) -> tuple[
+        dict[str, list[dict[str, Any]]],
+        dict[str, dict[str, Any]],
+        dict[str, _EmaState | None],
+    ]:
         unique_symbols = list(dict.fromkeys(symbols))
         with self._lock:
             if self._history_date != quote_date:
                 self._history_date = quote_date
                 self._histories = {}
+                self._live_ema_seeds = {}
             missing = [symbol for symbol in unique_symbols if symbol not in self._histories]
             if missing:
                 loaded = self.kline_loader(
@@ -185,16 +314,32 @@ class NiuOneMinuteEngine:
                     count=DEFAULT_KLINE_COUNT,
                 )
                 for symbol, rows in (loaded or {}).items():
-                    self._histories[str(symbol)] = list(rows or [])
+                    normalized = normalize_kline_rows(
+                        rows or [],
+                        limit=DEFAULT_KLINE_COUNT,
+                    )
+                    resolved_symbol = str(symbol)
+                    self._histories[resolved_symbol] = normalized
+                    self._live_ema_seeds[resolved_symbol] = _live_ema_seed(
+                        normalized,
+                        quote_date=quote_date,
+                    )
 
             signature = _industry_cache_signature(self.industry_cache_path)
             if not self._industries or signature != self._industry_signature:
-                self._industries = self.industry_loader(self.industry_cache_path)
+                self._industries = {
+                    str(code): _classification_record(value)
+                    for code, value in self.industry_loader(self.industry_cache_path).items()
+                }
                 self._industry_signature = signature
 
             return (
                 {symbol: self._histories.get(symbol, []) for symbol in unique_symbols},
                 dict(self._industries),
+                {
+                    symbol: self._live_ema_seeds.get(symbol)
+                    for symbol in unique_symbols
+                },
             )
 
     def build_scan(
@@ -244,7 +389,7 @@ class NiuOneMinuteEngine:
             )
             if value
         }
-        histories, industries = self._load_slow_inputs(
+        histories, industries, live_ema_seeds = self._load_slow_inputs(
             quotes,
             quote_date=quote_date,
             accepted_last_dates=accepted_dates,
@@ -255,19 +400,21 @@ class NiuOneMinuteEngine:
             rows = merge_live_quote(histories.get(symbol, []), quote)
             if len(rows) < 30:
                 continue
-            closes = [_finite_float(row.get("close")) for row in rows]
-            if any(value is None for value in closes):
+            ema_values = _ema_values_for_live_rows(
+                rows,
+                quote_date=quote_date,
+                seed=live_ema_seeds.get(symbol),
+            )
+            if ema_values is None:
                 continue
-            close_values = [float(value) for value in closes if value is not None]
-            ema20 = compute_ema(close_values, 20)
-            ema50 = compute_ema(close_values, 50)
-            rows[-1]["ema20"] = ema20[-1] if ema20 else None
-            rows[-1]["ema50"] = ema50[-1] if ema50 else None
+            rows[-1]["ema20"], rows[-1]["ema50"] = ema_values
             code = str(quote.get("code") or "")
+            classification = industries.get(code) or {}
             prepared_items.append({
                 "code": code,
                 "name": str(quote.get("name") or ""),
-                "industry": str(industries.get(code) or ""),
+                "industry": str(classification.get("industry") or ""),
+                "themes": list(classification.get("themes") or ()),
                 "quote": quote,
                 "rows": rows,
             })
@@ -296,6 +443,7 @@ class NiuOneMinuteEngine:
             previous_trading_day=previous_trading_day,
             sample_at=quote_generated_at,
             reuse_previous_external_context=True,
+            theme_basis="eastmoney_concept",
         )
         if float(context.get("data_coverage") or 0.0) < self.minimum_coverage:
             raise ValueError("minute theme coverage is below the safe publish threshold")
@@ -324,5 +472,6 @@ __all__ = [
     "DEFAULT_MINIMUM_COVERAGE",
     "MINUTE_REFRESH_MODE",
     "NiuOneMinuteEngine",
+    "load_stock_board_map",
     "load_stock_industry_map",
 ]

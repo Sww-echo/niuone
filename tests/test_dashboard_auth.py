@@ -221,6 +221,7 @@ class DashboardAuthTests(unittest.TestCase):
         self.original_admin_password = dashboard.ADMIN_PASSWORD
         self.original_public_data_dir = dashboard.PUBLIC_DATA_DIR
         self.original_public_snapshot_publisher = dashboard.PUBLIC_SNAPSHOT_PUBLISHER
+        self.original_market_data_readiness = dashboard.market_data_readiness
         self.saved_env = {
             name: os.environ.get(name)
             for name in (
@@ -255,6 +256,16 @@ class DashboardAuthTests(unittest.TestCase):
         dashboard.MONEY_FLOW_SNAPSHOT_FILE = self.tmp_path / 'cron' / 'output' / 'industry_main_money_flow_cache.json'
         dashboard.PUBLIC_DATA_DIR = self.tmp_path / 'public-data'
         dashboard.PUBLIC_SNAPSHOT_PUBLISHER = None
+        # Workflow tests exercise behavior after the deployment gate; dedicated
+        # readiness tests below replace this stub with blocked states.
+        dashboard.market_data_readiness = lambda _now=None: {
+            'ready': True,
+            'data_ready': True,
+            'requires_full_kline_cache': True,
+            'blockers': [],
+            'warnings': [],
+            'kline': {'ready': True, 'status': 'completed'},
+        }
         dashboard.API_RESPONSE_CACHE.clear()
         dashboard.API_CACHE_KEY_LOCKS.clear()
         dashboard.API_CACHE_KEY_GENERATIONS.clear()
@@ -275,6 +286,7 @@ class DashboardAuthTests(unittest.TestCase):
         dashboard.ADMIN_PASSWORD = self.original_admin_password
         dashboard.PUBLIC_DATA_DIR = self.original_public_data_dir
         dashboard.PUBLIC_SNAPSHOT_PUBLISHER = self.original_public_snapshot_publisher
+        dashboard.market_data_readiness = self.original_market_data_readiness
         for name, value in self.saved_env.items():
             if value is None:
                 os.environ.pop(name, None)
@@ -1004,6 +1016,7 @@ console.log(JSON.stringify({
         })
 
         self.assertEqual(payload['items'], [])
+        self.assertEqual(payload['observed_items'], [display_candidate])
 
     def test_b1_payload_legacy_cache_without_trade_items_uses_display_candidates(self):
         display_candidate = {'code': '600001', 'actionable': True}
@@ -1014,6 +1027,7 @@ console.log(JSON.stringify({
         })
 
         self.assertEqual(payload['items'], [display_candidate])
+        self.assertEqual(payload['observed_items'], [display_candidate])
 
     def test_no_candidate_b1_still_refreshes_and_logs_market_context(self):
         calls = {'summary_trigger': '', 'entries': []}
@@ -1078,7 +1092,55 @@ console.log(JSON.stringify({
         self.assertFalse(mark_done)
         self.assertEqual(entry['market_decision_context']['tone'], 'balanced')
         self.assertEqual(entry['decision']['market_guidance']['source_title'], '此刻盘面总结与评价')
+        self.assertIn('候选池0只，其中0只进入买卖决策', entry['decision']['summary'])
         self.assertIn('继续检查已有持仓的原策略退出规则', entry['decision']['summary'])
+
+    def test_decision_start_log_distinguishes_display_and_trade_candidate_counts(self):
+        calls = {'entries': []}
+
+        class TraderStub:
+            def now_ts(self):
+                return '2026-08-03 09:46:35'
+
+            def record_decision_log_entry(self, entry, mark_b1_done=False):
+                calls['entries'].append((entry, mark_b1_done))
+
+            def run_decision_after_b1(self, payload):
+                calls['decision_payload'] = payload
+                return {'decision': {'summary': '决策完成'}, 'executed': []}
+
+        display_items = [
+            {'code': f'60000{index}', 'best_strategy': 'niu_reversal_probe'}
+            for index in range(10)
+        ]
+        original_get_trader = dashboard.get_trader_module
+        try:
+            dashboard.get_trader_module = lambda: TraderStub()
+            result = dashboard.run_practice_decision_logged(
+                {
+                    'generated_at': '2026-08-03 09:46:30',
+                    'items': display_items,
+                    'trade_items': display_items[:2],
+                },
+                record_start=True,
+                refresh_market_summary=False,
+            )
+        finally:
+            dashboard.get_trader_module = original_get_trader
+
+        self.assertEqual(result['decision']['summary'], '决策完成')
+        self.assertEqual(len(calls['decision_payload']['items']), 2)
+        self.assertEqual(len(calls['decision_payload']['observed_items']), 10)
+        entry, mark_done = calls['entries'][0]
+        self.assertFalse(mark_done)
+        self.assertEqual(
+            entry['decision']['summary'],
+            '选股完成：候选池10只，其中2只进入买卖决策，开始生成买卖决策。',
+        )
+        self.assertEqual(
+            entry['trade_reason'],
+            '选股后买卖决策开始：候选池10只，决策池2只',
+        )
 
     def test_scheduled_b1_refreshes_unified_summary_before_scan_and_reuses_it_for_decision(self):
         calls = []
@@ -1124,7 +1186,11 @@ console.log(JSON.stringify({
                     refresh_market_summary,
                     payload['market_summary']['generated_at'],
                 ))
-                return {'executed': []}
+                return {
+                    'decision': {'actions': []},
+                    'executed': [],
+                    'durable_evidence_persisted': True,
+                }
 
             dashboard.run_practice_decision_logged = fake_decision
 
@@ -1138,6 +1204,154 @@ console.log(JSON.stringify({
         self.assertIn(('mainline', '2026-07-10 10:00'), calls)
         self.assertIn(('decision', True, False, '2026-07-10 10:00:01'), calls)
         self.assertEqual(calls[-1][0:2], ('mark', 'ok'))
+
+    def test_scheduled_b1_records_model_failure_as_terminal_error(self):
+        calls = []
+        originals = {
+            'b1_cache_generated_for_slot': dashboard.b1_cache_generated_for_slot,
+            '_b1_schedule_slot_lag_seconds': dashboard._b1_schedule_slot_lag_seconds,
+            '_mark_b1_schedule_slot': dashboard._mark_b1_schedule_slot,
+            'refresh_practice_market_summary_for_decision': dashboard.refresh_practice_market_summary_for_decision,
+            'trigger_b1_scan': dashboard.trigger_b1_scan,
+            'run_practice_decision_logged': dashboard.run_practice_decision_logged,
+            'start_independent_niuone_mainline_scan': dashboard.start_independent_niuone_mainline_scan,
+        }
+        try:
+            dashboard.b1_cache_generated_for_slot = lambda _slot: False
+            dashboard._b1_schedule_slot_lag_seconds = lambda _slot: 0
+            dashboard._mark_b1_schedule_slot = lambda slot, status, **fields: calls.append(
+                ('mark', status, fields)
+            )
+            dashboard.refresh_practice_market_summary_for_decision = lambda _trigger: {}
+            dashboard.trigger_b1_scan = lambda **_kwargs: {
+                'items': [],
+                'count': 0,
+                'generated_at': '2026-07-10 10:00:05',
+                'error': '',
+            }
+            dashboard.start_independent_niuone_mainline_scan = lambda _slot='': True
+            dashboard.run_practice_decision_logged = lambda *_args, **_kwargs: {
+                'decision': {'error': 'TimeoutError: model timeout'},
+                'executed': [],
+            }
+
+            dashboard.run_scheduled_b1_scan('2026-07-10 10:00')
+        finally:
+            for name, value in originals.items():
+                setattr(dashboard, name, value)
+
+        self.assertEqual(calls[-1][0:2], ('mark', 'error'))
+        self.assertEqual(calls[-1][2]['reason'], 'practice_decision_failed')
+        self.assertIn('model timeout', calls[-1][2]['error'])
+
+    def test_scheduled_b1_records_decision_persistence_failure_as_error(self):
+        calls = []
+        originals = {
+            'b1_cache_generated_for_slot': dashboard.b1_cache_generated_for_slot,
+            '_b1_schedule_slot_lag_seconds': dashboard._b1_schedule_slot_lag_seconds,
+            '_mark_b1_schedule_slot': dashboard._mark_b1_schedule_slot,
+            'refresh_practice_market_summary_for_decision': dashboard.refresh_practice_market_summary_for_decision,
+            'trigger_b1_scan': dashboard.trigger_b1_scan,
+            'run_practice_decision_logged': dashboard.run_practice_decision_logged,
+            'start_independent_niuone_mainline_scan': dashboard.start_independent_niuone_mainline_scan,
+        }
+        try:
+            dashboard.b1_cache_generated_for_slot = lambda _slot: False
+            dashboard._b1_schedule_slot_lag_seconds = lambda _slot: 0
+            dashboard._mark_b1_schedule_slot = lambda slot, status, **fields: calls.append(
+                ('mark', status, fields)
+            )
+            dashboard.refresh_practice_market_summary_for_decision = lambda _trigger: {}
+            dashboard.trigger_b1_scan = lambda **_kwargs: {
+                'items': [],
+                'count': 0,
+                'generated_at': '2026-07-10 10:00:05',
+                'error': '',
+            }
+            dashboard.start_independent_niuone_mainline_scan = lambda _slot='': True
+            dashboard.run_practice_decision_logged = lambda *_args, **_kwargs: {
+                'decision': {'actions': []},
+                'executed': [],
+                'durable_evidence_persisted': False,
+            }
+
+            dashboard.run_scheduled_b1_scan('2026-07-10 10:00')
+        finally:
+            for name, value in originals.items():
+                setattr(dashboard, name, value)
+
+        self.assertEqual(calls[-1][0:2], ('mark', 'error'))
+        self.assertEqual(
+            calls[-1][2]['error'],
+            'practice_decision_evidence_not_persisted',
+        )
+
+    def test_scheduled_b1_does_not_treat_unproven_cached_cycle_as_ok(self):
+        calls = []
+        originals = {
+            'b1_cache_generated_for_slot': dashboard.b1_cache_generated_for_slot,
+            '_b1_schedule_slot_lag_seconds': dashboard._b1_schedule_slot_lag_seconds,
+            '_mark_b1_schedule_slot': dashboard._mark_b1_schedule_slot,
+            'refresh_practice_market_summary_for_decision': dashboard.refresh_practice_market_summary_for_decision,
+            'start_independent_niuone_mainline_scan': dashboard.start_independent_niuone_mainline_scan,
+        }
+        try:
+            dashboard.b1_cache_generated_for_slot = lambda _slot: True
+            dashboard._b1_schedule_slot_lag_seconds = lambda _slot: 0
+            dashboard._mark_b1_schedule_slot = lambda slot, status, **fields: calls.append(
+                ('mark', status, fields)
+            )
+            dashboard.refresh_practice_market_summary_for_decision = lambda _trigger: {}
+            dashboard.start_independent_niuone_mainline_scan = lambda _slot='': True
+
+            dashboard.run_scheduled_b1_scan('2026-07-10 10:00')
+        finally:
+            for name, value in originals.items():
+                setattr(dashboard, name, value)
+
+        self.assertEqual(calls[-1][0:2], ('mark', 'skipped'))
+        self.assertEqual(
+            calls[-1][2]['reason'],
+            'cache_already_generated_for_slot',
+        )
+
+    def test_b1_schedule_retains_daily_terminal_history(self):
+        original_state_file = dashboard.B1_SCHEDULE_STATE_FILE
+        original_run_keys = set(dashboard.B1_SCHEDULE_RUN_KEYS)
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix="niuone-b1-history-"
+            ) as directory:
+                dashboard.B1_SCHEDULE_STATE_FILE = (
+                    Path(directory) / "b1_schedule_state.json"
+                )
+                dashboard.B1_SCHEDULE_RUN_KEYS.clear()
+                dashboard._mark_b1_schedule_slot(
+                    "2026-08-03 09:25",
+                    "running",
+                    run_kind="scheduled",
+                )
+                dashboard._mark_b1_schedule_slot(
+                    "2026-08-03 09:25",
+                    "ok",
+                    run_kind="scheduled",
+                    count=0,
+                )
+                state = json.loads(
+                    dashboard.B1_SCHEDULE_STATE_FILE.read_text(
+                        encoding="utf-8"
+                    )
+                )
+        finally:
+            dashboard.B1_SCHEDULE_STATE_FILE = original_state_file
+            dashboard.B1_SCHEDULE_RUN_KEYS.clear()
+            dashboard.B1_SCHEDULE_RUN_KEYS.update(original_run_keys)
+
+        slot = state["day_history"]["2026-08-03"]["slots"]["09:25"]
+        self.assertEqual(slot["status"], "ok")
+        self.assertEqual(slot["run_kind"], "scheduled")
+        self.assertEqual(slot["scheduled_at"], "2026-08-03 09:25")
+        self.assertIn("finished_at", slot)
 
     def test_independent_mainline_scan_uses_research_only_mode(self):
         calls = []
@@ -1221,6 +1435,327 @@ console.log(JSON.stringify({
         finally:
             for name, value in originals.items():
                 setattr(dashboard, name, value)
+
+    def test_cold_deployment_bootstrap_is_due_outside_regular_window(self):
+        originals = {
+            'KLINE_PREWARM_ENABLED': dashboard.KLINE_PREWARM_ENABLED,
+            'KLINE_BOOTSTRAP_ENABLED': dashboard.KLINE_BOOTSTRAP_ENABLED,
+            'KLINE_PREWARM_LAST_ATTEMPT_TS': dashboard.KLINE_PREWARM_LAST_ATTEMPT_TS,
+            'KLINE_PREWARM_ATTEMPTS_BY_DATE': dashboard.KLINE_PREWARM_ATTEMPTS_BY_DATE,
+            'KLINE_PREWARM_LOCK': dashboard.KLINE_PREWARM_LOCK,
+            'market_data_readiness': dashboard.market_data_readiness,
+        }
+        try:
+            dashboard.KLINE_PREWARM_ENABLED = True
+            dashboard.KLINE_BOOTSTRAP_ENABLED = True
+            dashboard.KLINE_PREWARM_LAST_ATTEMPT_TS = 0
+            dashboard.KLINE_PREWARM_ATTEMPTS_BY_DATE = {}
+            dashboard.KLINE_PREWARM_LOCK = threading.Lock()
+            dashboard.market_data_readiness = lambda _now=None: {'data_ready': False}
+
+            self.assertTrue(
+                dashboard.kline_bootstrap_due(datetime(2026, 7, 29, 16, 30))
+            )
+            dashboard.KLINE_PREWARM_ATTEMPTS_BY_DATE['2026-07-29'] = (
+                dashboard.KLINE_BOOTSTRAP_MAX_ATTEMPTS
+            )
+            self.assertFalse(
+                dashboard.kline_bootstrap_due(datetime(2026, 7, 29, 16, 30))
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(dashboard, name, value)
+
+    def test_scan_gate_starts_initialization_without_running_scanner(self):
+        calls = []
+        originals = {
+            'practice_scan_requires_full_kline_cache': dashboard.practice_scan_requires_full_kline_cache,
+            'market_data_readiness': dashboard.market_data_readiness,
+            'start_kline_prewarm': dashboard.start_kline_prewarm,
+            '_trigger_b1_scan_unlocked': dashboard._trigger_b1_scan_unlocked,
+        }
+        try:
+            dashboard.practice_scan_requires_full_kline_cache = lambda: True
+            dashboard.market_data_readiness = lambda: {
+                'ready': False,
+                'data_ready': False,
+                'requires_full_kline_cache': True,
+                'blockers': ['kline_cache_missing'],
+            }
+            dashboard.start_kline_prewarm = lambda *args, **kwargs: (
+                calls.append(('prewarm', args, kwargs)) or True
+            )
+            dashboard._trigger_b1_scan_unlocked = lambda *_args, **_kwargs: (
+                calls.append(('scan',)) or {}
+            )
+
+            result = dashboard.trigger_b1_scan(force=True)
+        finally:
+            for name, value in originals.items():
+                setattr(dashboard, name, value)
+
+        self.assertEqual(result['error_code'], 'kline_cache_missing')
+        self.assertTrue(result['initializing'])
+        self.assertEqual([call[0] for call in calls], ['prewarm'])
+
+    def test_scan_gate_blocks_unwritable_runtime_without_starting_prewarm(self):
+        calls = []
+        originals = {
+            'market_data_readiness': dashboard.market_data_readiness,
+            'start_kline_prewarm': dashboard.start_kline_prewarm,
+            '_trigger_b1_scan_unlocked': dashboard._trigger_b1_scan_unlocked,
+        }
+        try:
+            dashboard.market_data_readiness = lambda: {
+                'ready': False,
+                'data_ready': True,
+                'requires_full_kline_cache': True,
+                'blockers': ['runtime_storage_not_writable'],
+            }
+            dashboard.start_kline_prewarm = lambda *args, **kwargs: calls.append('prewarm')
+            dashboard._trigger_b1_scan_unlocked = lambda *_args, **_kwargs: calls.append('scan')
+
+            result = dashboard.trigger_b1_scan(force=True)
+        finally:
+            for name, value in originals.items():
+                setattr(dashboard, name, value)
+
+        self.assertEqual(result['error_code'], 'runtime_storage_not_writable')
+        self.assertEqual(result['stage'], 'deployment_check')
+        self.assertEqual(calls, [])
+
+    def test_ready_trading_scan_forces_strict_local_kline_cache(self):
+        calls = []
+        originals = {
+            'market_data_readiness': dashboard.market_data_readiness,
+            '_trigger_b1_scan_unlocked': dashboard._trigger_b1_scan_unlocked,
+            'B1_FULL_SCAN_LOCK': dashboard.B1_FULL_SCAN_LOCK,
+        }
+        try:
+            dashboard.market_data_readiness = lambda: {
+                'ready': True,
+                'data_ready': True,
+                'requires_full_kline_cache': True,
+                'blockers': [],
+            }
+            dashboard._trigger_b1_scan_unlocked = lambda *_args, **kwargs: (
+                calls.append(kwargs) or {'count': 0}
+            )
+            dashboard.B1_FULL_SCAN_LOCK = threading.Lock()
+
+            result = dashboard.trigger_b1_scan(force=True)
+        finally:
+            for name, value in originals.items():
+                setattr(dashboard, name, value)
+
+        self.assertEqual(result['count'], 0)
+        self.assertTrue(calls[0]['require_ready_cache'])
+
+    def test_manual_cycle_waits_for_initialization_then_scans(self):
+        readiness = iter([
+            {
+                'ready': False,
+                'data_ready': False,
+                'requires_full_kline_cache': True,
+                'kline': {'status': 'missing'},
+            },
+            {
+                'ready': True,
+                'data_ready': True,
+                'requires_full_kline_cache': True,
+                'kline': {
+                    'status': 'completed',
+                    'completed_count': 5000,
+                    'requested_count': 5000,
+                    'fresh_count': 5000,
+                    'failure_count': 0,
+                },
+            },
+        ])
+        calls = []
+        originals = {
+            'practice_scan_requires_full_kline_cache': dashboard.practice_scan_requires_full_kline_cache,
+            'market_data_readiness': dashboard.market_data_readiness,
+            'start_kline_prewarm': dashboard.start_kline_prewarm,
+            'time_sleep': dashboard.time.sleep,
+            'PRACTICE_MANUAL_CYCLE_STATE': dashboard.PRACTICE_MANUAL_CYCLE_STATE,
+        }
+        try:
+            dashboard.practice_scan_requires_full_kline_cache = lambda: True
+            dashboard.market_data_readiness = lambda: next(readiness)
+            dashboard.start_kline_prewarm = lambda *args, **kwargs: (
+                calls.append((args, kwargs)) or True
+            )
+            dashboard.time.sleep = lambda _seconds: None
+            dashboard.PRACTICE_MANUAL_CYCLE_STATE = {
+                'running': True,
+                'stage': 'starting',
+                'job_id': 'manual-test',
+            }
+
+            dashboard._wait_for_manual_cycle_market_data()
+            status = dashboard.practice_manual_cycle_status()
+        finally:
+            dashboard.practice_scan_requires_full_kline_cache = originals[
+                'practice_scan_requires_full_kline_cache'
+            ]
+            dashboard.market_data_readiness = originals['market_data_readiness']
+            dashboard.start_kline_prewarm = originals['start_kline_prewarm']
+            dashboard.time.sleep = originals['time_sleep']
+            dashboard.PRACTICE_MANUAL_CYCLE_STATE = originals[
+                'PRACTICE_MANUAL_CYCLE_STATE'
+            ]
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(status['completed'], 5000)
+        self.assertEqual(status['progress_pct'], 100.0)
+
+    def test_manual_cycle_running_state_recovers_as_interrupted(self):
+        original_state = dashboard.PRACTICE_MANUAL_CYCLE_STATE
+        try:
+            dashboard.PRACTICE_MANUAL_CYCLE_STATE = {'running': False, 'stage': 'idle'}
+            dashboard.write_json_cache(
+                dashboard.practice_manual_cycle_state_file(),
+                {
+                    'job_id': 'manual-before-restart',
+                    'running': True,
+                    'stage': 'trading',
+                    'stage_label': '正在执行买卖策略',
+                },
+            )
+
+            restored = dashboard.restore_practice_manual_cycle_state()
+        finally:
+            dashboard.PRACTICE_MANUAL_CYCLE_STATE = original_state
+
+        self.assertFalse(restored['running'])
+        self.assertEqual(restored['stage'], 'interrupted')
+        self.assertEqual(restored['error_code'], 'service_restarted')
+        self.assertIn('不会自动重放', restored['error'])
+
+    def test_manual_cycle_status_refreshes_from_shared_persistent_state(self):
+        original_state = dashboard.PRACTICE_MANUAL_CYCLE_STATE
+        try:
+            dashboard.PRACTICE_MANUAL_CYCLE_STATE = {
+                'running': False,
+                'stage': 'idle',
+                'updated_at': '',
+            }
+            dashboard.write_json_cache(
+                dashboard.practice_manual_cycle_state_file(),
+                {
+                    'job_id': 'manual-other-instance',
+                    'running': True,
+                    'stage': 'scoring',
+                    'stage_label': '正在执行本地策略评分',
+                    'updated_at': '2026-08-03 10:00:00',
+                },
+            )
+
+            status = dashboard.practice_manual_cycle_status()
+        finally:
+            dashboard.PRACTICE_MANUAL_CYCLE_STATE = original_state
+
+        self.assertEqual(status['job_id'], 'manual-other-instance')
+        self.assertTrue(status['running'])
+        self.assertEqual(status['stage'], 'scoring')
+
+    def test_manual_cycle_cross_process_lease_blocks_duplicate(self):
+        original_lock = dashboard.PRACTICE_MANUAL_CYCLE_LOCK
+        original_state = dashboard.PRACTICE_MANUAL_CYCLE_STATE
+        test_lock = threading.Lock()
+        lease = dashboard.FileLease(
+            dashboard.CRON_STATE_DIR / 'practice_manual_cycle.lock',
+            stale_after_seconds=60,
+        )
+        try:
+            dashboard.PRACTICE_MANUAL_CYCLE_LOCK = test_lock
+            dashboard.PRACTICE_MANUAL_CYCLE_STATE = {
+                'running': False,
+                'stage': 'idle',
+                'updated_at': '',
+            }
+            self.assertTrue(lease.acquire())
+
+            result = dashboard.start_practice_manual_cycle()
+        finally:
+            lease.release()
+            dashboard.PRACTICE_MANUAL_CYCLE_LOCK = original_lock
+            dashboard.PRACTICE_MANUAL_CYCLE_STATE = original_state
+
+        self.assertFalse(result['accepted'])
+        self.assertTrue(result['busy'])
+        self.assertEqual(
+            result['error_code'],
+            'manual_cycle_in_progress_other_process',
+        )
+        self.assertFalse(test_lock.locked())
+
+    def test_scan_timeout_reports_last_published_stage(self):
+        original_run = subprocess.run
+        original_progress_file = os.environ.get('DASHBOARD_B1_PROGRESS_FILE')
+        progress_path = self.tmp_path / 'scan-progress.json'
+
+        def timeout_runner(_args, **kwargs):
+            dashboard.write_json_cache(
+                Path(kwargs['env']['DASHBOARD_B1_PROGRESS_FILE']),
+                {
+                    'job_id': kwargs['env']['DASHBOARD_B1_JOB_ID'],
+                    'stage': 'quotes',
+                    'stage_label': '正在获取全市场实时行情',
+                    'completed': 7,
+                    'total': 35,
+                },
+            )
+            raise subprocess.TimeoutExpired(
+                cmd='scanner',
+                timeout=dashboard.B1_SCAN_TIMEOUT_SECONDS,
+                stderr='Step 2: Fetching real-time batch quotes...',
+            )
+
+        try:
+            os.environ['DASHBOARD_B1_PROGRESS_FILE'] = str(progress_path)
+            subprocess.run = timeout_runner
+            result = dashboard._trigger_b1_scan_unlocked(job_id='manual-timeout')
+        finally:
+            subprocess.run = original_run
+            if original_progress_file is None:
+                os.environ.pop('DASHBOARD_B1_PROGRESS_FILE', None)
+            else:
+                os.environ['DASHBOARD_B1_PROGRESS_FILE'] = original_progress_file
+
+        self.assertEqual(result['stage'], 'quotes')
+        self.assertEqual(result['error_code'], 'quote_source_timeout')
+        self.assertIn('正在获取全市场实时行情超时', result['error'])
+
+    def test_scan_process_failure_reports_last_published_stage(self):
+        original_run = subprocess.run
+
+        def failed_runner(_args, **kwargs):
+            dashboard.write_json_cache(
+                Path(kwargs['env']['DASHBOARD_B1_PROGRESS_FILE']),
+                {
+                    'job_id': kwargs['env']['DASHBOARD_B1_JOB_ID'],
+                    'stage': 'kline_prepare',
+                    'stage_label': '正在准备全市场日K与题材上下文',
+                },
+            )
+            return subprocess.CompletedProcess(
+                args=[],
+                returncode=1,
+                stdout='',
+                stderr='RuntimeError: upstream unavailable',
+            )
+
+        try:
+            subprocess.run = failed_runner
+            result = dashboard._trigger_b1_scan_unlocked(job_id='manual-failure')
+        finally:
+            subprocess.run = original_run
+
+        self.assertEqual(result['stage'], 'kline_prepare')
+        self.assertEqual(result['error_code'], 'kline_prepare_failed')
+        self.assertIn('upstream unavailable', result['error'])
 
     def test_manual_practice_cycle_stays_locked_until_trade_decision_finishes(self):
         scan_started = threading.Event()
@@ -1394,12 +1929,20 @@ console.log(JSON.stringify({
             dashboard._trigger_b1_scan_unlocked = fake_scan
             dashboard.B1_FULL_SCAN_LOCK = threading.Lock()
             worker = threading.Thread(
-                target=lambda: results.append(dashboard.trigger_b1_scan(force=True, decision_mode='none')),
+                target=lambda: results.append(dashboard.trigger_b1_scan(
+                    force=True,
+                    decision_mode='none',
+                    require_ready=False,
+                )),
             )
             worker.start()
             self.assertTrue(scan_started.wait(1))
 
-            duplicate = dashboard.trigger_b1_scan(force=True, decision_mode='none')
+            duplicate = dashboard.trigger_b1_scan(
+                force=True,
+                decision_mode='none',
+                require_ready=False,
+            )
             self.assertTrue(duplicate['busy'])
             self.assertTrue(duplicate['running'])
             self.assertIn('已有选股扫描正在运行', duplicate['error'])
@@ -1419,6 +1962,7 @@ console.log(JSON.stringify({
         original_b1_cache_file = dashboard.B1_CACHE_FILE
         original_subprocess_run = subprocess.run
         dashboard.B1_CACHE_FILE = self.tmp_path / 'b1_screen_latest.json'
+        child_environments = []
         display_candidate = {'code': '600001', 'actionable': False}
         scanner_payload = {
             'items': [display_candidate],
@@ -1428,12 +1972,16 @@ console.log(JSON.stringify({
             'total_analyzed': 1,
         }
         try:
-            subprocess.run = lambda *_args, **_kwargs: subprocess.CompletedProcess(
-                args=[],
-                returncode=0,
-                stdout=json.dumps(scanner_payload),
-                stderr='',
-            )
+            def successful_runner(*_args, **kwargs):
+                child_environments.append(kwargs['env'])
+                return subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout=json.dumps(scanner_payload),
+                    stderr='',
+                )
+
+            subprocess.run = successful_runner
 
             result = dashboard._trigger_b1_scan_unlocked(
                 force=True,
@@ -1446,6 +1994,15 @@ console.log(JSON.stringify({
             self.assertEqual(result['trade_count'], 0)
             self.assertEqual(cached['trade_items'], [])
             self.assertEqual(cached['trade_count'], 0)
+            self.assertEqual(result['schedule_run_kind'], 'manual')
+            self.assertEqual(
+                child_environments[0]['DASHBOARD_B1_REQUIRE_READY_CACHE'],
+                '1',
+            )
+            self.assertRegex(
+                result['schedule_triggered_at'],
+                r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$',
+            )
         finally:
             subprocess.run = original_subprocess_run
             dashboard.B1_CACHE_FILE = original_b1_cache_file
@@ -1453,8 +2010,10 @@ console.log(JSON.stringify({
     def test_recent_manual_candidates_respect_reuse_window(self):
         original_seconds = dashboard.PRACTICE_MANUAL_SCAN_REUSE_SECONDS
         original_loader = dashboard.load_practice_candidates_cache
+        original_context_loader = dashboard._load_practice_candidate_decision_context
         try:
             dashboard.PRACTICE_MANUAL_SCAN_REUSE_SECONDS = 600
+            dashboard._load_practice_candidate_decision_context = lambda _generated_at: {}
             generated_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             dashboard.load_practice_candidates_cache = lambda: {
                 'items': [{'code': '000001'}],
@@ -1476,6 +2035,46 @@ console.log(JSON.stringify({
         finally:
             dashboard.PRACTICE_MANUAL_SCAN_REUSE_SECONDS = original_seconds
             dashboard.load_practice_candidates_cache = original_loader
+            dashboard._load_practice_candidate_decision_context = original_context_loader
+
+    def test_recent_manual_candidates_restore_full_trading_context_on_demand(self):
+        original_seconds = dashboard.PRACTICE_MANUAL_SCAN_REUSE_SECONDS
+        original_multi = dashboard.MULTI_STRATEGY_CACHE_FILE
+        original_b1 = dashboard.B1_CACHE_FILE
+        dashboard.PRACTICE_MANUAL_SCAN_REUSE_SECONDS = 600
+        dashboard.MULTI_STRATEGY_CACHE_FILE = self.tmp_path / 'multi_strategy_latest.json'
+        dashboard.B1_CACHE_FILE = self.tmp_path / 'b1_screen_latest.json'
+        generated_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        try:
+            dashboard.write_json_cache(
+                dashboard.B1_CACHE_FILE,
+                {
+                    'generated_at': generated_at,
+                    'items': [{'code': '600001'}],
+                    'trade_items': [{'code': '600001'}],
+                    'niuone_context': {
+                        'market': {'state': 'balanced'},
+                        'stocks': {'600001': {'theme_rank': 1}},
+                    },
+                },
+            )
+
+            recent = dashboard.recent_practice_candidates_for_manual_cycle()
+
+            self.assertEqual(
+                recent['niuone_context']['stocks']['600001']['theme_rank'],
+                1,
+            )
+            compact = json.loads(
+                (self.tmp_path / 'practice_candidates_latest.json').read_text(
+                    encoding='utf-8'
+                )
+            )
+            self.assertNotIn('niuone_context', compact)
+        finally:
+            dashboard.PRACTICE_MANUAL_SCAN_REUSE_SECONDS = original_seconds
+            dashboard.MULTI_STRATEGY_CACHE_FILE = original_multi
+            dashboard.B1_CACHE_FILE = original_b1
 
     def test_b1_slot_cache_is_read_as_utf8(self):
         class RecordingCachePath:
@@ -1506,6 +2105,57 @@ console.log(JSON.stringify({
         self.assertEqual(workers['effect'], 'restart')
         self.assertEqual(reuse['default'], '0')
         self.assertEqual(reuse['effect'], 'restart')
+
+    def test_practice_decisions_are_serialized_across_schedule_slots(self):
+        first_started = threading.Event()
+        release_first = threading.Event()
+        second_started = threading.Event()
+        calls = []
+
+        class TraderStub:
+            def run_decision_after_b1(self, payload):
+                calls.append(payload['slot'])
+                if payload['slot'] == 'first':
+                    first_started.set()
+                    self.assert_released(release_first)
+                else:
+                    second_started.set()
+                return {'slot': payload['slot']}
+
+            @staticmethod
+            def assert_released(event):
+                if not event.wait(2):
+                    raise AssertionError('first decision was not released')
+
+        original_get_trader = dashboard.get_trader_module
+        original_lock = dashboard.PRACTICE_DECISION_LOCK
+        try:
+            trader_stub = TraderStub()
+            dashboard.get_trader_module = lambda: trader_stub
+            dashboard.PRACTICE_DECISION_LOCK = threading.Lock()
+            first = threading.Thread(
+                target=dashboard.run_practice_decision,
+                args=({'slot': 'first'},),
+            )
+            second = threading.Thread(
+                target=dashboard.run_practice_decision,
+                args=({'slot': 'second'},),
+            )
+            first.start()
+            self.assertTrue(first_started.wait(1))
+            second.start()
+            self.assertFalse(second_started.wait(0.05))
+            release_first.set()
+            first.join(2)
+            second.join(2)
+        finally:
+            release_first.set()
+            dashboard.get_trader_module = original_get_trader
+            dashboard.PRACTICE_DECISION_LOCK = original_lock
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(calls, ['first', 'second'])
 
     def test_fast_practice_payload_derives_daily_calendar_points_from_intraday_history(self):
         class TraderStub:
@@ -2923,6 +3573,28 @@ console.log(JSON.stringify([
         self.assertIn('allowInfoPopoverClick', ADMIN_FRONTEND)
         self.assertIn('event?.detail === 0', DASHBOARD_FRONTEND)
 
+    def test_practice_position_text_uses_theme_aware_high_contrast_colors(self):
+        stylesheet = (ROOT / 'frontend' / 'dashboard.css').read_text(encoding='utf-8')
+        display_utils = (
+            ROOT / 'web' / 'src' / 'utils' / 'practiceDisplay.js'
+        ).read_text(encoding='utf-8')
+
+        self.assertIn("return 'var(--muted)'", display_utils)
+        self.assertIn(
+            "return number >= 0 ? 'var(--red-text)' : 'var(--green-text)'",
+            display_utils,
+        )
+        self.assertNotIn('style="color:#94a3b8"', PRACTICE_COMPONENTS)
+        self.assertIn('class="position-value secondary"', PRACTICE_COMPONENTS)
+        self.assertIn(
+            'html:not([data-theme="dark"]) .position-reason-text { color:#344054; }',
+            stylesheet,
+        )
+        self.assertIn(
+            'html:not([data-theme="dark"]) .position-value-separator { color:#475467; }',
+            stylesheet,
+        )
+
     def test_compliance_dialog_stays_compact_and_visible_in_dark_mode(self):
         compliance_source = (
             ROOT / 'web' / 'src' / 'components' / 'ComplianceDialog.vue'
@@ -2944,12 +3616,14 @@ console.log(JSON.stringify([
         self.assertNotIn('renderPracticePage', DASHBOARD_FRONTEND)
         self.assertNotIn('loadPracticePage', DASHBOARD_FRONTEND)
         self.assertIn("main_board: '主板'", PRACTICE_CANDIDATE_UTILS)
-        for label in ('牛牛战法 · 领航', '牛牛战法 · 回踩', '牛牛战法 · 启动', '牛牛战法 · 反转试仓'):
+        for label in ('牛牛战法 · 领涨', '牛牛战法 · 转强', '牛牛战法 · 启动', '牛牛战法 · 试仓'):
+            self.assertIn(label, PRACTICE_CANDIDATE_UTILS)
+        for label in ('主线酝酿', '主线主升', '主线高潮', '主线分歧', '主线退幕'):
             self.assertIn(label, PRACTICE_CANDIDATE_UTILS)
         self.assertIn('item.industry || item.sector || item.board_label || item.board', PRACTICE_CANDIDATE_UTILS)
         self.assertIn('{{ industryLabel }}', PRACTICE_CANDIDATE_COMPONENTS)
         self.assertNotIn('所属板块', PRACTICE_CANDIDATE_COMPONENTS)
-        for label in ('主线与龙头', '风控与执行', '未通过条件', '评分依据', '仓位规则', '退出规则'):
+        for label in ('主线与龙头', '生命周期', '风控与执行', '未通过条件', '评分依据', '仓位规则', '退出规则'):
             self.assertIn(label, PRACTICE_CANDIDATE_COMPONENTS)
         self.assertIn("hardBlockers.value.length ? '未达标' : '等确认'", PRACTICE_CANDIDATE_COMPONENTS)
         self.assertNotIn("hardBlockers.value.length ? '硬过滤'", PRACTICE_CANDIDATE_COMPONENTS)
@@ -3097,19 +3771,34 @@ console.log(JSON.stringify([
         self.assertIn('<NiuOneMainlinePanel />', dashboard_page)
         self.assertNotIn('NIUONE THEME STRENGTH', mainline_page)
         self.assertNotIn('.mainline-hero::before', mainline_page)
+        self.assertNotIn('lifecycleStages', mainline_page)
+        self.assertNotIn('lifecycle-flow', mainline_page)
+        self.assertNotIn('牛牛战法主线生命周期', mainline_page)
         self.assertIn("rotation: '轮动'", mainline_page)
         self.assertIn("recovery: '修复'", mainline_page)
         self.assertIn('多只强势股跨日延续', mainline_page)
-        self.assertIn('今日强势待确认', mainline_page)
-        self.assertIn("label: '结构前5'", mainline_page)
-        self.assertIn("label: '今日前5'", mainline_page)
-        self.assertIn("label: '反转试仓'", mainline_page)
+        self.assertNotIn('今日强势待确认', mainline_page)
+        self.assertNotIn('mainline.today_observation_reason', mainline_page)
+        self.assertNotIn('mainline.observation_reason', mainline_page)
+        self.assertIn("title: '今日排名'", mainline_page)
+        self.assertIn("title: '结构排名'", mainline_page)
+        self.assertLess(mainline_page.index("key: 'today'"), mainline_page.index("key: 'structure'"))
+        self.assertNotIn('const activeFilter', mainline_page)
+        self.assertNotIn("日内修复观察", mainline_page)
+        self.assertNotIn("日内V形修复观察", mainline_page)
         self.assertIn("import { authenticateAdmin } from '../utils/adminSession.js'", mainline_page)
         self.assertIn('@click="refreshData"', mainline_page)
         self.assertIn('await authenticateAdmin(adminAuth.credential)', mainline_page)
         self.assertIn('id="mainlineRefreshAdminTitle">刷新题材强度数据</h2>', mainline_page)
         self.assertNotIn('题材研究视图', mainline_page)
         self.assertNotIn('mainline.reason', mainline_page)
+        self.assertNotIn('mainline-summary-card primary', mainline_page)
+        self.assertNotIn('mainline-summary-card intraday', mainline_page)
+        self.assertNotIn("hardStopMarket || defensiveMarket ? 'risk' : 'positive'", mainline_page)
+        self.assertNotIn('.mainline-summary-card.primary', mainline_page)
+        self.assertNotIn('.mainline-summary-card.intraday', mainline_page)
+        self.assertNotIn('.mainline-summary-card.positive', mainline_page)
+        self.assertNotIn('.mainline-summary-card.risk', mainline_page)
         self.assertIn('aria-label="查看未覆盖原因"', mainline_page)
         self.assertIn('@click="toggleCoveragePopover"', mainline_page)
         self.assertIn(':aria-expanded="coveragePopoverOpen"', mainline_page)
@@ -3122,33 +3811,46 @@ console.log(JSON.stringify([
         self.assertNotIn('.coverage-info:focus-within', mainline_page)
         self.assertIn('class="dashboard-info-trigger"', mainline_page)
         self.assertNotIn('class="coverage-breakdown"', mainline_page)
-        self.assertIn('class="theme-table" role="table"', mainline_page)
-        self.assertEqual(mainline_page.count('class="theme-column-help" role="columnheader"'), 4)
-        self.assertIn('<span role="columnheader">题材</span>', mainline_page)
-        self.assertIn("activeFilter === 'reversal' ? '同步转强' : activeFilter === 'today' ? '上涨家数' : '结构强股'", mainline_page)
-        self.assertIn("['today', 'reversal'].includes(activeFilter) ? '日内领涨' : '结构龙头'", mainline_page)
-        self.assertIn(':aria-expanded="expandedTheme === theme.industry"', mainline_page)
-        self.assertIn("['today', 'reversal'].includes(activeFilter) ? '今日领涨列表' : '结构代表股'", mainline_page)
-        self.assertIn('.theme-stock-list { position:relative;', mainline_page)
+        self.assertIn('class="theme-rankings"', mainline_page)
+        self.assertIn('class="theme-ranking-panel"', mainline_page)
+        self.assertIn('<ol v-else class="theme-ranking-list">', mainline_page)
+        self.assertIn("ranking.key === 'today' ? '等效上涨' : '归因强股'", mainline_page)
+        self.assertIn("ranking.key === 'today' ? '今日领涨股' : '结构代表股'", mainline_page)
+        self.assertIn(':aria-expanded="expandedTheme === expandedThemeKey(theme, ranking.key)"', mainline_page)
+        self.assertIn("target.closest('.theme-stock-list')", mainline_page)
+        self.assertIn("document.addEventListener('pointerdown', handleThemeStocksPointerDown)", mainline_page)
+        self.assertIn("document.removeEventListener('pointerdown', handleThemeStocksPointerDown)", mainline_page)
+        self.assertIn('.theme-rankings { display:grid; grid-template-columns:repeat(2,minmax(0,1fr));', mainline_page)
+        self.assertIn('.theme-stock-list { position:relative; grid-area:stocks;', mainline_page)
         self.assertIn('.theme-stock-details { position:absolute;', mainline_page)
-        self.assertIn('.theme-stock-details { position:absolute; z-index:10; top:calc(100% + 5px); left:0; width:min(100%,380px);', mainline_page)
+        self.assertIn('.theme-stock-details { position:absolute; z-index:10; top:calc(100% + 3px); right:0; left:auto; width:min(520px,calc(100cqw - 24px));', mainline_page)
+        self.assertIn('class="theme-stock-detail-head-code">代码</span>', mainline_page)
+        self.assertIn('class="theme-stock-detail-head-attribution">归因</span>', mainline_page)
+        self.assertIn('class="theme-stock-detail-code"', mainline_page)
+        self.assertIn('class="theme-stock-detail-attribution"', mainline_page)
         self.assertNotIn('width:clamp(240px,24vw,310px)', mainline_page)
         self.assertNotIn('.theme-row.expanded { align-items:start; }', mainline_page)
-        self.assertIn('grid-template-columns:minmax(200px,260px) 74px 68px 82px 88px minmax(300px,380px) minmax(150px,1fr)', mainline_page)
-        self.assertIn('.theme-leader-button { display:grid; width:min(100%,380px);', mainline_page)
-        self.assertIn('--mainline-row-border:#cfd8e3', mainline_page)
-        self.assertIn('--mainline-row-border:#3a4657', mainline_page)
-        self.assertIn('.theme-table { display:grid; gap:8px;', mainline_page)
-        self.assertIn('.theme-row { min-height:72px; padding:11px 12px; border:1px solid var(--mainline-row-border); border-radius:10px;', mainline_page)
-        self.assertIn('.theme-stock-detail-row { padding:7px 8px; border:1px solid var(--mainline-row-border); border-radius:7px;', mainline_page)
-        self.assertIn('.theme-data-cell { display:block; min-width:0; margin-top:9px; padding:8px; border:1px solid var(--mainline-row-border);', mainline_page)
+        self.assertIn('grid-template-areas:"identity score stocks" "metrics metrics context"', mainline_page)
+        self.assertIn('.theme-leader-button { display:grid; width:100%;', mainline_page)
+        self.assertNotIn('--mainline-row-', mainline_page)
+        self.assertNotIn('.theme-ranking-panel.today', mainline_page)
+        self.assertIn('--mainline-line:#bcc5d1', mainline_page)
+        self.assertIn('--mainline-line:#46566c', mainline_page)
+        self.assertIn('.theme-ranking-panel { min-width:0; height:100%; overflow:visible; border:1px solid var(--mainline-line);', mainline_page)
+        self.assertIn(':global(html[data-theme="dark"] .theme-ranking-panel)', mainline_page)
+        self.assertIn('.theme-ranking-list { margin:0; padding:0; list-style:none;', mainline_page)
+        self.assertIn('.theme-row { display:grid; height:80px; box-sizing:border-box; grid-template-columns:minmax(118px,1.15fr) 96px minmax(150px,1fr);', mainline_page)
+        self.assertIn('.theme-row:last-child { border-bottom:0;', mainline_page)
+        self.assertIn('.theme-metrics { display:grid; grid-area:metrics; grid-template-columns:repeat(3,minmax(0,1fr));', mainline_page)
+        self.assertIn('.theme-stock-detail-row { padding:10px; border-radius:7px; background:var(--panel2);', mainline_page)
+        self.assertNotIn('theme-data-cell', mainline_page)
         self.assertIn('@media (max-width:1450px)', mainline_page)
         self.assertNotIn('@media (max-width:1050px)', mainline_page)
-        self.assertIn('@media (max-width:1000px) and (min-width:841px)', mainline_page)
+        self.assertNotIn('@media (max-width:1000px) and (min-width:841px)', mainline_page)
         self.assertIn('@media (max-width:840px)', mainline_page)
-        self.assertNotIn('@media (max-width:720px)', mainline_page)
-        self.assertIn('data-tooltip="结构广度是等效强势股占比；今日和反转广度是实时上涨家数', mainline_page)
-        self.assertIn('.theme-column-help:hover::after,.theme-column-help:focus::after', mainline_page)
+        self.assertIn('@media (max-width:560px)', mainline_page)
+        self.assertIn('.theme-rankings { grid-template-columns:minmax(0,1fr); gap:10px;', mainline_page)
+        self.assertNotIn('theme-column-help', mainline_page)
         self.assertIn('numeric(theme.effective_breadth_pct)', mainline_page)
         self.assertNotIn('data-label="有效强度"', mainline_page)
         self.assertNotIn('class="theme-card"', mainline_page)
@@ -3158,6 +3860,57 @@ console.log(JSON.stringify([
         self.assertIn('subscribePublicProjection(handleProjection)', PRACTICE_CANDIDATE_DATA)
         self.assertIn("fetchJson('/api/v2/public/latest'", PUBLIC_PROJECTION_DATA)
         self.assertNotIn('/static/dashboard.js', dashboard_page)
+
+    def test_mainline_rankings_render_all_themes_in_compact_rows(self):
+        mainline_page = (
+            ROOT / 'web' / 'src' / 'components' / 'NiuOneMainlinePanel.vue'
+        ).read_text(encoding='utf-8')
+
+        self.assertNotIn('RANKING_PREVIEW_COUNT', mainline_page)
+        self.assertNotIn('expandedRankings', mainline_page)
+        self.assertIn('v-for="(theme, index) in ranking.rows"', mainline_page)
+        self.assertNotIn('class="theme-ranking-footer"', mainline_page)
+        self.assertIn('grid-template-areas:"identity score stocks" "metrics metrics context"', mainline_page)
+        self.assertIn('padding:8px 12px', mainline_page)
+        self.assertIn('grid-template-areas:"identity score" "metrics metrics" "stocks context"', mainline_page)
+        self.assertIn('.theme-metrics > span { display:flex;', mainline_page)
+        self.assertIn('@container (min-width:630px)', mainline_page)
+        self.assertIn('grid-template-areas:"identity score metrics stocks" "identity score metrics context"', mainline_page)
+        self.assertIn('.theme-score { display:flex; grid-area:score;', mainline_page)
+        self.assertIn('.theme-metrics > span + span { padding-left:0; border-left:0; }', mainline_page)
+        self.assertNotIn('.theme-score { padding-left:14px; border-left:', mainline_page)
+        self.assertIn('<small>{{ scoreDetail(theme, ranking.key) }}</small>', mainline_page)
+        self.assertIn('.theme-context { display:flex; overflow:hidden;', mainline_page)
+        self.assertIn('.theme-leader-identity small { display:none;', mainline_page)
+        self.assertIn('class="theme-state-line"', mainline_page)
+        self.assertIn('class="theme-related-line"', mainline_page)
+        self.assertIn('class="theme-related-label"', mainline_page)
+        self.assertIn('class="theme-related"', mainline_page)
+        self.assertIn('class="theme-related placeholder"', mainline_page)
+        self.assertIn('class="theme-row-placeholder"', mainline_page)
+        self.assertIn('height:80px; box-sizing:border-box', mainline_page)
+        self.assertIn('.theme-rankings { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); align-items:stretch;', mainline_page)
+        self.assertIn('.theme-row:last-child { border-bottom:0; border-radius:0 0 11px 11px;', mainline_page)
+        self.assertIn('class="theme-context-detail"', mainline_page)
+        self.assertIn('.theme-context.today .theme-context-detail { display:none; }', mainline_page)
+
+    def test_mainline_overview_and_rankings_share_one_shell(self):
+        mainline_page = (
+            ROOT / 'web' / 'src' / 'components' / 'NiuOneMainlinePanel.vue'
+        ).read_text(encoding='utf-8')
+
+        shell_index = mainline_page.index('<section class="mainline-hero">')
+        overview_index = mainline_page.index('<div class="mainline-overview">')
+        ranking_index = mainline_page.index('<section class="mainline-section">')
+        shell_end_index = mainline_page.index('\n    </section>\n  </div>', ranking_index)
+        self.assertLess(shell_index, overview_index)
+        self.assertLess(overview_index, ranking_index)
+        self.assertLess(ranking_index, shell_end_index)
+        self.assertIn('.mainline-section { min-width:0; margin-top:18px; }', mainline_page)
+        self.assertNotIn('.mainline-section { min-width:0; margin-top:18px; padding-top:', mainline_page)
+        self.assertNotIn('<h3>题材强度榜</h3>', mainline_page)
+        self.assertNotIn('结构榜用于跨日主线确认', mainline_page)
+        self.assertNotIn('</section>\n\n    <template v-if="payload.available">', mainline_page)
 
     def test_index_snapshot_merge_handles_business_errors_and_stale_full_responses(self):
         functions = (
@@ -3732,6 +4485,63 @@ process.stdout.write(JSON.stringify({{
             dashboard.MULTI_STRATEGY_CACHE_FILE = original_multi_strategy_cache_file
             dashboard.B1_CACHE_FILE = original_b1_cache_file
 
+    def test_practice_candidates_cache_uses_small_snapshot_without_parsing_full_scan(self):
+        original_multi_strategy_cache_file = dashboard.MULTI_STRATEGY_CACHE_FILE
+        original_b1_cache_file = dashboard.B1_CACHE_FILE
+        dashboard.MULTI_STRATEGY_CACHE_FILE = self.tmp_path / 'multi_strategy_latest.json'
+        dashboard.B1_CACHE_FILE = self.tmp_path / 'b1_screen_latest.json'
+        try:
+            dashboard.MULTI_STRATEGY_CACHE_FILE.write_text('{bad', encoding='utf-8')
+            compact_path = self.tmp_path / 'practice_candidates_latest.json'
+            dashboard.write_practice_candidates_cache(
+                compact_path,
+                {
+                    'generated_at': '2026-08-04 10:15:00',
+                    'items': [{'code': '600001', 'best_score': 8.8}],
+                    'trade_items': [],
+                },
+                source_path=dashboard.MULTI_STRATEGY_CACHE_FILE,
+            )
+
+            payload = dashboard.load_practice_candidates_cache()
+
+            self.assertEqual(payload['items'][0]['code'], '600001')
+            self.assertEqual(payload['generated_at'], '2026-08-04 10:15:00')
+            self.assertNotIn('error', payload)
+        finally:
+            dashboard.MULTI_STRATEGY_CACHE_FILE = original_multi_strategy_cache_file
+            dashboard.B1_CACHE_FILE = original_b1_cache_file
+
+    def test_practice_candidates_cache_rebuilds_small_snapshot_after_full_scan_changes(self):
+        original_multi_strategy_cache_file = dashboard.MULTI_STRATEGY_CACHE_FILE
+        original_b1_cache_file = dashboard.B1_CACHE_FILE
+        dashboard.MULTI_STRATEGY_CACHE_FILE = self.tmp_path / 'multi_strategy_latest.json'
+        dashboard.B1_CACHE_FILE = self.tmp_path / 'b1_screen_latest.json'
+        try:
+            dashboard.write_json_cache(
+                dashboard.MULTI_STRATEGY_CACHE_FILE,
+                {'generated_at': 'old', 'items': [{'code': 'old'}]},
+            )
+            first = dashboard.load_practice_candidates_cache()
+            self.assertEqual(first['items'][0]['code'], 'old')
+
+            dashboard.write_json_cache(
+                dashboard.MULTI_STRATEGY_CACHE_FILE,
+                {'generated_at': 'new', 'items': [{'code': 'new'}]},
+            )
+            refreshed = dashboard.load_practice_candidates_cache()
+
+            self.assertEqual(refreshed['items'][0]['code'], 'new')
+            compact = json.loads(
+                (self.tmp_path / 'practice_candidates_latest.json').read_text(
+                    encoding='utf-8'
+                )
+            )
+            self.assertEqual(compact['generated_at'], 'new')
+        finally:
+            dashboard.MULTI_STRATEGY_CACHE_FILE = original_multi_strategy_cache_file
+            dashboard.B1_CACHE_FILE = original_b1_cache_file
+
     def test_practice_candidates_cache_hides_candidates_from_inactive_strategy(self):
         original_multi_strategy_cache_file = dashboard.MULTI_STRATEGY_CACHE_FILE
         original_b1_cache_file = dashboard.B1_CACHE_FILE
@@ -3791,6 +4601,183 @@ process.stdout.write(JSON.stringify({{
                 os.environ.pop(dashboard.ACTIVE_STRATEGY_ENV, None)
             else:
                 os.environ[dashboard.ACTIVE_STRATEGY_ENV] = saved_active
+
+    def test_niuone_mainline_view_uses_small_summary_snapshot(self):
+        original_minute = dashboard.NIUONE_MAINLINE_MINUTE_CACHE_FILE
+        original_full = dashboard.NIUONE_MAINLINE_CACHE_FILE
+        original_summary = dashboard.NIUONE_MAINLINE_SUMMARY_CACHE_FILE
+        original_multi = dashboard.MULTI_STRATEGY_CACHE_FILE
+        original_b1 = dashboard.B1_CACHE_FILE
+        dashboard.NIUONE_MAINLINE_MINUTE_CACHE_FILE = self.tmp_path / 'niuone_mainline_minute_latest.json'
+        dashboard.NIUONE_MAINLINE_CACHE_FILE = self.tmp_path / 'niuone_mainline_latest.json'
+        dashboard.NIUONE_MAINLINE_SUMMARY_CACHE_FILE = self.tmp_path / 'niuone_mainline_summary_latest.json'
+        dashboard.MULTI_STRATEGY_CACHE_FILE = self.tmp_path / 'multi_strategy_latest.json'
+        dashboard.B1_CACHE_FILE = self.tmp_path / 'b1_screen_latest.json'
+        try:
+            dashboard.NIUONE_MAINLINE_CACHE_FILE.write_text('{bad', encoding='utf-8')
+            dashboard.write_niuone_mainline_summary_cache(
+                dashboard.NIUONE_MAINLINE_SUMMARY_CACHE_FILE,
+                {
+                    'generated_at': '2026-08-04 10:30:00',
+                    'reference_pool_count': 100,
+                    'reference_analysis_count': 90,
+                    'niuone_context': {
+                        'as_of_date': '2026-08-04',
+                        'mapped_stock_count': 90,
+                        'market': {'state': 'balanced', 'score': 70},
+                        'mainline': {'mode': 'single', 'primary': '半导体'},
+                        'themes': {},
+                    },
+                },
+            )
+
+            view = dashboard.load_niuone_mainline_view()
+
+            self.assertTrue(view['available'])
+            self.assertEqual(view['generated_at'], '2026-08-04 10:30:00')
+            self.assertEqual(view['mainline']['primary'], '半导体')
+        finally:
+            dashboard.NIUONE_MAINLINE_MINUTE_CACHE_FILE = original_minute
+            dashboard.NIUONE_MAINLINE_CACHE_FILE = original_full
+            dashboard.NIUONE_MAINLINE_SUMMARY_CACHE_FILE = original_summary
+            dashboard.MULTI_STRATEGY_CACHE_FILE = original_multi
+            dashboard.B1_CACHE_FILE = original_b1
+
+    def test_minute_theme_refresh_attaches_eastmoney_cross_check_with_failure_degrade(self):
+        original_minute = dashboard.NIUONE_MAINLINE_MINUTE_CACHE_FILE
+        original_full = dashboard.NIUONE_MAINLINE_CACHE_FILE
+        original_summary = dashboard.NIUONE_MAINLINE_SUMMARY_CACHE_FILE
+        original_multi = dashboard.MULTI_STRATEGY_CACHE_FILE
+        original_b1 = dashboard.B1_CACHE_FILE
+        original_loader = dashboard.load_eastmoney_concept_board_signal
+        dashboard.NIUONE_MAINLINE_MINUTE_CACHE_FILE = self.tmp_path / 'niuone_mainline_minute_latest.json'
+        dashboard.NIUONE_MAINLINE_CACHE_FILE = self.tmp_path / 'niuone_mainline_latest.json'
+        dashboard.NIUONE_MAINLINE_SUMMARY_CACHE_FILE = self.tmp_path / 'niuone_mainline_summary_latest.json'
+        dashboard.MULTI_STRATEGY_CACHE_FILE = self.tmp_path / 'multi_strategy_latest.json'
+        dashboard.B1_CACHE_FILE = self.tmp_path / 'b1_screen_latest.json'
+
+        class FakeEngine:
+            @staticmethod
+            def build_scan(snapshot, **_kwargs):
+                generated_at = snapshot['generated_at']
+                return {
+                    'generated_at': generated_at,
+                    'quote_generated_at': generated_at,
+                    'refresh_mode': 'minute_quotes',
+                    'reference_pool_count': 10,
+                    'reference_analysis_count': 10,
+                    'niuone_context': {
+                        'as_of_date': generated_at[:10],
+                        'mapped_stock_count': 10,
+                        'market': {'state': 'balanced', 'score': 70},
+                        'mainline': {'today_primary': '半导体'},
+                        'themes': {
+                            '半导体': {
+                                'industry': '半导体',
+                                'score': 60,
+                                'today_eligible_data': True,
+                                'today_strength_score': 75,
+                                'today_median_change_pct': 2.5,
+                            },
+                        },
+                    },
+                }
+
+        class FakeSignal:
+            @staticmethod
+            def to_dict():
+                return {
+                    'schema_version': 1,
+                    'source': 'eastmoney_concept_board_rank',
+                    'captured_at': '2026-08-04 10:30:00',
+                    'quote_generated_at': '2026-08-04 10:29:58',
+                    'total_count': 503,
+                    'covered_count': 100,
+                    'boards': [{
+                        'code': 'BK1036',
+                        'name': '半导体概念',
+                        'rank': 6,
+                        'change_pct': 3.8,
+                        'up_count': 80,
+                        'down_count': 20,
+                        'flat_count': 0,
+                    }],
+                }
+
+        try:
+            dashboard.load_eastmoney_concept_board_signal = lambda: FakeSignal()
+            updated = dashboard.run_niuone_mainline_minute_refresh(
+                {'generated_at': '2026-08-04 10:30:00'},
+                engine=FakeEngine(),
+            )
+            first_view = dashboard.load_niuone_mainline_view()
+
+            self.assertTrue(updated['updated'])
+            self.assertTrue(first_view['eastmoney_concept_signal']['available'])
+            self.assertEqual(first_view['today_themes'][0]['eastmoney']['rank'], 6)
+
+            def unavailable():
+                raise OSError('temporary upstream failure')
+
+            dashboard.load_eastmoney_concept_board_signal = unavailable
+            dashboard.run_niuone_mainline_minute_refresh(
+                {'generated_at': '2026-08-04 10:31:00'},
+                engine=FakeEngine(),
+            )
+            degraded_view = dashboard.load_niuone_mainline_view()
+
+            self.assertEqual(
+                [theme['industry'] for theme in degraded_view['today_themes']],
+                ['半导体'],
+            )
+            self.assertFalse(
+                degraded_view['eastmoney_concept_signal']['available']
+            )
+            self.assertEqual(
+                degraded_view['eastmoney_concept_signal']['status'],
+                'upstream_unavailable',
+            )
+        finally:
+            dashboard.NIUONE_MAINLINE_MINUTE_CACHE_FILE = original_minute
+            dashboard.NIUONE_MAINLINE_CACHE_FILE = original_full
+            dashboard.NIUONE_MAINLINE_SUMMARY_CACHE_FILE = original_summary
+            dashboard.MULTI_STRATEGY_CACHE_FILE = original_multi
+            dashboard.B1_CACHE_FILE = original_b1
+            dashboard.load_eastmoney_concept_board_signal = original_loader
+
+    def test_niuone_operational_cache_does_not_parse_legacy_when_dedicated_exists(self):
+        original_minute = dashboard.NIUONE_MAINLINE_MINUTE_CACHE_FILE
+        original_full = dashboard.NIUONE_MAINLINE_CACHE_FILE
+        original_multi = dashboard.MULTI_STRATEGY_CACHE_FILE
+        original_b1 = dashboard.B1_CACHE_FILE
+        dashboard.NIUONE_MAINLINE_MINUTE_CACHE_FILE = self.tmp_path / 'niuone_mainline_minute_latest.json'
+        dashboard.NIUONE_MAINLINE_CACHE_FILE = self.tmp_path / 'niuone_mainline_latest.json'
+        dashboard.MULTI_STRATEGY_CACHE_FILE = self.tmp_path / 'multi_strategy_latest.json'
+        dashboard.B1_CACHE_FILE = self.tmp_path / 'b1_screen_latest.json'
+        try:
+            dashboard.write_json_cache(
+                dashboard.NIUONE_MAINLINE_CACHE_FILE,
+                {
+                    'generated_at': '2026-08-04 10:00:00',
+                    'niuone_context': {'mainline': {'primary': '专用缓存'}},
+                },
+            )
+            dashboard.write_json_cache(
+                dashboard.MULTI_STRATEGY_CACHE_FILE,
+                {
+                    'generated_at': '2026-08-04 11:00:00',
+                    'niuone_context': {'mainline': {'primary': '旧完整缓存'}},
+                },
+            )
+
+            payload = dashboard.load_niuone_mainline_cache_payload()
+
+            self.assertEqual(payload['niuone_context']['mainline']['primary'], '专用缓存')
+        finally:
+            dashboard.NIUONE_MAINLINE_MINUTE_CACHE_FILE = original_minute
+            dashboard.NIUONE_MAINLINE_CACHE_FILE = original_full
+            dashboard.MULTI_STRATEGY_CACHE_FILE = original_multi
+            dashboard.B1_CACHE_FILE = original_b1
 
     def test_practice_candidates_api_uses_canonical_cache_for_legacy_alias(self):
         original_loader = dashboard.load_practice_candidates_cache
@@ -4520,6 +5507,27 @@ process.stdout.write(JSON.stringify({{
         self.assertIn("if (retryAction === 'manual-cycle') await runManualCycle()", PRACTICE_COMPONENTS)
         self.assertIn("title: '手动运行选股与交易策略'", PRACTICE_COMPONENTS)
         self.assertIn("submitLabel: '验证并运行'", PRACTICE_COMPONENTS)
+        self.assertIn("/api/system/data-readiness", PRACTICE_DATA)
+        self.assertIn("error?.status === 404", PRACTICE_DATA)
+        self.assertIn("dashboard_restart_required", PRACTICE_DATA)
+        self.assertIn(':data-readiness="state.dataReadiness"', PRACTICE_COMPONENTS)
+        self.assertIn('class="practice-data-readiness"', PRACTICE_COMPONENTS)
+        self.assertIn('初始化完成后运行选股与交易策略', PRACTICE_COMPONENTS)
+        self.assertIn('页面已更新，但后台仍在运行旧版本', PRACTICE_COMPONENTS)
+
+    def test_practice_data_readiness_hides_only_when_fully_ready(self):
+        overview = (
+            ROOT / 'web' / 'src' / 'components' / 'practice' / 'PracticeAccountOverview.vue'
+        ).read_text(encoding='utf-8')
+
+        self.assertIn('const showDataReadiness = computed(() => !(', overview)
+        self.assertIn("props.dataReadiness?.status === 'ready'", overview)
+        self.assertIn('props.dataReadiness?.ready === true', overview)
+        self.assertIn('props.dataReadiness?.data_ready === true', overview)
+        self.assertIn('!props.dataReadiness?.error', overview)
+        self.assertIn('!props.dataReadiness?.blockers?.length', overview)
+        self.assertIn('!props.dataReadiness?.warnings?.length', overview)
+        self.assertIn('v-if="showDataReadiness"', overview)
 
     def test_manual_market_summary_snapshot_force_refreshes_live_channels(self):
         original_runner = dashboard.run_dashboard_helper
@@ -5292,6 +6300,33 @@ process.stdout.write(JSON.stringify({{
 
         self.assertEqual(dashboard.B1_SCAN_TIMEOUT_SECONDS, 480)
         self.assertEqual(item['default'], '480')
+
+    def test_niuone_forward_cohort_start_requires_iso_date(self):
+        item = next(
+            item
+            for item in dashboard.ENV_CONFIG_SCHEMA
+            if item['name'] == dashboard.NIUONE_FORWARD_COHORT_START_ENV
+        )
+
+        self.assertEqual(item['default'], '2026-08-04')
+        self.assertEqual(item['effect'], 'next_run')
+        preflight = next(
+            item
+            for item in dashboard.ENV_CONFIG_SCHEMA
+            if item['name'] == 'DASHBOARD_NIUONE_FORWARD_PREFLIGHT_CRON'
+        )
+        self.assertEqual(preflight['default'], '5 9 * * 1-5')
+        self.assertEqual(preflight['effect'], 'next_run')
+        self.assertEqual(
+            dashboard.normalize_business_updates({preflight['name']: '09:06'})[
+                preflight['name']
+            ],
+            '6 9 * * 1-5',
+        )
+        dashboard.validate_business_updates({item['name']: '2026-11-04'})
+        for invalid in ('', '2026-11-4', '2026-02-29'):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                dashboard.validate_business_updates({item['name']: invalid})
 
     def test_full_market_quote_interval_defaults_to_thirty_seconds(self):
         item = next(
