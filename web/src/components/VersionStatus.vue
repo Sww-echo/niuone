@@ -94,7 +94,7 @@ async function checkForUpdates(manual = false) {
       }
       state.value = 'update'
       title.value = `发现新版本 ${updateVersion}`
-      showAvailableVersion(updateVersion)
+      if (manual) showAvailableVersion(updateVersion)
     } else if (payload.update_available === false) {
       state.value = 'current'
       title.value = `版本检查完成；当前版本 ${currentLabel}`

@@ -1,6 +1,5 @@
 <script setup>
 import { defineAsyncComponent } from 'vue'
-import ComplianceDialog from './ComplianceDialog.vue'
 import CategoryTabs from './CategoryTabs.vue'
 import LastUpdated from './LastUpdated.vue'
 import ThemeToggle from './ThemeToggle.vue'
@@ -23,7 +22,6 @@ const { activeCategory } = useDashboardTabs()
 </script>
 
 <template>
-  <ComplianceDialog />
   <header>
     <div class="header-row">
       <h1 class="dashboard-brand">

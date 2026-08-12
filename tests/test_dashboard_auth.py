@@ -419,7 +419,7 @@ class DashboardAuthTests(unittest.TestCase):
         expected_paths = {
             "/",
             "/practice",
-            ", "/niuone-mainline"",
+            "/watchlist",
             "/niuone-mainline",
             "/indices",
             "/industry-flow",
@@ -3749,25 +3749,17 @@ console.log(JSON.stringify([
             ROOT / 'web' / 'src' / 'components' / 'NiuOneMainlinePanel.vue'
         ).read_text(encoding='utf-8')
 
-<<<<<<< HEAD
         for route in ('/practice', '/watchlist', '/niuone-mainline', '/indices', '/industry-flow', '/dragon-tiger', '/market-monitor', '/x-monitor', '/us-ratings'):
             self.assertIn(f"'{route}'", router_source)
         self.assertIn("const CATEGORY_ORDER = ['practice', 'watchlist', 'niuone_mainline', 'indices', 'market_monitor', 'dragon_tiger', 'x_monitor', 'us_ratings']", tabs_source)
-=======
-        for route in ('/practice', '/niuone-mainline', '/indices', '/industry-flow', '/dragon-tiger', '/market-monitor', '/x-monitor', '/us-ratings'):
-            self.assertIn(f"'{route}'", router_source)
-        self.assertIn("const CATEGORY_ORDER = ['practice', 'niuone_mainline', 'indices', 'market_monitor', 'dragon_tiger', 'x_monitor', 'us_ratings']", tabs_source)
         self.assertIn("niuone_mainline: '题材强度'", tabs_source)
->>>>>>> origin/main
         self.assertIn("industry_flow: '/industry-flow'", tabs_source)
         self.assertIn("const LEGACY_CATEGORY_ALIASES = { b1_screen: 'practice' }", tabs_source)
         self.assertIn("fetch(`/api/iwencai/dragon-tiger${query}`", dragon_source)
         self.assertIn("const SORT_FIELDS = new Set(['name', 'sector', 'change_pct', 'net_amount_yuan'])", dragon_source)
         self.assertIn("record?.seat_category === 'institution'", dragon_source)
         self.assertIn('<PracticePanel />', dashboard_page)
-<<<<<<< HEAD
         self.assertIn('<WatchlistPanel />', dashboard_page)
-=======
         self.assertIn('<NiuOneMainlinePanel />', dashboard_page)
         self.assertNotIn('NIUONE THEME STRENGTH', mainline_page)
         self.assertNotIn('.mainline-hero::before', mainline_page)
@@ -3855,7 +3847,6 @@ console.log(JSON.stringify([
         self.assertNotIn('data-label="有效强度"', mainline_page)
         self.assertNotIn('class="theme-card"', mainline_page)
         self.assertNotIn('theme-score-track', mainline_page)
->>>>>>> origin/main
         self.assertIn('<DragonTigerPanel />', dashboard_page)
         self.assertIn('subscribePublicProjection(handleProjection)', PRACTICE_CANDIDATE_DATA)
         self.assertIn("fetchJson('/api/v2/public/latest'", PUBLIC_PROJECTION_DATA)
