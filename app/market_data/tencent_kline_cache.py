@@ -379,9 +379,12 @@ def quote_trade_date(quote: Mapping[str, Any] | None) -> str:
 def merge_live_quote(
     historical_rows: Iterable[Mapping[str, Any]],
     quote: Mapping[str, Any] | None,
+    *,
+    limit: int = DEFAULT_KLINE_COUNT,
 ) -> list[dict[str, Any]]:
     """Append or replace today's bar without mutating cached completed history."""
-    rows = normalize_kline_rows(historical_rows, limit=DEFAULT_KLINE_COUNT)
+    resolved_limit = max(1, int(limit or DEFAULT_KLINE_COUNT))
+    rows = normalize_kline_rows(historical_rows, limit=resolved_limit)
     trade_date = quote_trade_date(quote)
     price = _finite_float((quote or {}).get("price"))
     if not trade_date or price is None or price <= 0:
@@ -402,7 +405,7 @@ def merge_live_quote(
         rows[-1] = live
     else:
         rows.append(live)
-    return rows[-DEFAULT_KLINE_COUNT:]
+    return rows[-resolved_limit:]
 
 
 def prewarm_completed_for_date(

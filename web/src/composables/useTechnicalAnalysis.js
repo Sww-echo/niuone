@@ -343,6 +343,8 @@ export function useTechnicalAnalysis() {
 
   async function analyze(symbol, period = 'day') {
     analysisController?.abort()
+    minuteController?.abort()
+    minuteAnalysis.value = null
     const controller = new AbortController()
     analysisController = controller
     analysisState.loading = true

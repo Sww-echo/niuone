@@ -21,6 +21,21 @@ const moduleCards = computed(() => TECHNICAL_SCORE_CARDS.map(card => ({
   ...card,
   ...scoreFor(analysis.value?.signal?.moduleScores, card.key),
 })))
+const chartMarkers = computed(() => {
+  const rows = analysis.value?.klines || []
+  const signals = analysis.value?.signal?.chanlun?.signals
+  if (!rows.length || !Array.isArray(signals)) return []
+  const rowDates = new Set(rows.map(row => String(row.date || '').slice(0, 10)))
+  return signals
+    .filter(item => item && rowDates.has(String(item.date || '').slice(0, 10)) && Number.isFinite(Number(item.price)))
+    .slice(-8)
+    .map(item => ({
+      date: String(item.date).slice(0, 10),
+      price: Number(item.price),
+      type: String(item.type || '').toLowerCase().startsWith('buy') ? 'buy' : 'sell',
+      label: String(item.type_name || item.type || '信号'),
+    }))
+})
 const headlineTone = computed(() => actionTone(analysis.value?.signal?.action))
 const quoteChange = computed(() => {
   const quote = analysis.value?.quote
@@ -182,8 +197,8 @@ function toggleScanRow(index) {
         </div>
       </div>
 
-      <form class="technical-toolbar" @submit.prevent="submitAnalysis">
-        <label class="technical-symbol-field">
+      <form class="technical-toolbar" :class="{ 'is-scan-mode': activeMode === 'scan' }" @submit.prevent="submitAnalysis">
+        <label v-if="activeMode === 'analysis'" class="technical-symbol-field">
           <span>股票代码</span>
           <input v-model.trim="symbolInput" type="text" inputmode="numeric" maxlength="8" autocomplete="off" placeholder="例如 600519" aria-describedby="technical-input-help" @input="inputError = ''" />
         </label>
@@ -192,16 +207,18 @@ function toggleScanRow(index) {
           <button type="button" :class="{ active: period === 'day' }" :aria-pressed="period === 'day'" @click="period = 'day'">日线</button>
           <button type="button" :class="{ active: period === 'week' }" :aria-pressed="period === 'week'" @click="period = 'week'">周线</button>
         </fieldset>
-        <button class="technical-primary-btn" type="submit" :disabled="analysisState.loading">
-          <span v-if="analysisState.loading" class="technical-spinner" aria-hidden="true"></span>
-          {{ analysisState.loading ? '分析中…' : '开始分析' }}
-        </button>
-        <button class="technical-scan-btn" type="button" :disabled="scanActive" @click="submitScan">
-          {{ scanActive ? '扫描中…' : '开始扫描' }}
-        </button>
-        <button class="technical-scan-btn" type="button" :disabled="minuteLoading" @click="submitMinute">
-          {{ minuteLoading ? '分时分析中…' : '分时分析' }}
-        </button>
+        <div class="technical-toolbar-actions">
+          <button v-if="activeMode === 'analysis'" class="technical-primary-btn" type="submit" :disabled="analysisState.loading">
+            <span v-if="analysisState.loading" class="technical-spinner" aria-hidden="true"></span>
+            {{ analysisState.loading ? '分析中…' : '开始分析' }}
+          </button>
+          <button v-if="activeMode === 'analysis'" class="technical-scan-btn" type="button" :disabled="minuteLoading" @click="submitMinute">
+            {{ minuteLoading ? '分时分析中…' : '分时分析' }}
+          </button>
+          <button v-if="activeMode === 'scan'" class="technical-primary-btn" type="button" :disabled="scanActive" @click="submitScan">
+            {{ scanActive ? '扫描中…' : '开始扫描' }}
+          </button>
+        </div>
       </form>
       <p id="technical-input-help" class="technical-input-help" :class="{ error: inputError }">
         {{ inputError || '支持沪深京 A 股 6 位代码；全市场扫描仅使用 NiuOne 本地 K 线缓存。' }}
@@ -212,7 +229,7 @@ function toggleScanRow(index) {
       <b>分析未完成</b><span>{{ analysisState.error }}</span>
     </section>
 
-    <template v-if="activeMode === 'analysis'">
+      <template v-if="activeMode === 'analysis'">
       <section v-if="!analysis && !analysisState.loading" class="technical-welcome card">
         <div class="technical-welcome-mark" aria-hidden="true">个</div>
         <div><h3>输入股票代码开始分析</h3><p>生成 K 线、五维评分、关键价位、风险提示与交易计划。</p></div>
@@ -251,18 +268,28 @@ function toggleScanRow(index) {
         </section>
 
         <section class="technical-chart-card card">
-          <div class="technical-card-heading"><div><h3>K 线走势</h3><p>最近 {{ Math.min(80, analysis.klines.length) }} 根 {{ analysis.period === 'week' ? '周' : '日' }} K</p></div><span class="technical-legend"><i class="up"></i>上涨<i class="down"></i>下跌</span></div>
-          <CandlestickChart :rows="analysis.klines" />
+          <div class="technical-card-heading"><div><h3>K 线走势</h3><p>支持按钮或滚轮缩放 {{ analysis.period === 'week' ? '周' : '日' }} K 线</p></div><span class="technical-legend"><i class="up"></i>上涨<i class="down"></i>下跌<i class="buy-marker"></i>买点<i class="sell-marker"></i>卖点</span></div>
+          <CandlestickChart :rows="analysis.klines" :markers="chartMarkers" :levels="analysis.signal.keyLevels" />
         </section>
 
-        <section class="technical-detail-grid-layout">
-          <article v-for="section in detailSections" :key="section.key" class="technical-detail-card card">
-            <div class="technical-card-heading"><div><h3>{{ section.title }}</h3><p>{{ section.subtitle }}</p></div></div>
-            <TechnicalDetail :value="section.value" />
-          </article>
+        <section class="technical-evidence-section">
+          <div class="technical-section-heading">
+            <div><span>ANALYSIS EVIDENCE</span><h3>系统分析依据</h3><p>从六个技术模块拆解当前结论，先看评分，再查看对应证据。</p></div>
+            <em>{{ detailSections.length }} 个模块</em>
+          </div>
+          <div class="technical-detail-grid-layout">
+            <article v-for="section in detailSections" :key="section.key" class="technical-detail-card card">
+              <div class="technical-card-heading"><div><h3>{{ section.title }}</h3><p>{{ section.subtitle }}</p></div></div>
+              <TechnicalDetail :value="section.value" />
+            </article>
+          </div>
         </section>
 
-        <section class="technical-decision-grid">
+        <section class="technical-decisions-section">
+          <div class="technical-section-heading">
+            <div><span>DECISION SUPPORT</span><h3>执行参考</h3><p>把信号、风险、关键价位和交易计划集中在一个决策区。</p></div>
+          </div>
+          <div class="technical-decision-grid">
           <article class="technical-decision-card card signals">
             <div class="technical-card-heading"><div><h3>信号汇总</h3><p>多系统共振与反向信号</p></div></div>
             <div class="technical-signal-columns">
@@ -284,18 +311,24 @@ function toggleScanRow(index) {
             <div class="technical-card-heading"><div><h3>交易计划</h3><p>资金管理与执行参考</p></div></div>
             <TechnicalDetail :value="analysis.signal.tradePlan" empty-text="当前信号未生成交易计划" />
           </article>
+          </div>
         </section>
 
-        <section class="technical-quality card" :class="{ degraded: analysis.dataQuality.degraded }">
+        <section class="technical-utility-section">
+          <div class="technical-section-heading compact">
+            <div><span>DATA HEALTH</span><h3>数据与辅助分析</h3></div>
+          </div>
+          <section class="technical-quality card" :class="{ degraded: analysis.dataQuality.degraded }">
           <div class="technical-card-heading"><div><h3>数据质量</h3><p>行情来源、样本覆盖与降级状态</p></div><span class="technical-quality-badge">{{ analysis.dataQuality.degraded ? '降级数据' : '数据正常' }}</span></div>
           <dl class="technical-quality-grid"><div v-for="item in qualityRows(analysis.dataQuality)" :key="item.key"><dt>{{ item.label }}</dt><dd :class="item.ok === false ? 'negative' : item.ok === true ? 'positive' : ''">{{ item.value }}</dd></div></dl>
           <ul v-if="Array.isArray(analysis.dataQuality.warnings) && analysis.dataQuality.warnings.length" class="technical-warning-list"><li v-for="item in analysis.dataQuality.warnings" :key="String(item)">{{ item }}</li></ul>
         </section>
+          <section v-if="minuteAnalysis" class="technical-quality technical-minute-card card">
+            <div class="technical-card-heading"><div><h3>分时缠论</h3><p>今日五分钟数据结构分析</p></div><span>{{ minuteAnalysis.available === false ? '数据不足' : '已完成' }}</span></div>
+            <TechnicalDetail :value="minuteAnalysis" empty-text="分时数据暂不可用" />
+          </section>
+        </section>
       </template>
-      <section v-if="minuteAnalysis" class="technical-quality card">
-        <div class="technical-card-heading"><div><h3>分时缠论</h3><p>今日五分钟数据结构分析</p></div><span>{{ minuteAnalysis.available === false ? '数据不足' : '已完成' }}</span></div>
-        <TechnicalDetail :value="minuteAnalysis" empty-text="分时数据暂不可用" />
-      </section>
     </template>
 
     <template v-else>

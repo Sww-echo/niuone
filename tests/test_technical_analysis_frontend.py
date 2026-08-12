@@ -9,6 +9,8 @@ ROUTER_PATH = ROOT / "web" / "src" / "router.js"
 TABS_PATH = ROOT / "web" / "src" / "composables" / "useDashboardTabs.js"
 DASHBOARD_PATH = ROOT / "web" / "src" / "components" / "DashboardPage.vue"
 PANEL_PATH = ROOT / "web" / "src" / "components" / "TechnicalAnalysisPanel.vue"
+CHART_PATH = ROOT / "web" / "src" / "components" / "technical-analysis" / "CandlestickChart.vue"
+CSS_PATH = ROOT / "frontend" / "technical-analysis.css"
 COMPOSABLE_PATH = ROOT / "web" / "src" / "composables" / "useTechnicalAnalysis.js"
 
 
@@ -64,6 +66,27 @@ class TechnicalAnalysisFrontendTests(unittest.TestCase):
         for key in ("\u8d8b\u52bf", "\u91cf\u4ef7", "\u5f62\u6001", "\u7a81\u7834", "CAN_SLIM"):
             with self.subTest(key=key):
                 self.assertIn(f"'{key}'", composable)
+
+    def test_chart_declares_signal_marker_contract(self) -> None:
+        panel = PANEL_PATH.read_text(encoding="utf-8")
+        chart = CHART_PATH.read_text(encoding="utf-8")
+        css = CSS_PATH.read_text(encoding="utf-8")
+
+        self.assertIn("const chartMarkers = computed", panel)
+        self.assertIn(":markers=\"chartMarkers\"", panel)
+        self.assertIn(":levels=\"analysis.signal.keyLevels\"", panel)
+        self.assertIn("markers: { type: Array", chart)
+        self.assertIn("levels: { type: Object", chart)
+        self.assertIn("technical-chart-marker", chart)
+        self.assertIn("technical-chart-level", chart)
+        self.assertIn("technical-chart-summary", chart)
+        self.assertIn(".technical-chart-marker.marker-buy", css)
+        self.assertIn(".technical-chart-marker.marker-sell", css)
+
+    def test_new_analysis_clears_previous_minute_result(self) -> None:
+        composable = COMPOSABLE_PATH.read_text(encoding="utf-8")
+        self.assertIn("minuteAnalysis.value = null", composable)
+        self.assertIn("minuteController?.abort()", composable)
 
 
 if __name__ == "__main__":
