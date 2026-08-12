@@ -66,6 +66,7 @@ console.log(JSON.stringify({{fetchCalls, initialMarketCount, counts}}));
                 "counts": {
                     "practice": "",
                     "watchlist": "",
+                    "technical_analysis": "",
                     "niuone_mainline": "",
                     "indices": "",
                     "market_monitor": " · 6",

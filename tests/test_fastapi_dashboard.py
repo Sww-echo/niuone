@@ -83,7 +83,7 @@ class FastApiDashboardTests(unittest.TestCase):
 
     def test_vue_dashboard_and_admin_share_the_fastapi_port(self):
         for path in (
-            "/", "/practice", "/niuone-mainline", "/admin",
+            "/", "/practice", "/technical-analysis", "/niuone-mainline", "/admin",
             "/admin/settings/notifications", "/admin/backtest/niuone",
         ):
             with self.subTest(path=path):

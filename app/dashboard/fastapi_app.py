@@ -31,6 +31,7 @@ from app.dashboard.routers import (
     create_practice_router,
     create_system_router,
     create_watchlist_tracker_router,
+    create_technical_analysis_router,
 )
 
 
@@ -41,6 +42,7 @@ SPA_DASHBOARD_PATHS = (
     "/",
     "/practice",
     "/watchlist",
+    "/technical-analysis",
     "/niuone-mainline",
     "/indices",
     "/industry-flow",
@@ -147,6 +149,9 @@ def create_app(
     web_dist_dir: Path | None = None,
     enable_background_services: bool = True,
     backtest_task_manager: Any | None = None,
+    technical_analyze_service: Callable[..., dict[str, Any]] | None = None,
+    technical_minute_analyze_service: Callable[..., dict[str, Any]] | None = None,
+    technical_scan_manager: Any | None = None,
 ) -> FastAPI:
     """Create the production single-port ASGI application."""
 
@@ -425,6 +430,16 @@ def create_app(
             json_response=_canonical_json_response,
         )
     )
+    technical_router_kwargs: dict[str, Any] = {
+        "enforce_api_limits": enforce_native_api_limits,
+        "json_response": _canonical_json_response,
+        "scan_manager": technical_scan_manager,
+    }
+    if technical_analyze_service is not None:
+        technical_router_kwargs["analyze_service"] = technical_analyze_service
+    if technical_minute_analyze_service is not None:
+        technical_router_kwargs["minute_analyze_service"] = technical_minute_analyze_service
+    app.include_router(create_technical_analysis_router(**technical_router_kwargs))
 
     return app
 

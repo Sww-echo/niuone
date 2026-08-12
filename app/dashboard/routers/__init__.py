@@ -7,6 +7,7 @@ from .messages import create_messages_router
 from .practice import create_practice_router
 from .system import create_system_router
 from .watchlist_tracker import create_watchlist_tracker_router
+from .technical_analysis import create_technical_analysis_router
 
 __all__ = [
     "AdminAccess",
@@ -17,4 +18,5 @@ __all__ = [
     "create_practice_router",
     "create_system_router",
     "create_watchlist_tracker_router",
+    "create_technical_analysis_router",
 ]
