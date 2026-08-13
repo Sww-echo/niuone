@@ -12,6 +12,7 @@ const SCORE_ALIASES = {
   pattern: ['pattern', 'patterns', 'pattern_score', '形态'],
   breakout: ['breakout', 'breakouts', 'breakout_score', '突破'],
   canslim: ['canslim', 'CAN_SLIM', 'can_slim', 'canslim_score', 'can_slim_score'],
+  chanlun: ['chanlun', 'chan_lun', 'chanlun_score', '缠论'],
 }
 
 export const TECHNICAL_SCORE_CARDS = [
@@ -20,6 +21,7 @@ export const TECHNICAL_SCORE_CARDS = [
   { key: 'pattern', label: '形态' },
   { key: 'breakout', label: '突破' },
   { key: 'canslim', label: 'CAN SLIM' },
+  { key: 'chanlun', label: '缠论' },
 ]
 
 function objectValue(value) {
@@ -212,6 +214,71 @@ export function normalizeAnalysisPayload(payload) {
   }
 }
 
+export function normalizeMinutePayload(payload) {
+  const source = unwrapPayload(payload)
+  const rawAnalysis = firstValue(source, ['analysis', 'chanlun'], null)
+  const hasAnalysis = rawAnalysis !== null
+    && typeof rawAnalysis === 'object'
+    && !Array.isArray(rawAnalysis)
+  const analysis = objectValue(rawAnalysis)
+  const marketQuality = objectValue(firstValue(source, ['data_quality', 'dataQuality', 'quality'], {}))
+  const analysisQuality = objectValue(firstValue(analysis, ['data_quality', 'dataQuality', 'quality'], {}))
+  const times = arrayValue(firstValue(source, ['times'], [])).map(value => String(value || ''))
+  const prices = arrayValue(firstValue(source, ['prices'], [])).map(finiteNumber)
+  const averagePrices = arrayValue(firstValue(source, ['avg_prices', 'average_prices'], [])).map(finiteNumber)
+  const volumes = arrayValue(firstValue(source, ['volumes'], [])).map(value => finiteNumber(value) ?? 0)
+  const fractals = arrayValue(firstValue(analysis, ['fractals'], []))
+  const strokes = arrayValue(firstValue(analysis, ['strokes'], []))
+  const zhongshus = arrayValue(firstValue(analysis, ['zhongshus'], []))
+  const signals = arrayValue(firstValue(analysis, ['signals'], []))
+  const derivedBarKeys = ['derived_bars', 'derivedBars', 'proxy_bars', 'proxyBars']
+  const hasDerivedBars = derivedBarKeys.some(key => Object.hasOwn(analysis, key))
+  const derivedBars = arrayValue(firstValue(analysis, derivedBarKeys, []))
+  const counts = objectValue(firstValue(analysis, ['counts'], {}))
+  const availability = firstValue(analysis, ['available'], null)
+  const warnings = [
+    ...normalizeStringList(marketQuality.warnings),
+    ...normalizeStringList(analysisQuality.warnings),
+    ...normalizeStringList(firstValue(analysis, ['ohlc_note', 'ohlcNote'], [])),
+  ].filter((item, index, values) => values.indexOf(item) === index)
+  return {
+    raw: source,
+    symbol: String(firstValue(source, ['symbol', 'code'], '')).trim(),
+    name: String(firstValue(source, ['name'], '')).trim(),
+    preClose: finiteNumber(firstValue(source, ['pre_close', 'preClose', 'previous_close', 'previousClose'])),
+    high: finiteNumber(firstValue(source, ['high'])),
+    low: finiteNumber(firstValue(source, ['low'])),
+    times,
+    prices,
+    averagePrices,
+    volumes,
+    analysis: hasAnalysis ? {
+      ...analysis,
+      available: availability === null ? Object.keys(analysis).length > 0 : availability === true,
+      reason: String(firstValue(analysis, ['reason'], '')).trim(),
+      period: String(firstValue(analysis, ['period'], '5m')),
+      sourceInterval: String(firstValue(analysis, ['source_interval', 'sourceInterval'], firstValue(analysisQuality, ['source_interval', 'sourceInterval'], firstValue(marketQuality, ['source_interval', 'sourceInterval'], '1m')))),
+      outputInterval: String(firstValue(analysis, ['output_interval', 'outputInterval'], firstValue(analysisQuality, ['output_interval', 'outputInterval'], '5m'))),
+      pointCount: finiteNumber(firstValue(analysis, ['point_count', 'pointCount', 'time_count', 'timeCount'], firstValue(analysisQuality, ['valid_point_count', 'validPointCount'], firstValue(marketQuality, ['point_count', 'pointCount'], times.length)))),
+      derivedBarCount: finiteNumber(firstValue(analysis, ['derived_bar_count', 'derivedBarCount', 'kline_count', 'klineCount'], firstValue(analysisQuality, ['derived_bar_count', 'derivedBarCount'], hasDerivedBars ? derivedBars.length : undefined))),
+      fractalCount: finiteNumber(firstValue(analysis, ['fractal_count', 'fractalCount'], firstValue(counts, ['fractals'], fractals.length))),
+      strokeCount: finiteNumber(firstValue(analysis, ['stroke_count', 'strokeCount'], firstValue(counts, ['strokes'], strokes.length))),
+      zhongshuCount: finiteNumber(firstValue(analysis, ['zhongshu_count', 'zhongshuCount'], firstValue(counts, ['zhongshus'], zhongshus.length))),
+      signalCount: finiteNumber(firstValue(analysis, ['signal_count', 'signalCount'], firstValue(counts, ['signals'], signals.length))),
+      summary: String(firstValue(analysis, ['summary'], '')).trim(),
+      currentState: String(firstValue(analysis, ['current_state', 'currentState'], '')).trim(),
+      description: String(firstValue(analysis, ['description'], '')).trim(),
+      ohlcNote: String(firstValue(analysis, ['ohlc_note', 'ohlcNote'], '')).trim(),
+      fractals,
+      strokes,
+      zhongshus,
+      signals,
+      derivedBars,
+      dataQuality: { ...marketQuality, ...analysisQuality, warnings },
+    } : null,
+  }
+}
+
 function normalizeScanResult(row, defaultPeriod) {
   const source = objectValue(row)
   const moduleScores = objectValue(firstValue(source, ['module_scores', 'scores'], {}))
@@ -308,6 +375,7 @@ function requestErrorMessage(error, timeoutLabel) {
   if (message === 'kline_insufficient') return '该股历史 K 线数据不足'
   if (message === 'kline_cache_empty') return '本地 K 线缓存为空，暂时无法执行全市场扫描'
   if (message === 'scan_not_found') return '扫描任务已过期或不存在'
+  if (message === 'minute_analysis_missing') return '分时分析响应缺少结构数据'
   return message || '请求失败，请稍后重试'
 }
 
@@ -325,11 +393,13 @@ export function useTechnicalAnalysis() {
     results: [],
     error: '',
     starting: false,
+    cancelling: false,
   })
-  const scanActive = computed(() => scan.starting || ['queued', 'running'].includes(scan.status))
+  const scanActive = computed(() => scan.starting || scan.cancelling || ['queued', 'running'].includes(scan.status))
   let analysisController = null
   let minuteController = null
   let scanController = null
+  let scanCancelController = null
   let scanTimer = null
   let pollFailures = 0
   let disposed = false
@@ -373,19 +443,30 @@ export function useTechnicalAnalysis() {
 
   async function analyzeMinute(symbol) {
     minuteController?.abort()
-    minuteController = new AbortController()
+    const controller = new AbortController()
+    minuteController = controller
+    minuteAnalysis.value = null
+    analysisState.error = ''
     try {
       const params = new URLSearchParams({ symbol: String(symbol) })
       const payload = await fetchJson(
         `/api/technical-analysis/minute?${params.toString()}`,
-        { signal: minuteController.signal },
+        { signal: controller.signal },
         ANALYZE_TIMEOUT_MS,
       )
-      if (!disposed) minuteAnalysis.value = unwrapPayload(payload)
+      const normalized = normalizeMinutePayload(payload)
+      if (!normalized.analysis) throw new Error('minute_analysis_missing')
+      if (!disposed && minuteController === controller) {
+        minuteAnalysis.value = normalized
+      }
       return minuteAnalysis.value
     } catch (error) {
-      if (!disposed && !minuteController?.signal.aborted) analysisState.error = requestErrorMessage(error, '分时请求超时，请稍后重试')
+      if (!disposed && minuteController === controller && !controller.signal.aborted) {
+        analysisState.error = requestErrorMessage(error, '分时请求超时，请稍后重试')
+      }
       return null
+    } finally {
+      if (minuteController === controller) minuteController = null
     }
   }
 
@@ -437,7 +518,7 @@ export function useTechnicalAnalysis() {
     stopScanPolling()
     Object.assign(scan, {
       jobId: '', status: 'queued', progress: 0, stage: '正在创建扫描任务',
-      scanned: 0, total: 0, results: [], error: '', starting: true,
+      scanned: 0, total: 0, results: [], error: '', starting: true, cancelling: false,
     })
     pollFailures = 0
     const controller = new AbortController()
@@ -467,10 +548,46 @@ export function useTechnicalAnalysis() {
     }
   }
 
+  async function cancelScan(period = 'day') {
+    if (!scan.jobId || !['queued', 'running'].includes(scan.status) || scan.cancelling) return null
+    const jobId = scan.jobId
+    stopScanPolling()
+    const controller = new AbortController()
+    scanCancelController = controller
+    scan.cancelling = true
+    scan.error = ''
+    try {
+      const payload = await fetchJson(
+        `/api/technical-analysis/scans/${encodeURIComponent(jobId)}`,
+        { method: 'DELETE', signal: controller.signal },
+        SCAN_REQUEST_TIMEOUT_MS,
+      )
+      if (disposed || scanCancelController !== controller || scan.jobId !== jobId) return null
+      const normalized = applyScanPayload(payload, period)
+      if (normalized.status === 'cancelled' && !scan.error) scan.error = '本次扫描已取消'
+      if (!TERMINAL_SCAN_STATUSES.has(normalized.status)) {
+        scanTimer = window.setTimeout(() => pollScan(period), 300)
+      }
+      return normalized
+    } catch (error) {
+      if (!disposed && scanCancelController === controller && !controller.signal.aborted) {
+        scan.error = requestErrorMessage(error, '取消扫描请求超时')
+        if (['queued', 'running'].includes(scan.status)) {
+          scanTimer = window.setTimeout(() => pollScan(period), 300)
+        }
+      }
+      return null
+    } finally {
+      if (scanCancelController === controller) scanCancelController = null
+      if (!disposed && scan.jobId === jobId) scan.cancelling = false
+    }
+  }
+
   onBeforeUnmount(() => {
     disposed = true
     analysisController?.abort()
     minuteController?.abort()
+    scanCancelController?.abort()
     stopScanPolling()
   })
 
@@ -483,5 +600,6 @@ export function useTechnicalAnalysis() {
     scan,
     scanActive,
     startScan,
+    cancelScan,
   }
 }

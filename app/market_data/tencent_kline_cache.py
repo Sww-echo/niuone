@@ -26,8 +26,12 @@ except ImportError:  # pragma: no cover - legacy top-level import path
     from core.paths import get_dashboard_home
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_KLINE_COUNT = 120
+MAX_KLINE_COUNT = 500
+# Full-history prewarm supports weekly technical analysis while existing
+# screeners continue to request/load their original 120-row windows.
+DEFAULT_PREWARM_KLINE_COUNT = MAX_KLINE_COUNT
 DEFAULT_PREWARM_WORKERS = 12
 DEFAULT_HTTP_TIMEOUT_SECONDS = 15.0
 TENCENT_KLINE_URL = "https://ifzq.gtimg.cn/appstock/app/fqkline/get"
@@ -67,6 +71,7 @@ def _open_database(path: Path) -> sqlite3.Connection:
             first_trade_date TEXT NOT NULL,
             last_trade_date TEXT NOT NULL,
             row_count INTEGER NOT NULL,
+            requested_count INTEGER NOT NULL DEFAULT 120,
             rows_json TEXT NOT NULL,
             fetched_at TEXT NOT NULL,
             updated_ts REAL NOT NULL
@@ -100,12 +105,17 @@ def _open_database(path: Path) -> sqlite3.Connection:
         str(row["name"] or "")
         for row in connection.execute("PRAGMA table_info(prewarm_runs)")
     }
+    kline_columns = {
+        str(row["name"] or "")
+        for row in connection.execute("PRAGMA table_info(kline_series)")
+    }
     schema_row = connection.execute(
         "SELECT value FROM schema_meta WHERE key='schema_version'"
     ).fetchone()
     if (
         "completed_count" not in prewarm_columns
         or "updated_at" not in prewarm_columns
+        or "requested_count" not in kline_columns
         or not schema_row
         or str(schema_row["value"] or "") != str(SCHEMA_VERSION)
     ):
@@ -122,6 +132,16 @@ def _open_database(path: Path) -> sqlite3.Connection:
             if "updated_at" not in prewarm_columns:
                 connection.execute(
                     "ALTER TABLE prewarm_runs ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''"
+                )
+            kline_columns = {
+                str(row["name"] or "")
+                for row in connection.execute("PRAGMA table_info(kline_series)")
+            }
+            if "requested_count" not in kline_columns:
+                # Existing rows were produced by the legacy 120-row pipeline.
+                connection.execute(
+                    "ALTER TABLE kline_series "
+                    "ADD COLUMN requested_count INTEGER NOT NULL DEFAULT 120"
                 )
             connection.execute(
                 "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
@@ -183,7 +203,7 @@ def fetch_tencent_daily_klines(
     normalized_symbol = re.sub(r"[^a-zA-Z0-9]", "", str(symbol or "")).lower()
     if not re.fullmatch(r"(?:sh|sz)\d{6}", normalized_symbol):
         return []
-    bounded_count = max(30, min(500, int(count or DEFAULT_KLINE_COUNT)))
+    bounded_count = max(30, min(MAX_KLINE_COUNT, int(count or DEFAULT_KLINE_COUNT)))
     url = f"{TENCENT_KLINE_URL}?param={normalized_symbol},day,,,{bounded_count},qfq"
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
@@ -213,44 +233,84 @@ def store_kline_series(
     *,
     path: Path | None = None,
     fetched_at: str = "",
+    limit: int = DEFAULT_KLINE_COUNT,
 ) -> int:
-    """Atomically replace successful symbol series and retain all others."""
-    normalized: list[tuple[Any, ...]] = []
+    """Atomically replace successful symbol series and retain all others.
+
+    The default remains the historical 120-row cache contract.  Callers that
+    intentionally fetched a longer history (notably the full-market prewarm)
+    can preserve up to ``MAX_KLINE_COUNT`` rows with ``limit``.
+    """
+    candidates: dict[str, list[dict[str, Any]]] = {}
     timestamp = fetched_at or _now_text()
     updated_ts = time.time()
+    bounded_limit = max(1, min(MAX_KLINE_COUNT, int(limit or DEFAULT_KLINE_COUNT)))
     for raw_symbol, raw_rows in (series_by_symbol or {}).items():
         symbol = re.sub(r"[^a-zA-Z0-9]", "", str(raw_symbol or "")).lower()
         if not re.fullmatch(r"(?:sh|sz)\d{6}", symbol):
             continue
-        rows = normalize_kline_rows(raw_rows, limit=DEFAULT_KLINE_COUNT)
+        rows = normalize_kline_rows(raw_rows, limit=bounded_limit)
         if not rows:
             continue
-        normalized.append((
-            symbol,
-            "qfq",
-            str(rows[0]["date"]),
-            str(rows[-1]["date"]),
-            len(rows),
-            json.dumps(rows, ensure_ascii=False, separators=(",", ":")),
-            timestamp,
-            updated_ts,
-        ))
-    if not normalized:
+        candidates[symbol] = rows
+    if not candidates:
         return 0
     connection = _open_database(Path(path or kline_cache_path()))
     try:
-        with connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            normalized: list[tuple[Any, ...]] = []
+            for symbol, incoming_rows in candidates.items():
+                existing = connection.execute(
+                    "SELECT requested_count, rows_json FROM kline_series WHERE symbol=?",
+                    (symbol,),
+                ).fetchone()
+                existing_limit = int(existing["requested_count"] or 0) if existing else 0
+                existing_rows: list[dict[str, Any]] = []
+                if existing and existing_limit > bounded_limit:
+                    try:
+                        parsed = json.loads(str(existing["rows_json"] or "[]"))
+                    except (TypeError, ValueError):
+                        parsed = []
+                    existing_rows = normalize_kline_rows(
+                        parsed,
+                        limit=min(MAX_KLINE_COUNT, existing_limit),
+                    )
+                preserved_limit = existing_limit if existing_rows else 0
+                effective_limit = max(
+                    bounded_limit,
+                    min(MAX_KLINE_COUNT, preserved_limit),
+                )
+                # A normal 120-row fallback refresh must not erase a successful
+                # 500-row prewarm. Existing history is retained while incoming
+                # rows win on overlapping dates so current qfq values stay fresh.
+                rows = normalize_kline_rows(
+                    [*existing_rows, *incoming_rows],
+                    limit=effective_limit,
+                )
+                normalized.append((
+                    symbol,
+                    "qfq",
+                    str(rows[0]["date"]),
+                    str(rows[-1]["date"]),
+                    len(rows),
+                    effective_limit,
+                    json.dumps(rows, ensure_ascii=False, separators=(",", ":")),
+                    timestamp,
+                    updated_ts,
+                ))
             connection.executemany(
                 """
                 INSERT INTO kline_series(
                     symbol, adjustment, first_trade_date, last_trade_date,
-                    row_count, rows_json, fetched_at, updated_ts
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                    row_count, requested_count, rows_json, fetched_at, updated_ts
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(symbol) DO UPDATE SET
                     adjustment=excluded.adjustment,
                     first_trade_date=excluded.first_trade_date,
                     last_trade_date=excluded.last_trade_date,
                     row_count=excluded.row_count,
+                    requested_count=excluded.requested_count,
                     rows_json=excluded.rows_json,
                     fetched_at=excluded.fetched_at,
                     updated_ts=excluded.updated_ts
@@ -261,6 +321,10 @@ def store_kline_series(
                 "DELETE FROM kline_attempts WHERE symbol=?",
                 [(row[0],) for row in normalized],
             )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
     finally:
         connection.close()
     return len(normalized)
@@ -308,8 +372,15 @@ def load_kline_series_map(
     accepted_last_dates: set[str] | None = None,
     min_rows: int = 30,
     count: int = DEFAULT_KLINE_COUNT,
+    min_requested_count: int = 1,
 ) -> dict[str, list[dict[str, Any]]]:
-    """Bulk-load fresh cached histories with one SQLite read per symbol chunk."""
+    """Bulk-load fresh cached histories with one SQLite read per symbol chunk.
+
+    ``min_requested_count`` is an opt-in cache-capability gate.  It lets a
+    longer-history consumer reject legacy 120-row cache entries without
+    changing default readers or penalizing newly listed stocks whose valid
+    history is naturally shorter than the requested window.
+    """
     unique = list(dict.fromkeys(
         re.sub(r"[^a-zA-Z0-9]", "", str(symbol or "")).lower()
         for symbol in symbols
@@ -326,11 +397,15 @@ def load_kline_series_map(
             chunk = unique[offset:offset + 800]
             placeholders = ",".join("?" for _ in chunk)
             query = (
-                "SELECT symbol, last_trade_date, row_count, rows_json "
+                "SELECT symbol, last_trade_date, row_count, requested_count, rows_json "
                 f"FROM kline_series WHERE symbol IN ({placeholders})"
             )
             for row in connection.execute(query, chunk):
                 if int(row["row_count"] or 0) < max(1, int(min_rows or 1)):
+                    continue
+                if int(row["requested_count"] or 0) < max(
+                    1, int(min_requested_count or 1)
+                ):
                     continue
                 if accepted and str(row["last_trade_date"] or "")[:10] not in accepted:
                     continue
@@ -379,12 +454,18 @@ def quote_trade_date(quote: Mapping[str, Any] | None) -> str:
 def merge_live_quote(
     historical_rows: Iterable[Mapping[str, Any]],
     quote: Mapping[str, Any] | None,
-    *,
     limit: int = DEFAULT_KLINE_COUNT,
 ) -> list[dict[str, Any]]:
-    """Append or replace today's bar without mutating cached completed history."""
-    resolved_limit = max(1, int(limit or DEFAULT_KLINE_COUNT))
-    rows = normalize_kline_rows(historical_rows, limit=resolved_limit)
+    """Append or replace today's bar without mutating completed history.
+
+    Omitting ``limit`` preserves the original 120-row behavior.  Explicit
+    250/500-row consumers retain their requested technical-analysis window.
+    """
+    bounded_limit = max(1, min(MAX_KLINE_COUNT, int(limit or DEFAULT_KLINE_COUNT)))
+    rows = [
+        {**row, "bar_status": "closed"}
+        for row in normalize_kline_rows(historical_rows, limit=bounded_limit)
+    ]
     trade_date = quote_trade_date(quote)
     price = _finite_float((quote or {}).get("price"))
     if not trade_date or price is None or price <= 0:
@@ -400,12 +481,18 @@ def merge_live_quote(
         "high": max(high, open_price, price),
         "low": min(low, open_price, price),
         "volume": max(0.0, volume),
+        "amount": max(0.0, _finite_float((quote or {}).get("amount")) or 0.0),
+        "turnover": max(
+            0.0,
+            _finite_float((quote or {}).get("turnover")) or 0.0,
+        ),
+        "bar_status": "live",
     }
     if rows and rows[-1]["date"] == trade_date:
         rows[-1] = live
     else:
         rows.append(live)
-    return rows[-resolved_limit:]
+    return rows[-bounded_limit:]
 
 
 def prewarm_completed_for_date(
@@ -413,23 +500,38 @@ def prewarm_completed_for_date(
     *,
     path: Path | None = None,
     minimum_coverage: float = 0.90,
+    min_requested_count: int = DEFAULT_PREWARM_KLINE_COUNT,
 ) -> bool:
     cache_path = Path(path or kline_cache_path())
     if not cache_path.exists():
         return False
+    required_count = max(
+        1,
+        min(MAX_KLINE_COUNT, int(min_requested_count or DEFAULT_PREWARM_KLINE_COUNT)),
+    )
     connection = _open_database(cache_path)
     try:
         row = connection.execute(
             "SELECT requested_count, success_count, status FROM prewarm_runs WHERE target_date=?",
             (str(target_date)[:10],),
         ).fetchone()
+        capable_count = int(connection.execute(
+            "SELECT count(*) FROM kline_series "
+            "WHERE row_count >= 1 AND requested_count >= ?",
+            (required_count,),
+        ).fetchone()[0] or 0)
     finally:
         connection.close()
     if not row or str(row["status"] or "") != "completed":
         return False
     requested = int(row["requested_count"] or 0)
     success = int(row["success_count"] or 0)
-    return requested > 0 and success / requested >= max(0.0, min(1.0, minimum_coverage))
+    required_coverage = max(0.0, min(1.0, minimum_coverage))
+    return (
+        requested > 0
+        and success / requested >= required_coverage
+        and capable_count / requested >= required_coverage
+    )
 
 
 def kline_cache_readiness(
@@ -438,9 +540,14 @@ def kline_cache_readiness(
     path: Path | None = None,
     minimum_coverage: float = 0.90,
     min_rows: int = 30,
+    min_requested_count: int = DEFAULT_PREWARM_KLINE_COUNT,
 ) -> dict[str, Any]:
     """Return bounded cache and prewarm progress metadata for readiness gates."""
     cache_path = Path(path or kline_cache_path())
+    required_count = max(
+        1,
+        min(MAX_KLINE_COUNT, int(min_requested_count or DEFAULT_PREWARM_KLINE_COUNT)),
+    )
     accepted = {
         str(value)[:10]
         for value in (accepted_last_dates or set())
@@ -452,6 +559,7 @@ def kline_cache_readiness(
         "accepted_last_dates": sorted(accepted),
         "cached_count": 0,
         "fresh_count": 0,
+        "min_requested_count": required_count,
         "requested_count": 0,
         "completed_count": 0,
         "success_count": 0,
@@ -474,12 +582,22 @@ def kline_cache_readiness(
                 "SELECT count(*) FROM kline_series WHERE row_count >= ?",
                 (max(1, int(min_rows or 1)),),
             ).fetchone()[0] or 0)
+            capable_count = int(connection.execute(
+                "SELECT count(*) FROM kline_series "
+                "WHERE row_count >= ? AND requested_count >= ?",
+                (max(1, int(min_rows or 1)), required_count),
+            ).fetchone()[0] or 0)
             if accepted:
                 placeholders = ",".join("?" for _ in accepted)
                 fresh_count = int(connection.execute(
                     "SELECT count(*) FROM kline_series "
-                    f"WHERE row_count >= ? AND last_trade_date IN ({placeholders})",
-                    (max(1, int(min_rows or 1)), *sorted(accepted)),
+                    f"WHERE row_count >= ? AND requested_count >= ? "
+                    f"AND last_trade_date IN ({placeholders})",
+                    (
+                        max(1, int(min_rows or 1)),
+                        required_count,
+                        *sorted(accepted),
+                    ),
                 ).fetchone()[0] or 0)
             else:
                 fresh_count = cached_count
@@ -513,6 +631,8 @@ def kline_cache_readiness(
         error_code = "kline_cache_initializing"
     elif status == "error":
         error_code = str(run["error_summary"] or "kline_prewarm_failed")[:80]
+    elif cached_count > capable_count:
+        error_code = "kline_cache_upgrade_required"
     else:
         error_code = "kline_cache_incomplete"
     return {
@@ -520,6 +640,7 @@ def kline_cache_readiness(
         "ready": ready,
         "cache_exists": True,
         "cached_count": cached_count,
+        "capable_count": capable_count,
         "fresh_count": fresh_count,
         "requested_count": requested_count,
         "completed_count": completed_count,
@@ -573,7 +694,7 @@ def prewarm_kline_cache(
     path: Path | None = None,
     target_date: str = "",
     workers: int = DEFAULT_PREWARM_WORKERS,
-    count: int = DEFAULT_KLINE_COUNT,
+    count: int = DEFAULT_PREWARM_KLINE_COUNT,
     max_attempts: int = 2,
     accepted_last_dates: set[str] | None = None,
     fetcher: Callable[[str, int], list[dict[str, Any]]] | None = None,
@@ -590,6 +711,7 @@ def prewarm_kline_cache(
     started_at = _now_text()
     started = time.monotonic()
     active_fetcher = fetcher or fetch_tencent_daily_klines
+    bounded_count = max(30, min(MAX_KLINE_COUNT, int(count or DEFAULT_PREWARM_KLINE_COUNT)))
     accepted = {
         str(value)[:10]
         for value in (accepted_last_dates or set())
@@ -601,7 +723,8 @@ def prewarm_kline_cache(
             path=cache_path,
             accepted_last_dates=accepted,
             min_rows=30,
-            count=count,
+            count=bounded_count,
+            min_requested_count=bounded_count,
         )
     ) if accepted and cache_path.exists() else set()
     pending_symbols = [symbol for symbol in unique if symbol not in fresh_symbols]
@@ -641,7 +764,10 @@ def prewarm_kline_cache(
         last_error = "empty_response"
         for attempt in range(max(1, int(max_attempts or 1))):
             try:
-                rows = normalize_kline_rows(active_fetcher(symbol, count), limit=count)
+                rows = normalize_kline_rows(
+                    active_fetcher(symbol, bounded_count),
+                    limit=bounded_count,
+                )
             except Exception as exc:
                 rows = []
                 last_error = type(exc).__name__
@@ -676,13 +802,23 @@ def prewarm_kline_cache(
             else:
                 failures[symbol] = error or "unavailable"
             if len(pending) >= 100:
-                successes += store_kline_series(pending, path=cache_path, fetched_at=started_at)
+                successes += store_kline_series(
+                    pending,
+                    path=cache_path,
+                    fetched_at=started_at,
+                    limit=bounded_count,
+                )
                 pending.clear()
                 persist_progress()
             if progress and (completed % 100 == 0 or completed == len(unique)):
                 progress(completed, len(unique), len(failures))
     if pending:
-        successes += store_kline_series(pending, path=cache_path, fetched_at=started_at)
+        successes += store_kline_series(
+            pending,
+            path=cache_path,
+            fetched_at=started_at,
+            limit=bounded_count,
+        )
     persist_progress()
     record_kline_failures(failures, path=cache_path, attempted_at=started_at)
 
@@ -713,6 +849,7 @@ def prewarm_kline_cache(
         "completed_count": completed,
         "reused_count": len(fresh_symbols),
         "workers": worker_count,
+        "kline_count": bounded_count,
         "duration_seconds": duration,
         "cache_path": str(cache_path),
         "status": "completed",
@@ -722,7 +859,9 @@ def prewarm_kline_cache(
 __all__ = [
     "DEFAULT_CACHE_PATH",
     "DEFAULT_KLINE_COUNT",
+    "DEFAULT_PREWARM_KLINE_COUNT",
     "DEFAULT_PREWARM_WORKERS",
+    "MAX_KLINE_COUNT",
     "fetch_tencent_daily_klines",
     "kline_cache_path",
     "kline_cache_readiness",

@@ -11,8 +11,10 @@ from __future__ import annotations
 import json
 import math
 import re
+import sqlite3
 import time
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -29,6 +31,30 @@ TENCENT_QUOTE_URL = "https://qt.gtimg.cn/q="
 DEFAULT_TIMEOUT_SECONDS = 8.0
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 SUPPORTED_PERIODS = {"day", "week"}
+
+
+INDEX_REFERENCES = {
+    "sh": {
+        "code": "000001", "tencent": "sh000001", "secid": "1.000001",
+        "market": "sh", "name": "上证指数",
+    },
+    "sz": {
+        "code": "399001", "tencent": "sz399001", "secid": "0.399001",
+        "market": "sz", "name": "深证成指",
+    },
+    "cyb": {
+        "code": "399006", "tencent": "sz399006", "secid": "0.399006",
+        "market": "sz", "name": "创业板指",
+    },
+    "kcb": {
+        "code": "000688", "tencent": "sh000688", "secid": "1.000688",
+        "market": "sh", "name": "科创50",
+    },
+    "bj": {
+        "code": "899050", "tencent": "bj899050", "secid": "0.899050",
+        "market": "bj", "name": "北证50",
+    },
+}
 
 
 class TechnicalMarketDataError(RuntimeError):
@@ -103,6 +129,26 @@ def normalize_symbol(value: object) -> dict[str, str]:
         raise ValueError("invalid_symbol")
     secid = f"1.{code}" if market == "sh" else f"0.{code}"
     return {"code": code, "tencent": f"{market}{code}", "secid": secid, "market": market}
+
+
+def _index_reference(symbol: object) -> dict[str, str]:
+    """Select a same-board market benchmark for one A-share symbol."""
+    normalized = normalize_symbol(symbol)
+    code = normalized["code"]
+    if normalized["market"] == "bj":
+        key = "bj"
+    elif code.startswith(("300", "301")):
+        key = "cyb"
+    elif code.startswith(("688", "689")):
+        key = "kcb"
+    else:
+        key = normalized["market"]
+    return dict(INDEX_REFERENCES[key])
+
+
+def technical_index_key(symbol: object) -> str:
+    """Return the stable Tencent-style key for a symbol's benchmark."""
+    return _index_reference(symbol)["tencent"]
 
 
 def _finite(value: object) -> float | None:
@@ -214,7 +260,12 @@ def fetch_minute_series(
     downloader: Callable[[str, float], dict[str, Any]] = _download_json,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
-    """Fetch today's bounded five-minute series for minute Chanlun analysis."""
+    """Fetch today's one-minute representative-price stream for 5m analysis.
+
+    Eastmoney's ``trends2`` endpoint currently returns minute-by-minute points
+    even when passed ``klt=5``.  The strategy layer therefore owns the explicit
+    continuous-session five-minute aggregation.
+    """
     normalized = normalize_symbol(symbol)
     query = urlencode({
         "secid": normalized["secid"],
@@ -237,18 +288,27 @@ def fetch_minute_series(
     prices: list[float] = []
     averages: list[float] = []
     volumes: list[float] = []
+    source_invalid_row_count = 0
+    source_invalid_price_count = 0
+    source_missing_volume_count = 0
     for line in trends[:600]:
         fields = str(line or "").split(",")
         if len(fields) < 8:
+            source_invalid_row_count += 1
             continue
         price = _finite(fields[2])
         if price is None or price <= 0:
+            source_invalid_price_count += 1
             continue
+        volume = _finite(fields[5])
+        if volume is None or volume < 0:
+            source_missing_volume_count += 1
+            volume = 0.0
         times.append(fields[0].split(" ")[-1][:5])
         prices.append(price)
         averages.append(_finite(fields[7]) or price)
-        volumes.append(max(0.0, _finite(fields[5]) or 0.0))
-    if len(prices) < 10:
+        volumes.append(volume)
+    if not prices:
         raise TechnicalMarketDataError("minute_insufficient")
     return {
         "symbol": normalized["code"],
@@ -261,8 +321,15 @@ def fetch_minute_series(
         "high": max(prices),
         "low": min(prices),
         "data_quality": {
-            "source": "eastmoney_five_minute",
+            "source": "eastmoney_one_minute_points",
+            "source_interval": "1m",
+            "requested_klt": 5,
+            "aggregation_required": True,
             "point_count": len(prices),
+            "source_row_count": min(600, len(trends)),
+            "source_invalid_row_count": source_invalid_row_count,
+            "source_invalid_price_count": source_invalid_price_count,
+            "source_missing_volume_count": source_missing_volume_count,
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         },
     }
@@ -311,6 +378,107 @@ def _augment_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return augmented
 
 
+def load_technical_index_data(
+    symbol: object = "600000",
+    *,
+    period: str = "day",
+    count: int = 120,
+    series_loader: Callable[..., dict[str, list[dict[str, Any]]]] = load_kline_series_map,
+    tencent_fetcher: Callable[..., list[dict[str, Any]]] = fetch_tencent_daily_klines,
+    eastmoney_fetcher: Callable[..., list[dict[str, Any]]] = _fetch_eastmoney_daily_klines,
+) -> dict[str, Any]:
+    """Load a benchmark series for CAN SLIM's market-environment dimension.
+
+    An unavailable benchmark is an explicit degraded result rather than a hard
+    failure: stock K-lines remain sufficient for the rest of the analysis.
+    """
+    resolved_period = str(period or "day").lower()
+    if resolved_period not in SUPPORTED_PERIODS:
+        raise ValueError("unsupported_period")
+    reference = _index_reference(symbol)
+    daily_count = 500 if resolved_period == "week" else max(120, min(500, int(count or 120)))
+    rows: list[dict[str, Any]] = []
+    source = ""
+    if reference["tencent"].startswith(("sh", "sz")):
+        try:
+            cached = series_loader(
+                [reference["tencent"]], min_rows=60, count=daily_count,
+            )
+            rows = list(cached.get(reference["tencent"]) or [])
+        except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
+            rows = []
+        if rows:
+            source = "niuone_sqlite_cache"
+        if len(rows) < daily_count:
+            try:
+                extended = list(tencent_fetcher(reference["tencent"], daily_count) or [])
+            except (OSError, RuntimeError, TypeError, ValueError):
+                extended = []
+            if len(extended) > len(rows):
+                rows = extended
+                source = "tencent_bounded_fallback"
+    if len(rows) < daily_count:
+        try:
+            extended = list(eastmoney_fetcher(reference, daily_count) or [])
+        except (OSError, RuntimeError, TypeError, ValueError):
+            extended = []
+        if len(extended) > len(rows):
+            rows = extended
+            source = "eastmoney_bounded_fallback"
+    if resolved_period == "week" and rows:
+        rows = _aggregate_weekly(rows)
+    rows = _augment_rows(rows)
+    if len(rows) < 60:
+        rows = []
+    return {
+        "symbol": reference["code"],
+        "tencent_symbol": reference["tencent"],
+        "name": reference["name"],
+        "period": resolved_period,
+        "klines": rows,
+        "data_quality": {
+            "index_available": bool(rows),
+            "index_source": source,
+            "index_symbol": reference["code"],
+            "index_name": reference["name"],
+            "index_count": len(rows),
+            "index_last_date": str(rows[-1].get("date") or "")[:10] if rows else "",
+        },
+    }
+
+
+def load_technical_index_bundle(
+    symbols: list[str] | tuple[str, ...],
+    *,
+    period: str = "day",
+    count: int = 120,
+    index_loader: Callable[..., dict[str, Any]] = load_technical_index_data,
+) -> dict[str, dict[str, Any]]:
+    """Load each required board benchmark once for a multi-stock scan."""
+    representatives: dict[str, str] = {}
+    for symbol in symbols:
+        try:
+            representatives.setdefault(technical_index_key(symbol), symbol)
+        except ValueError:
+            continue
+    if not representatives:
+        return {}
+    results: dict[str, dict[str, Any]] = {}
+    worker_count = min(5, len(representatives))
+    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        futures = {
+            pool.submit(index_loader, symbol, period=period, count=count): key
+            for key, symbol in representatives.items()
+        }
+        for future in as_completed(futures):
+            key = futures[future]
+            try:
+                results[key] = dict(future.result() or {})
+            except (OSError, RuntimeError, TypeError, ValueError):
+                results[key] = {}
+    return results
+
+
 def load_technical_market_data(
     symbol: object,
     *,
@@ -319,6 +487,7 @@ def load_technical_market_data(
     include_fund_flow: bool = True,
     quote_fetcher: Callable[..., dict[str, dict[str, Any]]] = _fetch_tencent_quote,
     flow_fetcher: Callable[..., list[dict[str, Any]]] = fetch_fund_flows,
+    index_loader: Callable[..., dict[str, Any]] = load_technical_index_data,
 ) -> dict[str, Any]:
     """Load one normalized technical-analysis input envelope."""
     normalized = normalize_symbol(symbol)
@@ -335,16 +504,31 @@ def load_technical_market_data(
     except (RuntimeError, OSError):
         quote = {}
 
-    cache = load_kline_series_map(
-        [normalized["tencent"]], min_rows=60, count=daily_count,
-    )
+    try:
+        cache = load_kline_series_map(
+            [normalized["tencent"]], min_rows=60, count=daily_count,
+        )
+    except (OSError, RuntimeError, ValueError, sqlite3.Error):
+        cache = {}
     rows = list(cache.get(normalized["tencent"]) or [])
     kline_source = "niuone_sqlite_cache" if rows else "tencent_bounded_fallback"
-    if not rows:
-        rows = fetch_tencent_daily_klines(normalized["tencent"], daily_count)
-    if not rows:
-        rows = _fetch_eastmoney_daily_klines(normalized, daily_count)
-        if rows:
+    # Deployments upgraded from the original 120-row cache need an upstream
+    # extension before weekly aggregation and long-horizon CAN SLIM scoring.
+    if len(rows) < daily_count:
+        try:
+            extended = fetch_tencent_daily_klines(normalized["tencent"], daily_count)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            extended = []
+        if len(extended) > len(rows):
+            rows = extended
+            kline_source = "tencent_bounded_fallback"
+    if len(rows) < daily_count:
+        try:
+            extended = _fetch_eastmoney_daily_klines(normalized, daily_count)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            extended = []
+        if len(extended) > len(rows):
+            rows = extended
             kline_source = "eastmoney_bounded_fallback"
     if not rows:
         raise TechnicalMarketDataError("kline_unavailable")
@@ -355,7 +539,22 @@ def load_technical_market_data(
     if len(rows) < 60:
         raise TechnicalMarketDataError("kline_insufficient")
 
-    flows = flow_fetcher(normalized["code"], days=30) if include_fund_flow else []
+    if include_fund_flow:
+        try:
+            flows = list(flow_fetcher(normalized["code"], days=30) or [])
+        except (OSError, RuntimeError, TypeError, ValueError):
+            flows = []
+    else:
+        flows = []
+    try:
+        index_market = dict(index_loader(
+            normalized["code"], period=resolved_period, count=daily_count,
+        ) or {})
+    except (OSError, RuntimeError, TypeError, ValueError):
+        index_market = {}
+    index_rows = list(index_market.get("klines") or [])
+    index_quality = dict(index_market.get("data_quality") or {})
+    degraded = not quote or len(flows) < 3 or len(index_rows) < 60
     return {
         "symbol": normalized["code"],
         "tencent_symbol": normalized["tencent"],
@@ -363,6 +562,7 @@ def load_technical_market_data(
         "quote": quote,
         "klines": rows,
         "flows": flows,
+        "index_klines": index_rows,
         "data_quality": {
             "kline_source": kline_source,
             "kline_count": len(rows),
@@ -370,7 +570,9 @@ def load_technical_market_data(
             "latest_bar_status": str(rows[-1].get("bar_status") or "closed"),
             "quote_available": bool(quote.get("price")),
             "fund_flow_available": len(flows) >= 3,
-            "degraded": not quote or len(flows) < 3,
+            **index_quality,
+            "index_available": len(index_rows) >= 60,
+            "degraded": degraded,
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         },
     }
@@ -380,6 +582,9 @@ __all__ = [
     "TechnicalMarketDataError",
     "fetch_fund_flows",
     "fetch_minute_series",
+    "load_technical_index_bundle",
+    "load_technical_index_data",
     "load_technical_market_data",
     "normalize_symbol",
+    "technical_index_key",
 ]
