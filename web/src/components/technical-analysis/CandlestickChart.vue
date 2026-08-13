@@ -3,6 +3,7 @@ import { computed, ref } from 'vue'
 
 const props = defineProps({
   rows: { type: Array, default: () => [] },
+  chanlun: { type: Object, default: () => ({}) },
 })
 
 const width = 900
@@ -11,6 +12,14 @@ const plot = { left: 58, right: 14, top: 16, priceBottom: 218, volumeTop: 230, b
 const visibleRows = computed(() => props.rows.slice(-80))
 const hoverIndex = ref(-1)
 
+function rowLabel(row) {
+  return String(row?.date || row?.time || '')
+}
+
+function overlayLabel(value) {
+  return String(value || '').slice(0, 10)
+}
+
 function finite(value) {
   const number = Number(value)
   return Number.isFinite(number) ? number : 0
@@ -18,7 +27,7 @@ function finite(value) {
 
 const geometry = computed(() => {
   const rows = visibleRows.value
-  if (!rows.length) return { candles: [], grid: [], labels: [], maxVolume: 0 }
+  if (!rows.length) return { candles: [], grid: [], labels: [], maxVolume: 0, strokes: [], fractals: [], signals: [] }
   const low = Math.min(...rows.map(row => finite(row.low)))
   const high = Math.max(...rows.map(row => finite(row.high)))
   const span = Math.max(0.01, high - low)
@@ -59,7 +68,39 @@ const geometry = computed(() => {
     x: plot.left + step * (index + 0.5),
     date: String(rows[index]?.date || '').slice(5),
   }))
-  return { candles, grid, labels, maxVolume }
+  const positions = new Map()
+  rows.forEach((row, index) => {
+    const full = rowLabel(row)
+    const short = overlayLabel(full)
+    positions.set(full, index)
+    positions.set(short, index)
+  })
+  const point = (rawLabel, rawPrice) => {
+    const label = String(rawLabel || '')
+    const index = positions.get(label) ?? positions.get(overlayLabel(label))
+    const price = finite(rawPrice)
+    if (!Number.isInteger(index) || price <= 0) return null
+    return { x: plot.left + step * (index + 0.5), y: priceY(price), price, index }
+  }
+  const strokes = (Array.isArray(props.chanlun?.strokes) ? props.chanlun.strokes : []).map((stroke, index) => {
+    const start = point(stroke.start_date || stroke.start_time, stroke.start_price)
+    const end = point(stroke.end_date || stroke.end_time, stroke.end_price)
+    return start && end ? { key: `stroke-${index}`, start, end, direction: stroke.direction } : null
+  }).filter(Boolean)
+  const fractals = (Array.isArray(props.chanlun?.fractals) ? props.chanlun.fractals : []).map((fractal, index) => {
+    const position = point(fractal.date || fractal.time, fractal.price)
+    return position ? { key: `fractal-${index}`, ...position, type: fractal.type } : null
+  }).filter(Boolean)
+  const signals = (Array.isArray(props.chanlun?.signals) ? props.chanlun.signals : []).map((signal, index) => {
+    const position = point(signal.date || signal.time, signal.price)
+    return position ? {
+      key: `signal-${index}`,
+      ...position,
+      type: String(signal.type || ''),
+      label: String(signal.type_name || signal.type || ''),
+    } : null
+  }).filter(Boolean)
+  return { candles, grid, labels, maxVolume, strokes, fractals, signals }
 })
 
 const hovered = computed(() => geometry.value.candles[hoverIndex.value] || null)
@@ -125,6 +166,33 @@ function compactVolume(value) {
           :width="candle.bodyWidth"
           :height="candle.volumeHeight"
         />
+      </g>
+      <g v-if="geometry.strokes.length" class="technical-chanlun-strokes" aria-label="缠论笔">
+        <line
+          v-for="stroke in geometry.strokes"
+          :key="stroke.key"
+          :class="stroke.direction"
+          :x1="stroke.start.x"
+          :y1="stroke.start.y"
+          :x2="stroke.end.x"
+          :y2="stroke.end.y"
+        />
+      </g>
+      <g v-if="geometry.fractals.length" class="technical-chanlun-fractals" aria-label="缠论分型">
+        <path
+          v-for="fractal in geometry.fractals"
+          :key="fractal.key"
+          :class="fractal.type"
+          :d="fractal.type === 'top'
+            ? `M ${fractal.x - 4} ${fractal.y - 6} L ${fractal.x + 4} ${fractal.y - 6} L ${fractal.x} ${fractal.y - 1} Z`
+            : `M ${fractal.x - 4} ${fractal.y + 6} L ${fractal.x + 4} ${fractal.y + 6} L ${fractal.x} ${fractal.y + 1} Z`"
+        />
+      </g>
+      <g v-if="geometry.signals.length" class="technical-chanlun-signals" aria-label="缠论买卖点">
+        <g v-for="signal in geometry.signals" :key="signal.key" :class="signal.type.startsWith('buy') ? 'buy' : 'sell'">
+          <circle :cx="signal.x" :cy="signal.y" r="5" />
+          <text :x="signal.x" :y="signal.y + (signal.type.startsWith('buy') ? 15 : -10)" text-anchor="middle">{{ signal.label }}</text>
+        </g>
       </g>
       <g class="technical-chart-dates">
         <text v-for="label in geometry.labels" :key="label.x" :x="label.x" y="283" text-anchor="middle">{{ label.date }}</text>

@@ -14,13 +14,21 @@ const period = ref('day')
 const activeMode = ref('analysis')
 const expandedScanRows = ref(new Set())
 const inputError = ref('')
-const { analysis, minuteAnalysis, analysisState, analyze, analyzeMinute, scan, scanActive, startScan } = useTechnicalAnalysis()
+const { analysis, minuteAnalysis, analysisState, analyze, analyzeMinute, scan, scanActive, startScan, cancelScan } = useTechnicalAnalysis()
 const minuteLoading = ref(false)
 
 const moduleCards = computed(() => TECHNICAL_SCORE_CARDS.map(card => ({
   ...card,
   ...scoreFor(analysis.value?.signal?.moduleScores, card.key),
 })))
+const minuteResult = computed(() => minuteAnalysis.value?.analysis || null)
+const minuteQuality = computed(() => minuteResult.value?.dataQuality || {})
+const minuteWarnings = computed(() => (Array.isArray(minuteQuality.value.warnings) ? minuteQuality.value.warnings : [])
+  .filter(item => String(item || '').trim() && String(item) !== minuteResult.value?.ohlcNote))
+const minuteStatusLabel = computed(() => {
+  if (minuteResult.value?.available) return '派生 OHLC'
+  return minuteResult.value?.reason === 'minute_insufficient' ? '样本不足' : '数据不可用'
+})
 const headlineTone = computed(() => actionTone(analysis.value?.signal?.action))
 const quoteChange = computed(() => {
   const quote = analysis.value?.quote
@@ -78,6 +86,7 @@ async function submitMinute() {
   }
   inputError.value = ''
   symbolInput.value = symbol
+  activeMode.value = 'analysis'
   minuteLoading.value = true
   try {
     await analyzeMinute(symbol)
@@ -174,7 +183,7 @@ function toggleScanRow(index) {
         <div>
           <span class="technical-eyebrow">MULTI-SYSTEM RESEARCH</span>
           <h2>个股技术分析</h2>
-          <p>结合趋势、量价、形态、突破、CAN SLIM 与缠论结构，仅供研究参考。</p>
+          <p>六维结合趋势、量价、形态、突破、CAN SLIM 与缠论结构，仅供研究参考。</p>
         </div>
         <div class="technical-mode-tabs" role="tablist" aria-label="技术分析模式">
           <button :class="{ active: activeMode === 'analysis' }" type="button" role="tab" :aria-selected="activeMode === 'analysis'" @click="activeMode = 'analysis'">个股研究</button>
@@ -204,7 +213,7 @@ function toggleScanRow(index) {
         </button>
       </form>
       <p id="technical-input-help" class="technical-input-help" :class="{ error: inputError }">
-        {{ inputError || '支持沪深京 A 股 6 位代码；全市场扫描仅使用 NiuOne 本地 K 线缓存。' }}
+        {{ inputError || '支持沪深京 A 股 6 位代码；全市场扫描仅使用 NiuOne 本地 K 线缓存；分时分析将连续 1 分钟代表价聚合为 5 分钟结构。' }}
       </p>
     </section>
 
@@ -215,7 +224,7 @@ function toggleScanRow(index) {
     <template v-if="activeMode === 'analysis'">
       <section v-if="!analysis && !analysisState.loading" class="technical-welcome card">
         <div class="technical-welcome-mark" aria-hidden="true">个</div>
-        <div><h3>输入股票代码开始分析</h3><p>生成 K 线、五维评分、关键价位、风险提示与交易计划。</p></div>
+        <div><h3>输入股票代码开始分析</h3><p>生成 K 线、六维评分、关键价位、风险提示与交易计划。</p></div>
       </section>
 
       <template v-if="analysis">
@@ -242,7 +251,7 @@ function toggleScanRow(index) {
           </dl>
         </section>
 
-        <section class="technical-score-grid" aria-label="五维技术评分：趋势、量能、形态、突破、CAN SLIM">
+        <section class="technical-score-grid" aria-label="六维技术评分：趋势、量能、形态、突破、CAN SLIM、缠论">
           <article v-for="card in moduleCards" :key="card.key" class="technical-score-card card" :class="card.tone">
             <div class="technical-score-head"><span>{{ card.label }}</span><strong>{{ displayScore(card.score) }}<small v-if="card.score !== null">/{{ card.maximum }}</small></strong></div>
             <div class="technical-score-track" aria-hidden="true"><span :style="{ width: `${card.progress}%` }"></span></div>
@@ -252,7 +261,7 @@ function toggleScanRow(index) {
 
         <section class="technical-chart-card card">
           <div class="technical-card-heading"><div><h3>K 线走势</h3><p>最近 {{ Math.min(80, analysis.klines.length) }} 根 {{ analysis.period === 'week' ? '周' : '日' }} K</p></div><span class="technical-legend"><i class="up"></i>上涨<i class="down"></i>下跌</span></div>
-          <CandlestickChart :rows="analysis.klines" />
+          <CandlestickChart :rows="analysis.klines" :chanlun="analysis.signal.chanlun || {}" />
         </section>
 
         <section class="technical-detail-grid-layout">
@@ -292,15 +301,33 @@ function toggleScanRow(index) {
           <ul v-if="Array.isArray(analysis.dataQuality.warnings) && analysis.dataQuality.warnings.length" class="technical-warning-list"><li v-for="item in analysis.dataQuality.warnings" :key="String(item)">{{ item }}</li></ul>
         </section>
       </template>
-      <section v-if="minuteAnalysis" class="technical-quality card">
-        <div class="technical-card-heading"><div><h3>分时缠论</h3><p>今日五分钟数据结构分析</p></div><span>{{ minuteAnalysis.available === false ? '数据不足' : '已完成' }}</span></div>
-        <TechnicalDetail :value="minuteAnalysis" empty-text="分时数据暂不可用" />
+      <section v-if="minuteResult" class="technical-minute card" :class="{ degraded: minuteQuality.degraded !== false }">
+        <div class="technical-card-heading">
+          <div><h3>分时缠论</h3><p>连续 1 分钟代表价聚合的 5 分钟结构分析</p></div>
+          <span class="technical-quality-badge">{{ minuteStatusLabel }}</span>
+        </div>
+        <div v-if="minuteResult.ohlcNote || minuteResult.derivedBarCount !== null" class="technical-minute-notice" role="note">
+          <b>数据口径</b>
+          <span>{{ minuteResult.ohlcNote || '5 分钟 OHLC 由连续 1 分钟代表价聚合（首价/最高/最低/末价），并非上游原生 5 分钟 OHLC K 线。' }}</span>
+        </div>
+        <div v-else class="technical-minute-notice" role="note"><b>数据状态</b><span>{{ minuteResult.summary || '分时缠论模块暂不可用，尚未生成 5 分钟派生结构。' }}</span></div>
+        <dl class="technical-minute-metrics">
+          <div><dt>1 分钟点</dt><dd>{{ minuteResult.pointCount ?? '--' }}</dd></div>
+          <div><dt>5 分钟 bar</dt><dd>{{ minuteResult.derivedBarCount ?? '--' }}</dd></div>
+          <div><dt>分型</dt><dd>{{ minuteResult.fractalCount ?? 0 }}</dd></div>
+          <div><dt>笔</dt><dd>{{ minuteResult.strokeCount ?? 0 }}</dd></div>
+          <div><dt>中枢</dt><dd>{{ minuteResult.zhongshuCount ?? 0 }}</dd></div>
+          <div><dt>信号</dt><dd>{{ minuteResult.signalCount ?? 0 }}</dd></div>
+        </dl>
+        <p class="technical-minute-state">{{ minuteResult.available === false ? (minuteResult.summary || minuteResult.currentState || '分时结构不可用') : (minuteResult.currentState || minuteResult.summary || '结构形成中') }}</p>
+        <ul v-if="minuteWarnings.length" class="technical-warning-list"><li v-for="item in minuteWarnings" :key="String(item)">{{ item }}</li></ul>
+        <TechnicalDetail :value="minuteResult.signals" empty-text="暂无分时缠论买卖点" />
       </section>
     </template>
 
     <template v-else>
       <section class="technical-scan-status card">
-        <div class="technical-card-heading"><div><h3>全市场扫描</h3><p>从本地 K 线缓存中筛选技术信号较强的候选股</p></div><span class="technical-scan-state" :class="scan.status">{{ scanStatusLabel }}</span></div>
+        <div class="technical-card-heading"><div><h3>全市场扫描</h3><p>从本地 K 线缓存中筛选技术信号较强的候选股</p></div><div class="technical-scan-heading-actions"><span class="technical-scan-state" :class="scan.status">{{ scanStatusLabel }}</span><button v-if="scanActive && scan.jobId" class="technical-cancel-scan-btn" type="button" :disabled="scan.cancelling" @click="cancelScan(period)">{{ scan.cancelling ? '取消中…' : '取消扫描' }}</button></div></div>
         <div v-if="scan.status !== 'idle'" class="technical-progress-block">
           <div class="technical-progress-copy"><span>{{ scan.stage || '等待扫描进度' }}</span><b>{{ Math.round(scan.progress) }}%</b></div>
           <div class="technical-progress-track"><span :style="{ width: `${scan.progress}%` }"></span></div>

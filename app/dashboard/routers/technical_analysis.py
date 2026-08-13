@@ -137,6 +137,24 @@ def create_technical_analysis_router(
             )
         return json_response(request, payload, cache_control="no-store")
 
+    @router.delete("/api/technical-analysis/scans/{job_id}")
+    async def cancel_scan(request: Request, job_id: str) -> Response:
+        limited = await enforce_api_limits(request)
+        if limited is not None:
+            return limited
+        if not re.fullmatch(r"[0-9a-f]{32}", str(job_id or "")):
+            return JSONResponse(
+                {"error": "scan_not_found"}, status_code=404,
+                headers={"Cache-Control": "no-store"},
+            )
+        payload = await run_in_threadpool(scans.cancel, job_id)
+        if payload is None:
+            return JSONResponse(
+                {"error": "scan_not_found"}, status_code=404,
+                headers={"Cache-Control": "no-store"},
+            )
+        return json_response(request, payload, cache_control="no-store")
+
     return router
 
 

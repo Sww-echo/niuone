@@ -419,6 +419,7 @@ class DashboardAuthTests(unittest.TestCase):
         expected_paths = {
             "/",
             "/practice",
+            "/technical-analysis",
             "/watchlist",
             "/niuone-mainline",
             "/indices",
@@ -3749,9 +3750,9 @@ console.log(JSON.stringify([
             ROOT / 'web' / 'src' / 'components' / 'NiuOneMainlinePanel.vue'
         ).read_text(encoding='utf-8')
 
-        for route in ('/practice', '/watchlist', '/niuone-mainline', '/indices', '/industry-flow', '/dragon-tiger', '/market-monitor', '/x-monitor', '/us-ratings'):
+        for route in ('/practice', '/technical-analysis', '/watchlist', '/niuone-mainline', '/indices', '/industry-flow', '/dragon-tiger', '/market-monitor', '/x-monitor', '/us-ratings'):
             self.assertIn(f"'{route}'", router_source)
-        self.assertIn("const CATEGORY_ORDER = ['practice', 'watchlist', 'niuone_mainline', 'indices', 'market_monitor', 'dragon_tiger', 'x_monitor', 'us_ratings']", tabs_source)
+        self.assertIn("const CATEGORY_ORDER = ['practice', 'technical_analysis', 'watchlist', 'niuone_mainline', 'indices', 'market_monitor', 'dragon_tiger', 'x_monitor', 'us_ratings']", tabs_source)
         self.assertIn("niuone_mainline: '题材强度'", tabs_source)
         self.assertIn("industry_flow: '/industry-flow'", tabs_source)
         self.assertIn("const LEGACY_CATEGORY_ALIASES = { b1_screen: 'practice' }", tabs_source)
