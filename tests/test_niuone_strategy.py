@@ -256,6 +256,37 @@ def reversal_candidate(**updates) -> dict:
 
 
 class NiuOneStrategyTests(unittest.TestCase):
+    def test_compact_stock_context_fails_closed_without_strong_score(self):
+        rows = make_rows("600000", "半导体", 0.02)
+        context = {
+            "market": {
+                "state": "offensive",
+                "score": 78,
+                "hard_stop": False,
+                "allow_new_buys": True,
+            },
+            "themes": {
+                "半导体": {
+                    "state": "mainline",
+                    "score": 82.0,
+                    "cross_day_confirmed": True,
+                    "mainline_confirmed": True,
+                },
+            },
+            "stocks": {
+                "600000": {
+                    "theme_attributions": [{
+                        "theme": "半导体",
+                        "attribution_score": 88.0,
+                    }],
+                },
+            },
+        }
+
+        result = score_niu_leader(rows, context)
+
+        self.assertIsNone(result)
+
     def test_candidate_evidence_distinguishes_same_code_observations(self):
         first = {
             "code": "600000",

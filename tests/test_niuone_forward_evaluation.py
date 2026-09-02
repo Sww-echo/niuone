@@ -419,7 +419,7 @@ def operating_settings(*times: str) -> dict[str, str]:
 
 class NiuOneForwardEvaluationTests(unittest.TestCase):
     def test_protocol_identity_covers_evidence_pipeline_and_effective_paths(self):
-        self.assertEqual(DEFAULT_COHORT_START, "2026-08-31")
+        self.assertEqual(DEFAULT_COHORT_START, "2026-09-03")
         expected_sources = {
             "app/automation/cron.py",
             "app/automation/scheduler_service.py",
@@ -2738,7 +2738,7 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
 
         self.assertEqual(report["overall"]["completed_trade_count"], 1)
         self.assertEqual(report["coverage"]["duplicate_trade_count"], 2)
-        self.assertEqual(report["protocol"]["version"], "niuone-strict-forward-v47")
+        self.assertEqual(report["protocol"]["version"], "niuone-strict-forward-v48")
         self.assertEqual(
             report["protocol"][
                 "niuone_markup_upgrade_absolute_position_cap_pct"

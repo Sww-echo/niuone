@@ -14,6 +14,65 @@ from screening import holding_cycle  # noqa: E402
 
 
 class HoldingFastCycleTests(unittest.TestCase):
+    def test_merges_complete_stock_profiles_with_fresh_operational_context(self):
+        complete = {
+            "market": {"state": "defensive"},
+            "themes": {"旧题材": {"state": "candidate", "score": 55}},
+            "stocks": {
+                "600001": {
+                    "industry": "新题材",
+                    "strong_score": 88.0,
+                    "strong": True,
+                    "theme_profiles": [{
+                        "industry": "新题材",
+                        "strong_score": 88.0,
+                        "attribution_score": 70.0,
+                    }],
+                    "theme_attributions": [{
+                        "theme": "新题材",
+                        "attribution_score": 70.0,
+                    }],
+                },
+            },
+        }
+        operational = {
+            "market": {"state": "offensive"},
+            "themes": {
+                "新题材": {"state": "mainline", "score": 82.0},
+            },
+            "stocks": {
+                "600001": {
+                    "theme_attributions": [{
+                        "theme": "新题材",
+                        "attribution_score": 91.0,
+                        "attribution_weight": 0.8,
+                    }],
+                },
+                "600002": {
+                    "theme_attributions": [{
+                        "theme": "新题材",
+                        "attribution_score": 85.0,
+                    }],
+                },
+            },
+        }
+
+        merged = holding_cycle.merge_niuone_holding_cycle_context(
+            complete,
+            operational,
+        )
+
+        self.assertEqual(merged["market"]["state"], "offensive")
+        self.assertEqual(merged["themes"]["新题材"]["state"], "mainline")
+        self.assertEqual(merged["stocks"]["600001"]["strong_score"], 88.0)
+        self.assertEqual(
+            merged["stocks"]["600001"]["theme_profiles"][0][
+                "attribution_score"
+            ],
+            91.0,
+        )
+        self.assertNotIn("600002", merged["stocks"])
+
     def test_rescores_only_supplied_holdings_with_active_scorers(self):
         calls = {"symbols": [], "analysis": []}
 
@@ -204,6 +263,53 @@ class HoldingFastCycleTests(unittest.TestCase):
         self.assertEqual(payload["holding_cycle_error"], "OSError")
         self.assertEqual(payload["trade_items"], [])
         self.assertTrue(payload["holding_cycle_only"])
+
+    def test_scoring_exception_is_reported_without_exposing_exception_text(self):
+        with (
+            patch.object(
+                holding_cycle,
+                "_active_scorers",
+                return_value=({"test_strategy": object()}, None, None, 1),
+            ),
+            patch.object(
+                holding_cycle,
+                "prepare_strategy_rows",
+                return_value=[{"date": "2026-08-26"}],
+            ),
+            patch.object(
+                holding_cycle,
+                "analyze_all_strategies",
+                side_effect=KeyError("private scorer detail"),
+            ),
+            patch.object(
+                holding_cycle,
+                "resolve_quote_trading_dates",
+                return_value=("2026-08-27", "2026-08-26"),
+            ),
+        ):
+            payload = holding_cycle.build_holding_cycle_payload(
+                [{"code": "600001", "name": "持仓甲", "qty": 100}],
+                {},
+                now=datetime(2026, 8, 27, 10, 5, 0),
+                quote_fetcher=lambda _symbols, **_kwargs: {
+                    "sh600001": {
+                        "name": "持仓甲",
+                        "price": 10.5,
+                        "quote_time": "20260827100500",
+                    },
+                },
+                history_loader=lambda *_args, **_kwargs: {
+                    "sh600001": [{"date": "2026-08-26"}],
+                },
+                board_loader=lambda _path: {},
+            )
+
+        self.assertEqual(payload["holding_cycle_data_status"], "scoring_error")
+        self.assertEqual(
+            payload["holding_cycle_scoring_errors"],
+            [{"error_type": "KeyError", "count": 1}],
+        )
+        self.assertNotIn("private scorer detail", str(payload))
 
 
 if __name__ == "__main__":

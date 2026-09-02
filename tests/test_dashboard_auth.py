@@ -1527,6 +1527,82 @@ console.log(JSON.stringify({
         self.assertEqual(payload['items'], [display_candidate])
         self.assertEqual(payload['observed_items'], [display_candidate])
 
+    def test_holding_fast_cycle_log_distinguishes_holdings_from_full_candidates(self):
+        calls = {'entries': []}
+
+        class TraderStub:
+            def now_ts(self):
+                return '2026-09-02 11:14:12'
+
+            def record_decision_log_entry(self, entry, mark_b1_done=False):
+                calls['entries'].append((entry, mark_b1_done))
+
+            def run_decision_after_b1(self, payload):
+                calls['decision_payload'] = payload
+                return {'decision': {'summary': '持仓复核完成'}, 'executed': []}
+
+        original_get_trader = dashboard.get_trader_module
+        try:
+            dashboard.get_trader_module = lambda: TraderStub()
+            result = dashboard.run_practice_decision_logged(
+                {
+                    'generated_at': '2026-09-02 11:14:09',
+                    'items': [],
+                    'trade_items': [],
+                    'observed_items': [],
+                    'holding_cycle_only': True,
+                    'holding_cycle_codes': [
+                        '600001',
+                        '600002',
+                        '000001',
+                        '000002',
+                    ],
+                    'decision_cycle_kind': 'holding_fast',
+                    'holding_cycle_data_status': 'scoring_unavailable',
+                    'schedule_run_kind': 'holding_fast',
+                },
+                record_start=True,
+                refresh_market_summary=False,
+            )
+        finally:
+            dashboard.get_trader_module = original_get_trader
+
+        self.assertEqual(result['decision']['summary'], '持仓复核完成')
+        entry, mark_done = calls['entries'][0]
+        self.assertFalse(mark_done)
+        self.assertEqual(
+            entry['decision']['summary'],
+            '持仓快周期开始：当前持仓4只，持仓评分不可用（成功重评0只），'
+            '未生成加仓候选；开始执行已有持仓的原策略退出规则和模型持仓复核。',
+        )
+        self.assertEqual(
+            entry['trade_reason'],
+            '持仓快周期开始：当前持仓4只，成功重评0只，加仓候选0只，'
+            '开始退出检查和模型持仓复核；持仓评分不可用',
+        )
+        self.assertNotIn('候选池0只', entry['decision']['summary'])
+
+    def test_holding_fast_cycle_log_reports_ready_add_candidates(self):
+        summary, trade_reason = dashboard.holding_cycle_start_messages(
+            {
+                'holding_cycle_codes': ['600001', '600002', '000001', '000002'],
+                'holding_cycle_data_status': 'ready',
+            },
+            observed_count=4,
+            item_count=2,
+        )
+
+        self.assertEqual(
+            summary,
+            '持仓快周期开始：当前持仓4只，成功重评4只，其中2只达到加仓候选条件；'
+            '开始执行已有持仓的原策略退出规则和模型持仓复核。',
+        )
+        self.assertEqual(
+            trade_reason,
+            '持仓快周期开始：当前持仓4只，成功重评4只，加仓候选2只，'
+            '开始退出检查和模型持仓复核；持仓数据正常',
+        )
+
     def test_no_candidate_b1_still_refreshes_and_logs_market_context(self):
         calls = {'summary_trigger': '', 'entries': []}
         summary = {
@@ -8346,7 +8422,7 @@ process.stdout.write(JSON.stringify({{
             if item['name'] == dashboard.NIUONE_FORWARD_COHORT_START_ENV
         )
 
-        self.assertEqual(item['default'], '2026-08-31')
+        self.assertEqual(item['default'], '2026-09-03')
         self.assertEqual(item['effect'], 'next_run')
         preflight = next(
             item
@@ -8875,6 +8951,144 @@ process.stdout.write(JSON.stringify({{
         self.assertEqual(payload['schedule_run_kind'], 'holding_fast')
         self.assertFalse(kwargs['decision_blocking'])
         self.assertEqual(result['decision_cycle_kind'], 'holding_fast')
+
+    def test_holding_fast_cycle_context_restores_complete_stock_profiles(self):
+        original_minute = dashboard.NIUONE_MAINLINE_MINUTE_CACHE_FILE
+        original_full = dashboard.NIUONE_MAINLINE_CACHE_FILE
+        original_multi = dashboard.MULTI_STRATEGY_CACHE_FILE
+        original_b1 = dashboard.B1_CACHE_FILE
+        dashboard.NIUONE_MAINLINE_MINUTE_CACHE_FILE = (
+            self.tmp_path / 'niuone_mainline_minute_latest.json'
+        )
+        dashboard.NIUONE_MAINLINE_CACHE_FILE = (
+            self.tmp_path / 'niuone_mainline_latest.json'
+        )
+        dashboard.MULTI_STRATEGY_CACHE_FILE = (
+            self.tmp_path / 'multi_strategy_latest.json'
+        )
+        dashboard.B1_CACHE_FILE = self.tmp_path / 'b1_screen_latest.json'
+        try:
+            dashboard.write_json_cache(
+                dashboard.MULTI_STRATEGY_CACHE_FILE,
+                {
+                    'generated_at': '2026-09-02 10:00:00',
+                    'niuone_context': {
+                        'market': {'state': 'defensive'},
+                        'themes': {},
+                        'stocks': {
+                            '600001': {
+                                'industry': '半导体',
+                                'strong_score': 88.0,
+                                'theme_profiles': [{
+                                    'industry': '半导体',
+                                    'strong_score': 88.0,
+                                }],
+                            },
+                        },
+                    },
+                },
+            )
+            dashboard.write_json_cache(
+                dashboard.NIUONE_MAINLINE_MINUTE_CACHE_FILE,
+                {
+                    'generated_at': '2026-09-02 10:05:00',
+                    'niuone_context': {
+                        'market': {'state': 'offensive'},
+                        'themes': {
+                            '半导体': {'state': 'mainline', 'score': 82.0},
+                        },
+                        'stocks': {
+                            '600001': {
+                                'theme_attributions': [{
+                                    'theme': '半导体',
+                                    'attribution_score': 91.0,
+                                }],
+                            },
+                        },
+                    },
+                },
+            )
+
+            payload = dashboard.practice_fast_cycle_context_payload(
+                datetime(2026, 9, 2, 10, 6),
+            )
+
+            context = payload['niuone_context']
+            self.assertEqual(context['market']['state'], 'offensive')
+            self.assertEqual(context['stocks']['600001']['strong_score'], 88.0)
+            self.assertEqual(
+                context['stocks']['600001']['theme_attributions'][0][
+                    'attribution_score'
+                ],
+                91.0,
+            )
+            self.assertEqual(
+                payload['niuone_stock_profiles_generated_at'],
+                '2026-09-02 10:00:00',
+            )
+        finally:
+            dashboard.NIUONE_MAINLINE_MINUTE_CACHE_FILE = original_minute
+            dashboard.NIUONE_MAINLINE_CACHE_FILE = original_full
+            dashboard.MULTI_STRATEGY_CACHE_FILE = original_multi
+            dashboard.B1_CACHE_FILE = original_b1
+
+    def test_holding_fast_cycle_context_rejects_profiles_from_prior_day(self):
+        original_minute = dashboard.NIUONE_MAINLINE_MINUTE_CACHE_FILE
+        original_full = dashboard.NIUONE_MAINLINE_CACHE_FILE
+        original_multi = dashboard.MULTI_STRATEGY_CACHE_FILE
+        original_b1 = dashboard.B1_CACHE_FILE
+        dashboard.NIUONE_MAINLINE_MINUTE_CACHE_FILE = (
+            self.tmp_path / 'niuone_mainline_minute_latest.json'
+        )
+        dashboard.NIUONE_MAINLINE_CACHE_FILE = (
+            self.tmp_path / 'niuone_mainline_latest.json'
+        )
+        dashboard.MULTI_STRATEGY_CACHE_FILE = (
+            self.tmp_path / 'multi_strategy_latest.json'
+        )
+        dashboard.B1_CACHE_FILE = self.tmp_path / 'b1_screen_latest.json'
+        try:
+            dashboard.write_json_cache(
+                dashboard.MULTI_STRATEGY_CACHE_FILE,
+                {
+                    'generated_at': '2026-09-01 14:52:00',
+                    'niuone_context': {
+                        'stocks': {
+                            '600001': {
+                                'strong_score': 88.0,
+                                'theme_profiles': [],
+                            },
+                        },
+                    },
+                },
+            )
+            dashboard.write_json_cache(
+                dashboard.NIUONE_MAINLINE_MINUTE_CACHE_FILE,
+                {
+                    'generated_at': '2026-09-01 15:00:00',
+                    'niuone_context': {
+                        'market': {'state': 'offensive'},
+                        'stocks': {
+                            '600001': {'theme_attributions': []},
+                        },
+                    },
+                },
+            )
+
+            payload = dashboard.practice_fast_cycle_context_payload(
+                datetime(2026, 9, 2, 9, 30),
+            )
+
+            self.assertEqual(payload['niuone_context']['stocks'], {})
+            self.assertEqual(
+                payload['niuone_stock_profiles_generated_at'],
+                '',
+            )
+        finally:
+            dashboard.NIUONE_MAINLINE_MINUTE_CACHE_FILE = original_minute
+            dashboard.NIUONE_MAINLINE_CACHE_FILE = original_full
+            dashboard.MULTI_STRATEGY_CACHE_FILE = original_multi
+            dashboard.B1_CACHE_FILE = original_b1
 
     def test_practice_schedule_setting_migrates_legacy_dashboard_env_key(self):
         original_env_file = dashboard.DASHBOARD_ENV_FILE

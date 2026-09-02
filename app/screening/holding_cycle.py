@@ -8,6 +8,7 @@ symbol and never writes the full-scan caches.
 from __future__ import annotations
 
 import re
+from collections import Counter
 from collections.abc import Callable, Mapping
 from datetime import datetime
 from typing import Any
@@ -48,6 +49,121 @@ from strategies.selection import candidate_is_trade_ready, select_trade_candidat
 HOLDING_CYCLE_KIND = "holding_fast"
 DEFAULT_QUOTE_TIMEOUT_SECONDS = 5.0
 DEFAULT_QUOTE_MAX_ATTEMPTS = 2
+
+_ATTRIBUTION_PROFILE_FIELDS = {
+    "theme_member_count": "theme_member_count",
+    "membership_source": "theme_membership_source",
+    "current_score": "current_attribution_score",
+    "historical_prior_score": "historical_prior_score",
+    "attribution_score": "attribution_score",
+    "attribution_weight": "attribution_weight",
+    "leadership_eligible": "leadership_eligible",
+    "cohort_alignment_score": "cohort_alignment_score",
+    "peer_resonance_score": "peer_resonance_score",
+    "return_correlation_score": "return_correlation_score",
+    "return_correlation_rank_score": "return_correlation_rank_score",
+    "return_correlation_observation_count": (
+        "return_correlation_observation_count"
+    ),
+    "return_correlation_peer_count": "return_correlation_peer_count",
+    "theme_specificity_score": "theme_specificity_score",
+    "observation_count": "attribution_observation_count",
+    "wave_count": "attribution_wave_count",
+}
+
+
+def _merge_live_attribution(
+    profile: Mapping[str, Any],
+    attribution: Mapping[str, Any],
+) -> dict[str, Any]:
+    merged = dict(profile)
+    for source_key, target_key in _ATTRIBUTION_PROFILE_FIELDS.items():
+        if source_key in attribution:
+            merged[target_key] = attribution.get(source_key)
+    return merged
+
+
+def merge_niuone_holding_cycle_context(
+    full_context: Mapping[str, Any] | None,
+    operational_context: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Combine fresh theme state with scorer-complete stock profiles.
+
+    The dedicated minute cache intentionally persists only per-stock theme
+    attributions.  Those compact rows are sufficient for cross-day mainline
+    state, but the ordinary NiuOne scorers also require fields such as
+    ``strong_score`` and ``theme_profiles``.  Keep the newest operational
+    market/theme state while restoring only stock profiles present in the
+    latest complete scan.  Compact-only stocks remain absent and therefore
+    fail closed instead of being treated as complete scorer inputs.
+    """
+
+    complete = dict(full_context) if isinstance(full_context, Mapping) else {}
+    operational = (
+        dict(operational_context)
+        if isinstance(operational_context, Mapping)
+        else {}
+    )
+    merged = dict(complete)
+    merged.update({
+        key: value
+        for key, value in operational.items()
+        if key != "stocks"
+    })
+
+    complete_stocks = (
+        complete.get("stocks")
+        if isinstance(complete.get("stocks"), Mapping)
+        else {}
+    )
+    operational_stocks = (
+        operational.get("stocks")
+        if isinstance(operational.get("stocks"), Mapping)
+        else {}
+    )
+    merged_stocks: dict[str, dict[str, Any]] = {}
+    for raw_code, raw_profile in complete_stocks.items():
+        if not isinstance(raw_profile, Mapping):
+            continue
+        code = str(raw_code)
+        profile = dict(raw_profile)
+        live_stock = operational_stocks.get(code)
+        live_attributions = (
+            [
+                dict(item)
+                for item in list(live_stock.get("theme_attributions") or [])
+                if isinstance(item, Mapping)
+            ]
+            if isinstance(live_stock, Mapping)
+            else []
+        )
+        if live_attributions:
+            profile["theme_attributions"] = live_attributions
+            by_theme = {
+                str(item.get("theme") or ""): item
+                for item in live_attributions
+                if str(item.get("theme") or "")
+            }
+            profile_theme = str(profile.get("industry") or "")
+            if profile_theme in by_theme:
+                profile = _merge_live_attribution(
+                    profile,
+                    by_theme[profile_theme],
+                )
+            raw_theme_profiles = profile.get("theme_profiles")
+            if isinstance(raw_theme_profiles, list):
+                profile["theme_profiles"] = [
+                    _merge_live_attribution(
+                        item,
+                        by_theme.get(str(item.get("industry") or ""), {}),
+                    )
+                    if isinstance(item, Mapping)
+                    else item
+                    for item in raw_theme_profiles
+                ]
+        merged_stocks[code] = profile
+    merged["stocks"] = merged_stocks
+    return merged
 
 
 def _normalize_code(value: Any) -> str:
@@ -359,6 +475,7 @@ def build_holding_cycle_payload(
     )
     results: list[dict[str, Any]] = []
     failures: list[str] = []
+    scoring_errors: Counter[str] = Counter()
     for code in codes:
         holding = by_code[code]
         symbol = _tencent_symbol(code)
@@ -410,8 +527,9 @@ def build_holding_cycle_payload(
                 enrich_legacy_indicators=not prompt_only,
                 minimum_rows=minimum_rows,
             )
-        except Exception:
+        except Exception as exc:
             failures.append(code)
+            scoring_errors[type(exc).__name__] += 1
             continue
         if not isinstance(multi, Mapping):
             continue
@@ -448,11 +566,17 @@ def build_holding_cycle_payload(
         "trade_count": len(trade_items),
         "holding_cycle_analysis_count": len(results),
         "holding_cycle_unavailable_codes": failures,
+        "holding_cycle_scoring_errors": [
+            {"error_type": error_type, "count": count}
+            for error_type, count in sorted(scoring_errors.items())
+        ],
         "holding_cycle_data_status": (
             "ready"
             if len(results) == len(codes)
             else "partial"
             if results
+            else "scoring_error"
+            if scoring_errors
             else "scoring_unavailable"
         ),
     })
@@ -464,4 +588,5 @@ __all__ = [
     "DEFAULT_QUOTE_TIMEOUT_SECONDS",
     "HOLDING_CYCLE_KIND",
     "build_holding_cycle_payload",
+    "merge_niuone_holding_cycle_context",
 ]

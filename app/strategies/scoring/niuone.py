@@ -2660,7 +2660,11 @@ def _entry_metrics(
         float(common["stop_atr"]),
         regime,
     )
-    score_before_external = (float(theme["score"]) * 0.55 + float(stock["strong_score"]) * 0.45) / 10
+    theme_score = safe_float(theme.get("score"))
+    stock_score = safe_float(stock.get("strong_score"))
+    if theme_score is None or stock_score is None:
+        return None
+    score_before_external = (theme_score * 0.55 + stock_score * 0.45) / 10
     raw_external = float(stock.get("dragon_tiger_adjustment") or 0.0) + float(stock.get("news_adjustment") or 0.0)
     positive_suppressed = bool(
         raw_external > 0 and float(common["extension_atr"]) > 1.5

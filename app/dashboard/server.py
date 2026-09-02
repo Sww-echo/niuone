@@ -161,6 +161,7 @@ from screening.candidate_cache import (
 from screening.holding_cycle import (
     HOLDING_CYCLE_KIND,
     build_holding_cycle_payload,
+    merge_niuone_holding_cycle_context,
 )
 from screening.niuone_mainline_cache import (
     build_niuone_mainline_summary_cache_payload,
@@ -361,7 +362,7 @@ DEFAULT_PRACTICE_FAST_CYCLE_INTERVAL_SECONDS = 300
 MIN_PRACTICE_FAST_CYCLE_INTERVAL_SECONDS = 60
 MAX_PRACTICE_FAST_CYCLE_INTERVAL_SECONDS = 900
 NIUONE_FORWARD_COHORT_START_ENV = "DASHBOARD_NIUONE_FORWARD_COHORT_START"
-DEFAULT_NIUONE_FORWARD_COHORT_START = "2026-08-31"
+DEFAULT_NIUONE_FORWARD_COHORT_START = "2026-09-03"
 
 
 def resolve_practice_schedule_times(values: Mapping[str, str] | None = None) -> tuple[str, ...]:
@@ -2359,6 +2360,51 @@ def record_practice_decision_event(
         print(f"[WARN] 写入实战页面决策日志失败: {type(exc).__name__}: {exc}", flush=True)
 
 
+HOLDING_CYCLE_STATUS_LABELS = {
+    "ready": "持仓数据正常",
+    "partial": "部分持仓数据不可用",
+    "scoring_unavailable": "持仓评分不可用",
+    "scoring_error": "持仓评分发生错误",
+    "scorer_config_unavailable": "策略评分配置不可用",
+    "no_active_scorers": "没有启用的策略评分器",
+    "quote_unavailable": "持仓行情不可用",
+    "stale_or_missing_quotes": "持仓行情缺失或已过期",
+    "history_unavailable": "持仓日K数据不可用",
+    "empty_portfolio": "当前没有持仓",
+}
+
+
+def holding_cycle_start_messages(
+    payload: dict[str, Any],
+    *,
+    observed_count: int,
+    item_count: int,
+) -> tuple[str, str]:
+    holding_codes = {
+        str(code).strip()
+        for code in (payload.get("holding_cycle_codes") or [])
+        if str(code).strip()
+    }
+    holding_count = max(len(holding_codes), observed_count, item_count)
+    status = str(payload.get("holding_cycle_data_status") or "ready").strip()
+    status_label = HOLDING_CYCLE_STATUS_LABELS.get(status, "持仓评分状态未知")
+    if status == "ready":
+        scoring_note = f"成功重评{observed_count}只"
+    else:
+        scoring_note = f"{status_label}（成功重评{observed_count}只）"
+    candidate_note = (
+        f"其中{item_count}只达到加仓候选条件"
+        if item_count
+        else "未生成加仓候选"
+    )
+    return (
+        f"持仓快周期开始：当前持仓{holding_count}只，{scoring_note}，{candidate_note}；"
+        "开始执行已有持仓的原策略退出规则和模型持仓复核。",
+        f"持仓快周期开始：当前持仓{holding_count}只，成功重评{observed_count}只，"
+        f"加仓候选{item_count}只，开始退出检查和模型持仓复核；{status_label}",
+    )
+
+
 def run_practice_decision_logged(
     b1_payload: dict[str, Any],
     *,
@@ -2389,7 +2435,23 @@ def run_practice_decision_logged(
     if payload.get("schedule_slot"):
         kind_label = "补跑" if payload.get("schedule_run_kind") == "catchup" else "定时"
         slot_note = f"（计划{str(payload.get('schedule_slot'))[-5:]}{kind_label}）"
-    if not item_count:
+    holding_cycle = (
+        payload.get("holding_cycle_only") is True
+        or payload.get("decision_cycle_kind") == HOLDING_CYCLE_KIND
+        or payload.get("schedule_run_kind") == HOLDING_CYCLE_KIND
+    )
+    if holding_cycle and (record_start or not item_count):
+        holding_summary, holding_reason = holding_cycle_start_messages(
+            payload,
+            observed_count=observed_count,
+            item_count=item_count,
+        )
+        record_practice_decision_event(
+            payload,
+            holding_summary,
+            holding_reason,
+        )
+    elif not item_count:
         record_practice_decision_event(
             payload,
             f"选股完成{slot_note}：候选池{observed_count}只，其中0只进入买卖决策，"
@@ -4474,7 +4536,9 @@ def b1_schedule_loop() -> None:
         time.sleep(15)
 
 
-def practice_fast_cycle_context_payload() -> dict[str, Any]:
+def practice_fast_cycle_context_payload(
+    now: datetime | None = None,
+) -> dict[str, Any]:
     """Combine the latest complete scan with the freshest NiuOne context."""
 
     payload: dict[str, Any] = {}
@@ -4486,12 +4550,30 @@ def practice_fast_cycle_context_payload() -> dict[str, Any]:
             payload.get("generated_at") or ""
         ):
             payload = dict(candidate)
+    complete_context = payload.get("niuone_context")
     niuone_payload = load_niuone_mainline_cache_payload()
     niuone_context = niuone_payload.get("niuone_context")
     if isinstance(niuone_context, dict):
-        payload["niuone_context"] = dict(niuone_context)
+        complete_generated_at = str(payload.get("generated_at") or "")[:19]
+        operational_generated_at = str(
+            niuone_payload.get("generated_at") or ""
+        )[:19]
+        complete_date = complete_generated_at[:10]
+        operational_date = operational_generated_at[:10]
+        current_date = (now or current_cn_datetime()).strftime("%Y-%m-%d")
+        complete_is_current = bool(
+            isinstance(complete_context, Mapping)
+            and complete_date == operational_date == current_date
+        )
+        payload["niuone_context"] = merge_niuone_holding_cycle_context(
+            complete_context if complete_is_current else {},
+            niuone_context,
+        )
         payload["niuone_context_generated_at"] = str(
             niuone_payload.get("generated_at") or ""
+        )
+        payload["niuone_stock_profiles_generated_at"] = (
+            complete_generated_at if complete_is_current else ""
         )
     return payload
 
