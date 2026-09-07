@@ -1556,6 +1556,7 @@ class SellStrategyRuleTests(unittest.TestCase):
                         "avg_cost": 9.0,
                         "last_price": 10.0,
                         "buy_strategy": "niu_leader",
+                        "mainline_state": "inactive",
                         "buy_date_lots": {
                             "2026-06-23": 800,
                             trader.today_key(): 200,

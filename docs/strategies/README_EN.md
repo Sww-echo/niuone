@@ -369,3 +369,10 @@ The administrator page builds its candidate universe from the current A-share li
 - Do not use this project as a substitute for licensed institutional services, professional risk assessment, or your own independent judgment.
 - Historical replay, rule scores, and simulation results do not represent future performance.
 - When adding data sources, verify data licensing, request-frequency limits, privacy requirements, and redistribution terms.
+
+
+### v52: require observed evidence for model hard exits
+
+NiuOne model SELLs cannot bypass staged exits through stop-loss/breakdown wording, missing reasons, or supplied execution labels. Execution and local risk checks share observed conditions: current price below the effective structural/breakeven stop, an inactive theme, or a market hard stop with a weak theme. Structural stops use current prices so stale daily closes cannot trigger or delay them; other strategies retain their close-based rules. Unconfirmed model exits follow the existing score veto, partial reduction and cross-session confirmation. Local polling preserves model confirmations; explicit HOLD resets them. Validated priority replacements, T+1, and local ATR/expiry exits retain their constraints.
+
+Fills persist the original model reason, numerical hard-exit evidence, actual signal and reduction ratio. Strict-forward checks recompute the hard conditions and staged quantity instead of treating every difference from requested shares as invalid. The protocol advances to `niuone-strict-forward-v52`; daily backtests do not simulate model SELLs and already check intraday lows against structural stops, so they remain `niuone-backtest-v42`. Entry activity gates and `probe-chase-forward-v1` parameters remain fixed. Any return improvement from these execution fixes still requires prospective evidence.

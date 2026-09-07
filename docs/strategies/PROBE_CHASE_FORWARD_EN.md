@@ -1,6 +1,6 @@
 # Probe chase forward comparison
 
-`probe-chase-forward-v1` is frozen before first sampling on September 8, 2026, under the strict-forward v51 protocol and source fingerprint. It measures the conditional effect of the first-Probe price-gain gate below 3%; actual orders, holdings, exits, and risk budgets retain their rules.
+`probe-chase-forward-v1` is frozen before first sampling on September 8, 2026, under the strict-forward v52 protocol and source fingerprint. It measures the conditional effect of the first-Probe price-gain gate below 3%; actual orders, holdings, exits, and risk budgets retain their rules.
 
 ## Sampling and arms
 

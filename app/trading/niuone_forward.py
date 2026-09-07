@@ -41,6 +41,7 @@ from app.strategies.exits import (
     SOFT_EXIT_CONFIRMATIONS,
     SOFT_EXIT_REDUCE_RATIO,
     SOFT_EXIT_SCORE_VETO_THRESHOLD,
+    niuone_hard_exit_evidence,
 )
 from app.strategies.exit_feedback import (
     EXIT_FEEDBACK_ALGORITHM_VERSION,
@@ -83,7 +84,7 @@ DEFAULT_HISTORICAL_REFERENCE_WIN_RATE_PCT = 59.71
 DEFAULT_WIN_RATE_CONFIDENCE_LEVEL = 0.95
 DEFAULT_MAX_PORTFOLIO_DRAWDOWN_PCT = 6.0
 DEFAULT_MIN_RETURN_TO_DRAWDOWN_RATIO = 1.0
-FORWARD_PROTOCOL_VERSION = "niuone-strict-forward-v51"
+FORWARD_PROTOCOL_VERSION = "niuone-strict-forward-v52"
 FORWARD_PERFORMANCE_CLUSTER_UNIT = "entry_date_x_entry_theme"
 FORWARD_SHADOW_CANDIDATES = {
     "execution_gap": "round13_execution_gap_le_1pct",
@@ -694,16 +695,55 @@ def _summarize_niuone_sell_execution(
             and executed > available
         ):
             gaps.add("durable_sell_fill.shares")
+        staged_quantity = None
+        if sell_execution_source == "model_action":
+            evidence = fill.get("niuone_hard_exit_evidence")
+            try:
+                if not isinstance(evidence, Mapping) or evidence.get("schema_version") != 1:
+                    raise ValueError("missing hard-exit observations")
+                verified = niuone_hard_exit_evidence(
+                    strategy_id=_strategy_id(fill),
+                    current_price=float(evidence["current_price"]),
+                    structural_stop=float(evidence["structural_stop"]),
+                    market_hard_stop=evidence["market_hard_stop"] is True,
+                    theme_score=float(evidence["theme_score"]),
+                    theme_state=str(evidence["theme_state"]),
+                )
+                if (evidence.get("confirmed") is not verified["confirmed"]
+                        or evidence.get("signal") != verified["signal"]
+                        or not math.isfinite(float(fill.get("price") or 0))
+                        or abs(float(fill.get("price") or 0) - verified["current_price"]) > 0.00051):
+                    raise ValueError("inconsistent hard-exit observations")
+                if verified["confirmed"]:
+                    if fill.get("exit_signal") != verified["signal"]:
+                        raise ValueError("unverified exit signal")
+                else:
+                    stage = fill.get("soft_exit_stage")
+                    count = int(fill.get("soft_exit_confirmation_count") or 0)
+                    required = int(fill.get("soft_exit_confirmations_required") or 0)
+                    ratio = float(fill.get("soft_exit_reduce_ratio") or 0)
+                    if fill.get("exit_signal") != "model_soft_exit" or required < 2 or count < 1:
+                        raise ValueError("missing staged exit")
+                    if stage == "reduce" and 0 < ratio <= 0.75:
+                        staged_quantity = min(requested, int((available or 0) * ratio) // 100 * 100)
+                    elif stage == "exit" and count >= required:
+                        staged_quantity = available
+                    else:
+                        raise ValueError("unconfirmed staged exit")
+                    if executed != staged_quantity:
+                        raise ValueError("inconsistent staged quantity")
+            except (KeyError, TypeError, ValueError, OverflowError):
+                gaps.add("durable_sell_fill.niuone_exit_arbitration")
         if not isinstance(auto_reduced, bool):
             gaps.add("durable_sell_fill.sell_quantity_auto_reduced")
         elif auto_reduced:
             if not (
                 requested > (available or 0) > 0
                 and available % 100 == 0
-                and executed == available
+                and executed == (staged_quantity if staged_quantity is not None else available)
             ):
                 gaps.add("durable_sell_fill.sell_quantity_auto_reduced")
-        elif requested != executed:
+        elif requested != executed and staged_quantity is None:
             gaps.add("durable_sell_fill.sell_quantity_auto_reduced")
 
         requested_share_count += requested
@@ -3401,6 +3441,16 @@ def evaluate_niuone_forward(
                 "that available quantity; zero or non-whole-lot availability "
                 "and all non-NiuOne model SELL requests remain fail-closed"
             ),
+            "niuone_model_sell_arbitration_rule": (
+                "Model prose and supplied labels never authorize hard exits. "
+                "Verify execution price below structural/breakeven stop, inactive "
+                "theme, or market hard stop with weak theme using shared local rules. "
+                "All other model SELLs, including missing reasons, use staged soft "
+                "exits; polling preserves model confirmations and explicit HOLD "
+                "resets them. Validated priority replacements retain their policy."
+            ),
+            "niuone_hard_exit_evidence_schema_version": 1,
+            "niuone_structural_stop_price_source": "current_execution_quote",
             "performance_cluster_unit": (
                 FORWARD_PERFORMANCE_CLUSTER_UNIT
             ),

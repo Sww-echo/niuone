@@ -123,6 +123,7 @@ from strategies.exits import (
     evaluate_shaofu_soft_exit,
     evaluate_strategy_time_exit,
     niuone_climax_runner_active,
+    niuone_hard_exit_evidence,
     resolve_niuone_partial_take_profit,
 )
 from strategies.exit_feedback import (
@@ -6933,7 +6934,10 @@ def _resolve_staged_soft_exit(
     result["soft_exit_confirmation_count"] = count
     result["soft_exit_confirmations_required"] = required
     result["source_signal"] = source_signal
-    result["exit_rule"] = classify_exit_rule(reason, source_signal)
+    result["exit_rule"] = (
+        "model_sell" if source_signal == "model_soft_exit"
+        else classify_exit_rule(reason, source_signal)
+    )
     result["exit_feedback_policy_version"] = int(
         pos.get("exit_feedback_policy_version") or 0
     )
@@ -6949,6 +6953,24 @@ def _resolve_staged_soft_exit(
     else:
         result["reason"] = f"软退出跨交易日确认，清理观察仓；{reason}（确认{count}/{required}）"
     return result
+
+
+def _niuone_position_hard_exit_evidence(
+    pos: Mapping[str, Any], current_price: float,
+) -> dict[str, Any]:
+    stop = 0.0 if pos.get("shaofu_stop_source") == "fallback_pct" else _safe_float(
+        pos.get("shaofu_stop_price") or pos.get("entry_stop_price"), 0.0,
+    )
+    if NIUONE_BREAK_EVEN_AFTER_PARTIAL and pos.get("partial_tp_done"):
+        stop = max(stop, _safe_float(pos.get("avg_cost"), 0.0))
+    return niuone_hard_exit_evidence(
+        strategy_id=position_entry_strategy(pos),
+        current_price=current_price,
+        structural_stop=stop,
+        market_hard_stop=bool(pos.get("market_hard_stop")),
+        theme_score=_safe_float(pos.get("mainline_score"), 100.0),
+        theme_state=str(pos.get("mainline_state") or ""),
+    )
 
 
 def evaluate_sell_signal(
@@ -7089,7 +7111,13 @@ def evaluate_sell_signal(
         shaofu_stop = max(shaofu_stop, avg_cost)
         pos["entry_stop_price"] = round(shaofu_stop, 3)
         pos["entry_stop_source"] = "niu_breakeven"
-    if shaofu_stop > 0 and price < shaofu_stop:
+    if niuone_position:
+        hard_evidence = _niuone_position_hard_exit_evidence(pos, niuone_execution_price)
+        if hard_evidence["confirmed"]:
+            result = _sell_signal(hard_evidence["reason"], hard_evidence["signal"])
+            result["niuone_hard_exit_evidence"] = hard_evidence
+            return result
+    if not niuone_position and shaofu_stop > 0 and price < shaofu_stop:
         stop_labels = {
             "n_structure_low": "N型结构前低",
             "b1_low": "前置B1低点",
@@ -7133,16 +7161,6 @@ def evaluate_sell_signal(
                 if climax_runner_active
                 else NIUONE_LEADER_LOSS_CONFIRMATIONS
             )
-            if pos.get("market_hard_stop") and (theme_score < 55 or theme_state in {"fading", "inactive"}):
-                return _sell_signal(
-                    f"市场硬停止且主线转弱 ({pos.get('industry') or '-'}分数{theme_score:.1f}，状态{theme_state or '-'})",
-                    "niu_market_hard_stop",
-                )
-            if theme_state == "inactive":
-                return _sell_signal(
-                    f"主线失活 ({pos.get('industry') or '-'}分数{theme_score:.1f})",
-                    "niu_mainline_faded" if not reversal_probe else "niu_reversal_theme_failed",
-                )
             leader_lost_count = int(pos.get("niu_leader_lost_count") or 0)
             if not reversal_probe and leader_lost_count >= 1:
                 staged_soft_seen = True
@@ -7393,7 +7411,7 @@ def evaluate_sell_signal(
                 f"持仓到期 ({hold_days}d ≥ {max_hold_days}d)",
                 "max_hold_days",
             )
-        if not staged_soft_seen:
+        if not staged_soft_seen and pos.get("soft_exit_pending_signal") != "model_soft_exit":
             _clear_staged_soft_exit_pending(pos)
         return None
 
@@ -8973,6 +8991,7 @@ def check_auto_exits(
         }
         executed_trade.update(exit_feedback_trade_audit(state))
         for key in (
+            "niuone_hard_exit_evidence",
             "soft_exit_stage",
             "soft_exit_confirmation_count",
             "soft_exit_confirmations_required",
@@ -11035,6 +11054,10 @@ def execute_actions(
             break
         act = str(action.get("action") or "HOLD").upper()
         code = normalize_code(action.get("code") or "")
+        if act == "HOLD" and code:
+            held = positions.get(code) or {}
+            if held.get("soft_exit_pending_signal") == "model_soft_exit":
+                _clear_staged_soft_exit_pending(held)
         if not code or act == "HOLD":
             continue
         q = execution_quote(code)
@@ -11044,7 +11067,6 @@ def execute_actions(
         price_source = q.get("execution_price_source") or q.get("source") or "quote"
         candidate = cand_by_code.get(code) or {}
         name = action.get("name") or q.get("name") or candidate.get("name") or ""
-        model_reason_supplied = bool(str(action.get("reason") or "").strip())
         reason = _fallback_action_reason(action, candidate, act, name)
         action["reason"] = reason
         shares = parse_model_action_shares(action)
@@ -12924,22 +12946,26 @@ def execute_actions(
             avg_cost = float(pos.get("avg_cost") or 0)
             available_qty = available_to_sell(pos)
             model_requested_sell_shares = shares
-            model_exit_rule = classify_exit_rule(reason)
             replacement_intent = str(action.get("intent") or "").upper() == "REPLACE"
-            hard_exit_tokens = ("止损", "结构", "破位", "硬停止", "失活", "退幕")
+            hard_exit_confirmed = False
+            if is_niuone_strategy(entry_strategy) and not replacement_intent:
+                hard_evidence = _niuone_position_hard_exit_evidence(pos, float(price))
+                action["niuone_hard_exit_evidence"] = hard_evidence
+                action["model_original_sell_reason"] = reason
+                # Discard any model-provided execution labels before arbitration.
+                for key in ("source_signal", "exit_rule", "soft_exit_stage"):
+                    action.pop(key, None)
+                hard_exit_confirmed = bool(hard_evidence["confirmed"])
+                if hard_exit_confirmed:
+                    action["source_signal"] = hard_evidence["signal"]
+                    action["exit_rule"] = classify_exit_rule("", hard_evidence["signal"])
+                    reason = str(hard_evidence["reason"])
+                    action["reason"] = reason
             model_soft_exit = bool(
                 is_niuone_strategy(entry_strategy)
-                and model_reason_supplied
                 and available_qty > 0
                 and not replacement_intent
-                and model_exit_rule in {
-                    "no_progress",
-                    "sell_score",
-                    "sector_retreat",
-                    "profit_protection",
-                    "position_adjust",
-                }
-                and not any(token in reason for token in hard_exit_tokens)
+                and not hard_exit_confirmed
             )
             if model_soft_exit:
                 feedback_policy = current_exit_feedback_policy(state)
@@ -12977,6 +13003,7 @@ def execute_actions(
                     )
                     if key in staged
                 })
+                action["soft_exit_reduce_ratio"] = feedback_parameters["soft_exit_reduce_ratio"]
                 reason = str(staged.get("reason") or reason)
                 action["reason"] = reason
                 if staged.get("soft_exit_stage") == "exit":
@@ -13136,6 +13163,8 @@ def execute_actions(
             }
             executed_trade.update(exit_feedback_trade_audit(state))
             for key in (
+                "niuone_hard_exit_evidence",
+                "model_original_sell_reason",
                 "sell_execution_evidence_schema_version",
                 "sell_execution_source",
                 "model_requested_sell_shares",
@@ -13148,6 +13177,7 @@ def execute_actions(
                 "replacement_priority_margin",
                 "replacement_priority_margin_required",
                 "soft_exit_stage",
+                "soft_exit_reduce_ratio",
                 "soft_exit_confirmation_count",
                 "soft_exit_confirmations_required",
                 "source_signal",
@@ -14128,6 +14158,7 @@ def build_trade_rule_note() -> str:
         f"同股同战法再次BUY只在评分严格刷新持仓期实际买入最高分时加仓；试仓当日禁加、亏损不补，成熟路径仍须主升强领涨且浮盈2%～12%。"
         f"允许无明确主线；单只股票独强不得确认主线，日线V型结构则按独立试仓路径评估。"
         f"系统底线风控：结构止损、市场硬停止、峰值回撤/ATR吊灯保护、持仓超25日退出；普通未兑现、评分、板块转弱等软退出先减半，跨交易日确认后才清余仓，4-5分防卖飞评分首日否决；"
+        f"牛牛模型SELL只有执行现价跌破结构/成本保护线、主线失活或市场硬停止且主线转弱得到本地证据确认，才能按硬退出执行；理由中的止损/破位等词不授权清仓，缺少理由也进入软退出确认；明确HOLD重置模型软退出确认。"
         f"Z哥卖出风控：少妇B1至少观察{SHAOFU_MIN_HOLD_TRADING_DAYS}个交易日，开盘前30分钟仅执行硬退出，普通转弱经行业资金/预测量能连续确认后先减半；"
         f"模型SELL不直接成交。另保留防卖飞5分评分、B3次日不涨离场({B3_EXIT_HHMM}开盘检查)、B2两日不延续离场、超级B1未兑现离场({TIME_EXIT_HHMM}尾盘检查)、"
         f"卤煮半仓、S1/S2/S3逃顶、出货五式、BBI/白线两日破位、白线死叉黄线。"

@@ -1586,6 +1586,14 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
             "model_requested_sell_shares": 1000,
             "available_sell_shares": 800,
             "sell_quantity_auto_reduced": True,
+            "price": 10.0,
+            "exit_signal": "niu_structure_stop",
+            "niuone_hard_exit_evidence": {
+                "schema_version": 1, "confirmed": True,
+                "signal": "niu_structure_stop", "current_price": 10.0,
+                "structural_stop": 10.5, "market_hard_stop": False,
+                "theme_score": 70.0, "theme_state": "mainline",
+            },
         })
         automatic_exit = trade(
             "2026-08-04 10:01:00",
@@ -2814,7 +2822,7 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
 
         self.assertEqual(report["overall"]["completed_trade_count"], 1)
         self.assertEqual(report["coverage"]["duplicate_trade_count"], 2)
-        self.assertEqual(report["protocol"]["version"], "niuone-strict-forward-v51")
+        self.assertEqual(report["protocol"]["version"], "niuone-strict-forward-v52")
         self.assertEqual(
             report["protocol"][
                 "niuone_markup_upgrade_absolute_position_cap_pct"

@@ -609,3 +609,6 @@ git status --ignored --short
 3. 看板保持公开访问，设置页与管理 API 必须始终通过管理员认证。
 4. 真实数据库、本地凭据、日志、模型配置只留在 `.local-data/`。
 5. 消息类新任务应直接写入 `push_history.db`，不要生成独立 Markdown 历史文件。
+
+
+v52 部署：验证通过后升级至 `niuone-strict-forward-v52`。在 2026-09-08 队列首次采样前，将 v51 协议锁与报告归档到私有备份目录，再冻结 v52；不清空账户、成交账本或试仓对照结果。若队列已开始，不得复用开始日期覆盖原锁，须另开队列。保存并比对现金、持仓数量和成交尾部指纹，重建 dashboard/scheduler 后检查 healthz、readyz 和协议完整性。管理员日线回测保持 v42。规则见 [模型卖出证据](strategies/README.md#v52模型卖出须有硬退出证据)。

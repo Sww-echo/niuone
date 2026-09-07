@@ -611,3 +611,6 @@ git status --ignored --short
 3. Keep the dashboard publicly accessible, while always requiring administrator authentication for the settings page and administrative APIs.
 4. Keep real databases, local credentials, logs, and model configuration only in `.local-data/`.
 5. New message-producing tasks should write directly to `push_history.db` instead of generating separate historical Markdown files.
+
+
+v52 deployment: after validation, advance to `niuone-strict-forward-v52`. Before the first 2026-09-08 cohort sample, archive the v51 lock/report privately and freeze v52. Preserve the account, ledger and probe comparison outcomes. If sampling has started, create a new cohort instead of overwriting its lock under the same start date. Compare protected cash, position quantities and retained-trade fingerprints; rebuild dashboard/scheduler and verify healthz, readyz and protocol integrity. Admin daily backtests remain v42. See [model exit evidence](strategies/README_EN.md#v52-require-observed-evidence-for-model-hard-exits).

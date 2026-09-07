@@ -113,3 +113,6 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
 新增功能应优先放入对应领域包；只有 CLI、HTTP 路由、调度或跨域编排代码留在根入口。
+
+
+v52 将牛牛硬退出的数值观测判定集中到 `strategies/exits.py`，由本地风控、模型成交前复核及前向证据校验复用。模型文字不能授权硬清仓；分阶段确认跨轮询保留，明确 HOLD 重置。详见 [v52 规则](strategies/README.md#v52模型卖出须有硬退出证据)。

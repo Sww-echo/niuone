@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Collection
+import math
 from typing import Any
 
 
@@ -62,6 +63,45 @@ NIUONE_REVERSAL_MAINLINE_WEAK_CONFIRMATIONS = 1
 
 def _sell_signal(reason: str, signal: str, sell_ratio: float = 1.0) -> dict[str, Any]:
     return {"reason": reason, "signal": signal, "sell_ratio": sell_ratio}
+
+
+def niuone_hard_exit_evidence(
+    *,
+    strategy_id: str,
+    current_price: float,
+    structural_stop: float,
+    market_hard_stop: bool,
+    theme_score: float,
+    theme_state: str,
+) -> dict[str, Any]:
+    """Verify hard risk conditions from observations, never model prose."""
+    price = float(current_price)
+    stop = float(structural_stop)
+    score = float(theme_score)
+    price = price if math.isfinite(price) and price > 0 else 0.0
+    stop = stop if math.isfinite(stop) and stop > 0 else 0.0
+    score = score if math.isfinite(score) else 100.0
+    signal, reason = "", ""
+    if price > 0 and stop > 0 and price < stop:
+        signal = "niu_structure_stop"
+        reason = f"现价跌破牛牛结构/成本保护线 (现价{price:.2f} < 止损{stop:.2f})"
+    elif market_hard_stop and (score < 55 or theme_state in {"fading", "inactive"}):
+        signal = "niu_market_hard_stop"
+        reason = f"市场硬停止且主线转弱 (分数{score:.1f}，状态{theme_state or '-'})"
+    elif theme_state == "inactive":
+        signal = "niu_reversal_theme_failed" if strategy_id == "niu_reversal_probe" else "niu_mainline_faded"
+        reason = f"主线失活 (分数{score:.1f})"
+    return {
+        "schema_version": 1,
+        "confirmed": bool(signal),
+        "signal": signal,
+        "reason": reason,
+        "current_price": price,
+        "structural_stop": stop,
+        "market_hard_stop": bool(market_hard_stop),
+        "theme_score": score,
+        "theme_state": theme_state,
+    }
 
 
 def resolve_niuone_partial_take_profit(

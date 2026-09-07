@@ -3511,6 +3511,7 @@ class NiuOneStrategyTests(unittest.TestCase):
             )
 
             position["buy_date_lots"] = {"2026-07-31": 400}
+            position["mainline_state"] = "inactive"
             sell_decision = {"actions": [{
                 "action": "SELL",
                 "code": "600000",
