@@ -7,7 +7,7 @@ import { useAdminConfig } from '../composables/useAdminConfig.js'
 
 document.title = '牛牛1号 · 策略回测'
 
-const NIUONE_BACKTEST_PROTOCOL_VERSION = 'niuone-backtest-v40'
+const NIUONE_BACKTEST_PROTOCOL_VERSION = 'niuone-backtest-v42'
 
 const route = useRoute()
 const { state, errorMessage, refresh, authenticate } = useAdminConfig()
@@ -190,6 +190,8 @@ const signalStatusReasonLabels = {
   markup_momentum_identity_block: '主升动量试仓不符合策略身份条件',
   missing_signal_close: '缺少信号日收盘价，无法校验次日执行',
   reversal_execution_gap: '试仓次日开盘跳空超过执行上限',
+  reversal_entry_price: '试仓成交涨幅达到3%或缺少有效前收盘价',
+  stock_activity: '换手率不足3%、成交额排名不足或活跃度数据缺失',
   markup_momentum_execution_gap: '主升动量试仓次日跳空超过执行上限',
   max_open_positions: '已达到当前风险档位的持仓数量上限',
   max_new_positions: '当日新仓数量已达当前风险档位上限',

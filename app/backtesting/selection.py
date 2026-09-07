@@ -3682,7 +3682,8 @@ class NiuOneHistoricalContextProvider:
                     "prev_close": previous_close,
                     "low": current_bar.low,
                     "change_pct": change_pct,
-                    "amount": current_bar.amount or 0.0,
+                    "amount": current_bar.amount,
+                    "turnover": current_bar.turnover,
                 },
             })
         flow_rows = self.flow_provider(context) if self.flow_provider is not None else None

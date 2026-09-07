@@ -51,6 +51,7 @@ def evaluate_niuone_forward(*args, **kwargs):
 
 def complete_context(**overrides):
     context = {
+        "entry_turnover_pct": 4.0,
         "entry_niuone_lifecycle_stage": "brewing",
         "entry_niuone_lifecycle_label": "主线酝酿",
         "entry_niuone_lifecycle_order": 10,
@@ -393,6 +394,7 @@ def candidate_evidence(
     rank: int = 1,
 ) -> dict[str, object]:
     return {
+        "turnover": 4.0,
         "code": code,
         "strategy_id": strategy_id,
         "best_score": score,
@@ -419,12 +421,13 @@ def operating_settings(*times: str) -> dict[str, str]:
 
 class NiuOneForwardEvaluationTests(unittest.TestCase):
     def test_protocol_identity_covers_evidence_pipeline_and_effective_paths(self):
-        self.assertEqual(DEFAULT_COHORT_START, "2026-09-03")
+        self.assertEqual(DEFAULT_COHORT_START, "2026-09-08")
         expected_sources = {
             "app/automation/cron.py",
             "app/automation/scheduler_service.py",
             "app/dashboard/server.py",
             "app/entrypoints/evaluate_niuone_forward.py",
+            "app/market_data/cn_stock_tools.py",
             "app/storage/practice_db.py",
             "app/strategies/display.py",
             "app/screening/holding_cycle.py",
@@ -567,6 +570,17 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
             ["niuone_reversal_minimum_recovery_ratio_inclusive"],
             0.60,
         )
+        self.assertEqual(
+            identity["protocol"]["niuone_reversal_entry_maximum_change_pct_exclusive"],
+            3.0,
+        )
+        self.assertIn("previous close", identity["protocol"]["niuone_reversal_entry_price_rule"])
+        for field, expected in (("niuone_minimum_entry_turnover_pct", 3.0),
+                                ("niuone_minimum_market_amount_percentile", 60),
+                                ("niuone_minimum_theme_amount_percentile", 50)):
+            self.assertEqual(identity["protocol"][field], expected)
+        self.assertIn("actual cumulative same-day", identity["protocol"]["niuone_all_stage_activity_rule"])
+
         self.assertEqual(
             identity["protocol"]
             ["niuone_reversal_maximum_recovery_ratio_exclusive"],
@@ -932,7 +946,7 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
 
         self.assertEqual(first_code, 0)
         self.assertEqual(first_report["protocol_integrity"]["status"], "frozen")
-        self.assertEqual(first_report["protocol_integrity"]["source_file_count"], 25)
+        self.assertEqual(first_report["protocol_integrity"]["source_file_count"], 26)
         self.assertEqual(first_report["protocol_integrity"]["runtime_setting_count"], 57)
         self.assertEqual(
             first_report["evidence_gate"]["status"],
@@ -2404,6 +2418,40 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
             report["protocol"]["allowed_schedule_run_kinds"],
         )
 
+    def test_probe_activity_and_turnover_are_required_forward_evidence(self):
+        for field, value in (("entry_turnover_pct", None), ("entry_turnover_pct", 2.999),
+                             ("entry_stock_activity_confirmed", False),
+                             ("entry_stock_market_amount_percentile", 59.9),
+                             ("entry_stock_theme_amount_percentile", 49.9)):
+            with self.subTest(field=field, value=value):
+                rows = [
+                    trade("2026-08-04 10:00:00", "BUY", "activity-probe", 100, 1000,
+                          before_qty=0, after_qty=100, context=complete_context(**{field: value})),
+                    trade("2026-08-05 10:00:00", "SELL", "activity-probe", 100, 1010,
+                          before_qty=100, after_qty=0),
+                ]
+                report = evaluate_niuone_forward(rows, as_of="2026-08-06")
+                self.assertIn(field, report["coverage"]["missing_entry_attribution_fields"])
+
+    def test_eligible_probe_cannot_claim_activity_with_low_or_missing_turnover(self):
+        for value in (None, 2.999, 3.0):
+            with self.subTest(turnover=value):
+                candidate = {**candidate_evidence("600000"), "turnover": value}
+                row = {
+                    "_forward_payload_available": True,
+                    "candidate_evidence_schema_version": 2,
+                    "execution_evidence_schema_version": 2,
+                    "candidate_evidence": [candidate],
+                    "time": "2026-08-04 10:00:05",
+                    "b1_generated_at": "2026-08-04 10:00:02",
+                    "schedule_slot": "2026-08-04 10:00",
+                    "schedule_run_kind": "scheduled",
+                    "decision": {"actions": []}, "executed": [],
+                }
+                report = evaluate_niuone_forward([], decision_rows=[row], as_of="2026-08-04")
+                fields = report["opportunities"]["invalid_opportunity_evidence_fields"]
+                self.assertEqual("candidate_evidence.turnover" in fields, value != 3.0)
+
     def test_missing_entry_industry_blocks_performance_attribution(self):
         rows = [
             trade(
@@ -2738,7 +2786,7 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
 
         self.assertEqual(report["overall"]["completed_trade_count"], 1)
         self.assertEqual(report["coverage"]["duplicate_trade_count"], 2)
-        self.assertEqual(report["protocol"]["version"], "niuone-strict-forward-v48")
+        self.assertEqual(report["protocol"]["version"], "niuone-strict-forward-v50")
         self.assertEqual(
             report["protocol"][
                 "niuone_markup_upgrade_absolute_position_cap_pct"

@@ -33,7 +33,8 @@ class StrategyBacktestFrontendTests(unittest.TestCase):
         self.assertNotIn("selectedRiskProfile", source)
         self.assertIn("牛牛战法固定使用进取风险参数", source)
         self.assertIn("NIUONE_BACKTEST_PROTOCOL_VERSION", source)
-        self.assertIn("'niuone-backtest-v40'", source)
+        self.assertIn("'niuone-backtest-v42'", source)
+        self.assertIn("stock_activity: '换手率不足3%、成交额排名不足或活跃度数据缺失'", source)
         self.assertIn("staleResult", source)
         self.assertIn("当前结果由旧版回测协议生成", source)
         self.assertIn("避免把不完整指标误认为当前结果", source)
@@ -220,6 +221,7 @@ class StrategyBacktestFrontendTests(unittest.TestCase):
             "markup_upgrade_rule": "主升阶段升级加仓条件未满足",
             "markup_momentum_identity_block": "主升动量试仓不符合策略身份条件",
             "reversal_execution_gap": "试仓次日开盘跳空超过执行上限",
+            "reversal_entry_price": "试仓成交涨幅达到3%或缺少有效前收盘价",
             "markup_momentum_execution_gap": "主升动量试仓次日跳空超过执行上限",
         }
         for code, label in expected_reasons.items():

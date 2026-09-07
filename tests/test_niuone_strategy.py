@@ -108,6 +108,7 @@ def make_rows(code: str, industry: str, daily_step: float = 0.04) -> list[dict]:
         })
     enrich_rows(rows)
     rows[-1].update({
+        "quote_turnover": 4.0,
         "symbol_code": code,
         "stock_name": f"测试{code}",
         "industry": industry,
@@ -132,6 +133,7 @@ def make_daily_v_rows(code: str, industry: str) -> list[dict]:
         })
     enrich_rows(rows)
     rows[-1].update({
+        "quote_turnover": 4.0,
         "symbol_code": code,
         "stock_name": f"测试{code}",
         "industry": industry,
@@ -142,6 +144,7 @@ def make_daily_v_rows(code: str, industry: str) -> list[dict]:
 
 def niu_candidate(**updates) -> dict:
     candidate = {
+        "turnover": 4.0,
         "code": "600000",
         "name": "牛牛测试",
         "best_strategy": "niu_leader",
@@ -376,6 +379,7 @@ class NiuOneStrategyTests(unittest.TestCase):
                         row["volume"] = 1800.0
                     enrich_rows(rows)
                     rows[-1].update({
+                        "quote_turnover": 4.0,
                         "symbol_code": code,
                         "stock_name": f"测试{code}",
                         "industry": industry,
@@ -402,6 +406,7 @@ class NiuOneStrategyTests(unittest.TestCase):
                     row["low"] = float(row["close"]) * 0.98
                 enrich_rows(rows)
                 rows[-1].update({
+                    "quote_turnover": 4.0,
                     "symbol_code": code,
                     "stock_name": f"测试{code}",
                     "industry": industry,
@@ -411,6 +416,7 @@ class NiuOneStrategyTests(unittest.TestCase):
                 if theme_index == 0:
                     change_pct = rebound_changes[member_index]
                     quote = {
+                        "turnover": 4.0,
                         "price": previous_close * (1 + change_pct / 100),
                         "prev_close": previous_close,
                         "low": previous_close * 0.997,
@@ -419,6 +425,7 @@ class NiuOneStrategyTests(unittest.TestCase):
                     }
                 else:
                     quote = {
+                        "turnover": 4.0,
                         "price": previous_close * 0.995,
                         "prev_close": previous_close,
                         "low": previous_close * 0.99,
@@ -467,7 +474,26 @@ class NiuOneStrategyTests(unittest.TestCase):
                 for key in theme
             ))
 
-    def test_mature_mainline_requires_market_and_theme_amount_activity(self):
+    def test_fresh_turnover_overrides_cached_activity_for_every_scorer(self):
+        prepared = self._prepared_market()
+        context = build_niuone_context(prepared)
+        code = "600000"
+        stock = context["stocks"][code]
+        self.assertTrue(all("turnover" in item for item in stock["theme_profiles"]))
+        original = json.dumps(context, sort_keys=True)
+        for scorer in (score_niu_reversal_probe, score_niu_emerging,
+                       score_niu_leader, score_niu_pullback):
+            for turnover in (None, 2.999, 3.0):
+                with self.subTest(scorer=scorer.__name__, turnover=turnover):
+                    rows = [dict(row) for row in prepared[0]["rows"]]
+                    rows[-1]["quote_turnover"] = turnover
+                    result = scorer(rows, context)
+                    self.assertIsNotNone(result)
+                    self.assertEqual(result["turnover"], turnover)
+                    self.assertEqual(result["stock_activity_confirmed"], turnover == 3.0)
+        self.assertEqual(json.dumps(context, sort_keys=True), original)
+
+    def test_all_niuone_routes_require_market_and_theme_amount_activity(self):
         prepared = self._prepared_market()
         prepared[0]["quote"]["amount"] = 1.0e6
 
@@ -498,7 +524,7 @@ class NiuOneStrategyTests(unittest.TestCase):
             stock_activity_score=cold["activity_score"],
             stock_activity_confirmed=False,
         ))
-        self.assertFalse(any("成交活跃度" in item for item in probe_blockers))
+        self.assertTrue(any("成交活跃度" in item for item in probe_blockers))
 
     def test_reversal_probe_uses_multi_session_daily_v(self):
         rows = make_daily_v_rows("600000", "半导体")
@@ -528,6 +554,10 @@ class NiuOneStrategyTests(unittest.TestCase):
             },
             "stocks": {
                 "600000": {
+                    "amount_available": True,
+                    "market_amount_percentile": 90.0,
+                    "theme_amount_percentile": 75.0,
+                    "turnover": 4.0,
                     "theme_rank": 78,
                     "market_rank": 75,
                     "strong_score": 78,
@@ -561,6 +591,10 @@ class NiuOneStrategyTests(unittest.TestCase):
 
     def test_reversal_probe_requires_controlled_right_side_extension(self):
         payload = with_strategy_profile("niu_reversal_probe", {
+            "stock_activity_data_available": True,
+            "stock_market_amount_percentile": 90.0,
+            "stock_theme_amount_percentile": 75.0,
+            "turnover": 4.0,
             "score": 9.0,
             "entry_extension_atr": 0.99,
             "min_entry_extension_atr": 1.0,
@@ -641,6 +675,10 @@ class NiuOneStrategyTests(unittest.TestCase):
 
     def test_defensive_reversal_probe_remains_actionable_without_hard_stop(self):
         base = {
+            "stock_activity_data_available": True,
+            "stock_market_amount_percentile": 90.0,
+            "stock_theme_amount_percentile": 75.0,
+            "turnover": 4.0,
             "score": 9.0,
             "entry_extension_atr": 1.2,
             "min_entry_extension_atr": 1.0,
@@ -682,6 +720,10 @@ class NiuOneStrategyTests(unittest.TestCase):
 
     def test_reversal_probe_requires_breadth_or_sustained_brewing(self):
         base = {
+            "stock_activity_data_available": True,
+            "stock_market_amount_percentile": 90.0,
+            "stock_theme_amount_percentile": 75.0,
+            "turnover": 4.0,
             "score": 9.0,
             "entry_extension_atr": 1.2,
             "min_entry_extension_atr": 1.0,
@@ -1408,6 +1450,7 @@ class NiuOneStrategyTests(unittest.TestCase):
                 "themes": themes,
                 "rows": rows,
                 "quote": {
+                    "turnover": 4.0,
                     "price": previous_close * (1 + change_pct / 100),
                     "prev_close": previous_close,
                     "low": previous_close,
@@ -1595,6 +1638,7 @@ class NiuOneStrategyTests(unittest.TestCase):
                 })
             enrich_rows(rows)
             rows[-1].update({
+                "quote_turnover": 4.0,
                 "symbol_code": code,
                 "stock_name": name,
                 "industry": "有色金属",
@@ -1607,6 +1651,7 @@ class NiuOneStrategyTests(unittest.TestCase):
                 "themes": themes,
                 "rows": rows,
                 "quote": {
+                    "turnover": 4.0,
                     "price": float(rows[-1]["close"]),
                     "prev_close": float(rows[-2]["close"]),
                     "change_pct": returns[-1],
@@ -1703,6 +1748,10 @@ class NiuOneStrategyTests(unittest.TestCase):
             },
             "stocks": {
                 "600000": {
+                    "amount_available": True,
+                    "market_amount_percentile": 90.0,
+                    "theme_amount_percentile": 75.0,
+                    "turnover": 4.0,
                     "industry": "通信主题", "theme_rank": 100.0,
                     "market_rank": 92.0, "strong_score": 92.0,
                     "strong": True, "role": "leader", "leader_rank": 1,
@@ -1771,6 +1820,10 @@ class NiuOneStrategyTests(unittest.TestCase):
             },
             "stocks": {
                 "600000": {
+                    "amount_available": True,
+                    "market_amount_percentile": 90.0,
+                    "theme_amount_percentile": 75.0,
+                    "turnover": 4.0,
                     "industry": "成熟分支", "theme_rank": 100.0,
                     "market_rank": 92.0, "strong_score": 92.0,
                     "strong": True, "role": "leader", "leader_rank": 1,
@@ -1839,6 +1892,10 @@ class NiuOneStrategyTests(unittest.TestCase):
             },
             "stocks": {
                 "600000": {
+                    "amount_available": True,
+                    "market_amount_percentile": 90.0,
+                    "theme_amount_percentile": 75.0,
+                    "turnover": 4.0,
                     "industry": "分歧分支", "theme_rank": 95.0,
                     "market_rank": 92.0, "strong_score": 92.0,
                     "strong": True, "role": "leader", "leader_rank": 1,
@@ -2188,6 +2245,10 @@ class NiuOneStrategyTests(unittest.TestCase):
             },
             "stocks": {
                 "600000": {
+                    "amount_available": True,
+                    "market_amount_percentile": 90.0,
+                    "theme_amount_percentile": 75.0,
+                    "turnover": 4.0,
                     "theme_rank": 95, "market_rank": 92, "strong_score": 92,
                     "strong": True, "role": "leader", "leader_rank": 1,
                     "leader_tier": True, "news_precheck": {},
@@ -2278,6 +2339,10 @@ class NiuOneStrategyTests(unittest.TestCase):
         ))
 
         payload = with_strategy_profile("niu_leader", {
+            "stock_activity_data_available": True,
+            "stock_market_amount_percentile": 90.0,
+            "stock_theme_amount_percentile": 75.0,
+            "turnover": 4.0,
             "score": 9.0,
             "distance_pct": 10.0,
             "extension_atr": 1.0,
@@ -2339,6 +2404,10 @@ class NiuOneStrategyTests(unittest.TestCase):
         self.assertFalse(niuone_structure_risk_ok(6.1, 1.5, "recovery"))
 
         payload = with_strategy_profile("niu_leader", {
+            "stock_activity_data_available": True,
+            "stock_market_amount_percentile": 90.0,
+            "stock_theme_amount_percentile": 75.0,
+            "turnover": 4.0,
             "score": 9.0,
             "extension_atr": 1.25,
             "max_entry_change_pct": 5.0,
@@ -2388,6 +2457,7 @@ class NiuOneStrategyTests(unittest.TestCase):
         })
         enrich_rows(rows)
         rows[-1].update({
+            "quote_turnover": 4.0,
             "symbol_code": "600000",
             "stock_name": "突破测试",
             "industry": "半导体",
@@ -2414,6 +2484,10 @@ class NiuOneStrategyTests(unittest.TestCase):
             },
             "stocks": {
                 "600000": {
+                    "amount_available": True,
+                    "market_amount_percentile": 90.0,
+                    "theme_amount_percentile": 75.0,
+                    "turnover": 4.0,
                     "theme_rank": 95, "market_rank": 92, "strong_score": 92,
                     "strong": True, "role": "leader", "leader_rank": 1,
                     "leader_tier": True, "news_precheck": {},
@@ -2445,6 +2519,10 @@ class NiuOneStrategyTests(unittest.TestCase):
 
     def test_pullback_keeps_ema20_as_entry_anchor(self):
         payload = with_strategy_profile("niu_pullback", {
+            "stock_activity_data_available": True,
+            "stock_market_amount_percentile": 90.0,
+            "stock_theme_amount_percentile": 75.0,
+            "turnover": 4.0,
             "score": 9.0,
             "extension_atr": 1.26,
             "entry_extension_atr": 1.26,
@@ -2476,6 +2554,10 @@ class NiuOneStrategyTests(unittest.TestCase):
 
     def test_emerging_accepts_only_cross_day_emerging_theme_without_relaxing_chase_risk(self):
         payload = {
+            "stock_activity_data_available": True,
+            "stock_market_amount_percentile": 90.0,
+            "stock_theme_amount_percentile": 75.0,
+            "turnover": 4.0,
             "score": 8.399999999,
             "entry_extension_atr": 1.4,
             "entry_extension_source": "breakout_level",
@@ -2564,6 +2646,10 @@ class NiuOneStrategyTests(unittest.TestCase):
 
     def test_markup_momentum_probe_is_conditional_and_sizes_wide_stop_to_micro_position(self):
         payload = {
+            "stock_activity_data_available": True,
+            "stock_market_amount_percentile": 90.0,
+            "stock_theme_amount_percentile": 75.0,
+            "turnover": 4.0,
             "score": 8.0,
             "market_allows_buys": True,
             "market_hard_stop": False,
@@ -2756,7 +2842,7 @@ class NiuOneStrategyTests(unittest.TestCase):
         original_quote = trader.execution_quote
         try:
             trader.is_a_share_execution_time = lambda dt=None: (True, "连续竞价交易时段")
-            trader.execution_quote = lambda code: {"price": 10.0, "name": "牛牛测试", "source": "test"}
+            trader.execution_quote = lambda code: {"turnover": 4.0, "price": 10.0, "name": "牛牛测试", "source": "test"}
             market = {
                 "allow_new_buys": True,
                 "max_open_positions": 6,
@@ -2864,6 +2950,7 @@ class NiuOneStrategyTests(unittest.TestCase):
                 "连续竞价交易时段",
             )
             trader.execution_quote = lambda _code: {
+                "turnover": 4.0,
                 "price": 10.0,
                 "name": "牛牛测试",
                 "source": "test",
@@ -2897,6 +2984,7 @@ class NiuOneStrategyTests(unittest.TestCase):
                 "连续竞价交易时段",
             )
             trader.execution_quote = lambda code: {
+                "turnover": 4.0,
                 "price": 10.0,
                 "name": "防守开仓测试",
                 "source": "test",
@@ -2960,6 +3048,7 @@ class NiuOneStrategyTests(unittest.TestCase):
                 "连续竞价交易时段",
             )
             trader.execution_quote = lambda code: {
+                "turnover": 4.0,
                 "price": 38.81,
                 "prev_close": 38.0,
                 "name": "主升动量测试",
@@ -3036,6 +3125,7 @@ class NiuOneStrategyTests(unittest.TestCase):
             )
 
             trader.execution_quote = lambda code: {
+                "turnover": 4.0,
                 "price": 41.0,
                 "prev_close": 38.0,
                 "name": "主升动量测试",
@@ -3096,6 +3186,157 @@ class NiuOneStrategyTests(unittest.TestCase):
             ceiling["binding_constraints"],
         )
 
+    def test_reversal_new_entry_rechecks_price_and_requires_quote_previous_close(self):
+        for previous_close in (10.0, None, 0.0, float("nan"), float("inf")):
+            with self.subTest(previous_close=previous_close), patch.object(
+                trader, "is_a_share_execution_time", return_value=(True, "连续竞价交易时段"),
+            ), patch.object(trader, "execution_quote", return_value={
+                "turnover": 4.0,
+                "price": 10.3, "prev_close": previous_close, "source": "test",
+            }):
+                state = {"cash": 100000.0, "positions": {}, "trade_log": []}
+                decision = {"actions": [{
+                    "action": "BUY", "code": "600000", "shares": 100,
+                    "reason": "牛牛试仓确认",
+                }]}
+                # The scan price/percentage cannot replace the quote's previous close.
+                candidate = reversal_candidate(
+                    recent_close=10.3, change_pct=0.5, stop_price=10.0,
+                )
+                for _ in range(2):
+                    executed = trader.execute_actions(
+                        state, decision, [candidate], True, "连续竞价交易时段",
+                        {"allow_new_buys": True, "max_open_positions": 6},
+                        datetime(2026, 9, 8, 10, 0),
+                    )
+                    self.assertEqual(executed, [])
+                    self.assertEqual(state["cash"], 100000.0)
+                    self.assertEqual(state["positions"], {})
+                    self.assertEqual(state["trade_log"], [])
+                    self.assertEqual(
+                        decision["execution_blocks"][-1]["category"],
+                        "entry_price_quality",
+                    )
+
+    def test_all_buy_routes_recheck_actual_turnover_and_retry_after_it_rises(self):
+        candidates = (
+            reversal_candidate(),
+            niu_candidate(),
+            niu_candidate(best_strategy="niu_emerging", sector_status="emerging",
+                          mainline_state="emerging", mainline_cross_day_persistent=True),
+            niu_candidate(best_strategy="niu_pullback", niuone_lifecycle_stage="climax"),
+        )
+        for candidate in candidates:
+            with self.subTest(strategy=candidate["best_strategy"]), patch.object(
+                trader, "is_a_share_execution_time", return_value=(True, "连续竞价交易时段"),
+            ), patch.object(trader, "execution_quote") as quote:
+                state = {"cash": 100000.0, "positions": {}, "trade_log": []}
+                for turnover in (None, 2.999, float("nan"), float("inf"), 3.0):
+                    quote.return_value = {"price": 10.0, "prev_close": 10.0,
+                                          "turnover": turnover, "source": "test"}
+                    decision = {"actions": [{"action": "BUY", "code": "600000",
+                                              "shares": 100, "reason": "活跃股确认"}]}
+                    fills = trader.execute_actions(
+                        state, decision, [candidate], True, "连续竞价交易时段",
+                        {"allow_new_buys": True, "max_open_positions": 6},
+                        datetime(2026, 9, 8, 10, 0),
+                    )
+                    if turnover == 3.0:
+                        self.assertEqual(len(fills), 1, decision)
+                        self.assertEqual(fills[0]["niuone_entry_context"]["entry_turnover_pct"], 3.0)
+                    else:
+                        self.assertEqual(fills, [])
+                        self.assertEqual(state["cash"], 100000.0)
+                        self.assertEqual(state["positions"], {})
+                        self.assertEqual(state["trade_log"], [])
+                        self.assertEqual(decision["execution_blocks"][-1]["category"], "stock_activity")
+                cash_after_entry = state["cash"]
+                quote.return_value = {"price": 10.0, "prev_close": 10.0,
+                                      "turnover": 2.0, "source": "test"}
+                add_decision = {"actions": [{"action": "BUY", "code": "600000",
+                                             "shares": 100, "reason": "持仓加仓"}]}
+                added = trader.execute_actions(
+                    state, add_decision, [candidate], True, "连续竞价交易时段",
+                    {"allow_new_buys": True, "max_open_positions": 6},
+                    datetime(2026, 9, 9, 10, 0),
+                )
+                self.assertEqual(added, [])
+                self.assertEqual(add_decision["execution_blocks"][-1]["category"], "stock_activity")
+                self.assertEqual(state["cash"], cash_after_entry)
+                self.assertEqual(state["positions"]["600000"]["qty"], 100)
+                self.assertEqual(len(state["trade_log"]), 1)
+
+    def test_execution_quote_parsers_preserve_observed_turnover(self):
+        parts = [""] * 60
+        for index, value in {1: "测试", 3: "10", 4: "10", 5: "10", 6: "1000",
+                             30: "20260908100000", 33: "10", 34: "10",
+                             37: "100", 38: "3.25"}.items():
+            parts[index] = value
+        quote = trader.parse_tencent_quote_line('v_sh600000="' + "~".join(parts) + '";')
+        self.assertEqual(quote["turnover"], 3.25)
+        self.assertEqual(quote["turnover_yuan"], 1e6)
+        eastmoney = trader.parse_eastmoney_stock({"f43": 10.0, "f60": 10.0,
+                                                 "f57": "600000", "f168": 3.25, "f8": 99})
+        self.assertEqual(eastmoney["turnover"], 3.25)
+        with patch.object(trader.subprocess, "run") as request:
+            request.return_value.returncode = 0
+            request.return_value.stdout = json.dumps({"data": {
+                "f43": 10.0, "f60": 10.0, "f57": "600000", "f168": 3.25,
+            }})
+            quotes, error = trader.fetch_eastmoney_quotes(["600000"])
+        self.assertEqual(error, "")
+        self.assertEqual(quotes["600000"]["turnover"], 3.25)
+        fields = next(arg for arg in request.call_args.args[0] if arg.startswith("fields="))
+        self.assertIn("f168", fields.split("=", 1)[1].split(","))
+        self.assertIn("fltt=2", request.call_args.args[0])
+
+    def test_reversal_price_guard_reassesses_after_price_retreats(self):
+        state = {"cash": 100000.0, "positions": {}, "trade_log": []}
+        candidate = reversal_candidate(recent_close=10.4, stop_price=10.0)
+        with patch.object(
+            trader, "is_a_share_execution_time", return_value=(True, "连续竞价交易时段"),
+        ), patch.object(trader, "execution_quote") as quote:
+            for price, expected_count in ((10.3, 0), (10.299, 1)):
+                quote.return_value = {"turnover": 4.0, "price": price, "prev_close": 10.0, "source": "test"}
+                decision = {"actions": [{
+                    "action": "BUY", "code": "600000", "shares": 100,
+                    "reason": "牛牛试仓确认",
+                }]}
+                executed = trader.execute_actions(
+                    state, decision, [candidate], True, "连续竞价交易时段",
+                    {"allow_new_buys": True, "max_open_positions": 6},
+                    datetime(2026, 9, 8, 10, 0),
+                )
+                self.assertEqual(len(executed), expected_count)
+            self.assertEqual(state["positions"]["600000"]["qty"], 100)
+            self.assertEqual(len(state["trade_log"]), 1)
+
+    def test_probe_price_guard_does_not_apply_to_existing_holdings_or_leaders(self):
+        for candidate, position in (
+            (reversal_candidate(), {"qty": 100, "avg_cost": 10.0, "buy_strategy": "niu_reversal_probe"}),
+            (niu_candidate(), None),
+        ):
+            with self.subTest(strategy=candidate["best_strategy"]), patch.object(
+                trader, "is_a_share_execution_time", return_value=(True, "连续竞价交易时段"),
+            ), patch.object(trader, "execution_quote", return_value={
+                "turnover": 4.0,
+                "price": 10.4, "prev_close": 10.0, "source": "test",
+            }), patch.object(trader, "niu_reversal_entry_price_blocker") as guard:
+                state = {
+                    "cash": 100000.0, "trade_log": [],
+                    "positions": {"600000": position} if position else {},
+                }
+                decision = {"actions": [{
+                    "action": "BUY", "code": "600000", "shares": 100,
+                    "reason": "牛牛战法确认",
+                }]}
+                trader.execute_actions(
+                    state, decision, [candidate], True, "连续竞价交易时段",
+                    {"allow_new_buys": True, "max_open_positions": 6},
+                    datetime(2026, 9, 8, 10, 0),
+                )
+                guard.assert_not_called()
+
     def test_execution_records_niuone_entry_gap_without_blocking_the_trade(self):
         original_time = trader.is_a_share_execution_time
         original_quote = trader.execution_quote
@@ -3105,6 +3346,7 @@ class NiuOneStrategyTests(unittest.TestCase):
                 "连续竞价交易时段",
             )
             trader.execution_quote = lambda code: {
+                "turnover": 4.0,
                 "price": 10.1,
                 "prev_close": 10.0,
                 "name": "牛牛反转测试",
@@ -3174,6 +3416,7 @@ class NiuOneStrategyTests(unittest.TestCase):
             self.assertTrue(executed[0]["position_opened"])
             self.assertEqual(decision["actions"][0]["execution_gap_pct"], 1.0)
             expected_context = {
+                "entry_turnover_pct": 4.0,
                 "entry_niuone_lifecycle_stage": "brewing",
                 "entry_niuone_lifecycle_label": "主线酝酿",
                 "entry_niuone_lifecycle_order": 10,
@@ -3270,7 +3513,7 @@ class NiuOneStrategyTests(unittest.TestCase):
         original_quote = trader.execution_quote
         try:
             trader.is_a_share_execution_time = lambda dt=None: (True, "连续竞价交易时段")
-            trader.execution_quote = lambda code: {"price": 10.0, "name": "牛牛测试", "source": "test"}
+            trader.execution_quote = lambda code: {"turnover": 4.0, "price": 10.0, "name": "牛牛测试", "source": "test"}
             market = {
                 "allow_new_buys": True,
                 "max_open_positions": 6,
@@ -3359,7 +3602,7 @@ class NiuOneStrategyTests(unittest.TestCase):
         original_quote = trader.execution_quote
         try:
             trader.is_a_share_execution_time = lambda dt=None: (True, "连续竞价交易时段")
-            trader.execution_quote = lambda code: {"price": 10.0, "name": "行业跟随股", "source": "test"}
+            trader.execution_quote = lambda code: {"turnover": 4.0, "price": 10.0, "name": "行业跟随股", "source": "test"}
             market = {
                 "allow_new_buys": True,
                 "max_open_positions": 6,
@@ -3405,6 +3648,7 @@ class NiuOneStrategyTests(unittest.TestCase):
             self.assertIn("个股未进入强势行业龙头梯队", blocked_decision["execution_blocked_reason"])
 
             trader.execution_quote = lambda code: {
+                "turnover": 4.0,
                 "price": 11.0,
                 "prev_close": 10.0,
                 "change_pct": 10.0,
@@ -3434,7 +3678,7 @@ class NiuOneStrategyTests(unittest.TestCase):
         original_quote = trader.execution_quote
         try:
             trader.is_a_share_execution_time = lambda dt=None: (True, "连续竞价交易时段")
-            trader.execution_quote = lambda code: {"price": 10.2, "name": "牛牛启动", "source": "test"}
+            trader.execution_quote = lambda code: {"turnover": 4.0, "price": 10.2, "name": "牛牛启动", "source": "test"}
             market = {
                 "allow_new_buys": True,
                 "max_open_positions": 6,
@@ -3530,6 +3774,7 @@ class NiuOneStrategyTests(unittest.TestCase):
             )
 
             trader.execution_quote = lambda code: {
+                "turnover": 4.0,
                 "price": 10.5,
                 "name": "牛牛启动",
                 "source": "test",
@@ -3665,6 +3910,7 @@ class NiuOneStrategyTests(unittest.TestCase):
                 "连续竞价交易时段",
             )
             trader.execution_quote = lambda code: {
+                "turnover": 4.0,
                 "price": 10.2,
                 "name": "本地分级加仓",
                 "source": "test",
@@ -3790,8 +4036,10 @@ class NiuOneStrategyTests(unittest.TestCase):
                 "连续竞价交易时段",
             )
             trader.execution_quote = lambda code: {
+                "turnover": 4.0,
                 "price": 10.0,
                 "name": "轮动试仓",
+                "prev_close": 10.0,
                 "source": "test",
             }
             state = {"cash": 100000.0, "positions": {}, "trade_log": []}
@@ -3844,6 +4092,7 @@ class NiuOneStrategyTests(unittest.TestCase):
                 "连续竞价交易时段",
             )
             trader.execution_quote = lambda code: {
+                "turnover": 4.0,
                 "price": 10.6,
                 "name": "牛牛领涨",
                 "source": "test",
@@ -3938,7 +4187,7 @@ class NiuOneStrategyTests(unittest.TestCase):
         original_quote = trader.execution_quote
         try:
             trader.is_a_share_execution_time = lambda dt=None: (True, "连续竞价交易时段")
-            trader.execution_quote = lambda code: {"price": 10.0, "name": "牛牛反转", "source": "test"}
+            trader.execution_quote = lambda code: {"turnover": 4.0, "price": 10.0, "prev_close": 10.0, "name": "牛牛反转", "source": "test"}
             market = {
                 "allow_new_buys": True,
                 "max_open_positions": 6,
@@ -3992,7 +4241,7 @@ class NiuOneStrategyTests(unittest.TestCase):
         original_quote = trader.execution_quote
         try:
             trader.is_a_share_execution_time = lambda dt=None: (True, "连续竞价交易时段")
-            trader.execution_quote = lambda code: {"price": 11.3, "name": "牛牛反转", "source": "test"}
+            trader.execution_quote = lambda code: {"turnover": 4.0, "price": 11.3, "name": "牛牛反转", "source": "test"}
             market = {
                 "allow_new_buys": True,
                 "max_open_positions": 6,
@@ -4102,7 +4351,7 @@ class NiuOneStrategyTests(unittest.TestCase):
             os.environ[trader.ACTIVE_STRATEGY_ENV] = "niuone"
             os.environ[trader.STOCK_UNIVERSE_ENV] = "main_board"
             trader.is_a_share_execution_time = lambda dt=None: (True, "连续竞价交易时段")
-            trader.execution_quote = lambda code: {"price": 10.0, "name": "创业板牛牛", "source": "test"}
+            trader.execution_quote = lambda code: {"turnover": 4.0, "price": 10.0, "name": "创业板牛牛", "source": "test"}
             candidate = niu_candidate(code="300001", name="创业板牛牛")
             state = {"cash": 100000.0, "positions": {}, "trade_log": []}
             decision = {
@@ -4950,7 +5199,7 @@ class NiuOneStrategyTests(unittest.TestCase):
         original_quote = trader.execution_quote
         try:
             trader.is_a_share_execution_time = lambda dt=None: (True, "连续竞价交易时段")
-            trader.execution_quote = lambda code: {"price": 10.0, "name": "牛牛测试", "source": "test"}
+            trader.execution_quote = lambda code: {"turnover": 4.0, "price": 10.0, "name": "牛牛测试", "source": "test"}
             positions = {
                 f"60001{index}": {
                     "code": f"60001{index}",
@@ -5200,6 +5449,7 @@ class NiuOneStrategyTests(unittest.TestCase):
                 "连续竞价交易时段",
             )
             trader.execution_quote = lambda code: {
+                "turnover": 4.0,
                 "price": 11.0 if code == "600099" else 10.0,
                 "prev_close": 10.0,
                 "name": code,
@@ -5282,6 +5532,7 @@ class NiuOneStrategyTests(unittest.TestCase):
                 "连续竞价交易时段",
             )
             trader.execution_quote = lambda code: {
+                "turnover": 4.0,
                 "price": 10.0,
                 "prev_close": 10.0,
                 "name": f"牛牛{code}",
@@ -5362,6 +5613,7 @@ class NiuOneStrategyTests(unittest.TestCase):
                 "连续竞价交易时段",
             )
             trader.execution_quote = lambda code: {
+                "turnover": 4.0,
                 "price": 10.0,
                 "prev_close": 10.0,
                 "name": f"牛牛{code}",
@@ -5526,6 +5778,7 @@ class NiuOneStrategyTests(unittest.TestCase):
         try:
             trader.is_a_share_execution_time = lambda dt=None: (True, "连续竞价交易时段")
             trader.execution_quote = lambda code: {
+                "turnover": 4.0,
                 "price": rows[-1]["close"],
                 "name": "牛牛全链路",
                 "source": "test",

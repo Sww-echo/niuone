@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import math
 from typing import Any
 
 from .lifecycle import (
@@ -25,10 +26,12 @@ NIUONE_TODAY_OBSERVATION_THRESHOLD = 60.0
 NIUONE_LEADER_MIN_SECTOR_RANK = 80.0
 NIUONE_MATURE_MIN_MARKET_AMOUNT_PERCENTILE = 60.0
 NIUONE_MATURE_MIN_THEME_AMOUNT_PERCENTILE = 50.0
+NIUONE_MIN_ENTRY_TURNOVER_PCT = 3.0
 NIUONE_DAILY_V_MIN_RECOVERY_RATIO = 0.60
 NIUONE_DAILY_V_MAX_RECOVERY_RATIO = 2.0
 NIUONE_REVERSAL_CONTINUATION_MIN_STRONG_COUNT = 6
 NIUONE_REVERSAL_CONTINUATION_MIN_STATE_STREAK = 3
+NIUONE_REVERSAL_ENTRY_MAX_CHANGE_PCT_EXCLUSIVE = 3.0
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -86,22 +89,15 @@ def niuone_stock_activity_blocker(
     strategy_id: str,
     values: Mapping[str, Any],
 ) -> str | None:
-    """Require deterministic capital participation for mature mainline entries.
+    """Require observed capital participation for every NiuOne BUY route.
 
-    The gate is opt-in so legacy/manual contexts remain readable. Current
-    NiuOne contexts always set ``stock_activity_gate_required`` and therefore
-    fail closed when turnover-amount evidence is unavailable or too weak.
-    Probe entries stay exempt because their small risk budget is intended to
-    discover an early theme before it becomes broadly visible.
+    The legacy opt-in flag remains readable metadata, never an exemption.
+    Intraday turnover is actual cumulative turnover, not a full-day estimate.
     """
-    if (
-        strategy_id == "niu_reversal_probe"
-        or strategy_id not in {"niu_leader", "niu_pullback", "niu_emerging"}
-        or values.get("stock_activity_gate_required") is not True
-    ):
+    if strategy_id not in NIUONE_LIFECYCLE_ACTION_LABELS:
         return None
     if values.get("stock_activity_data_available") is not True:
-        return "个股成交活跃度数据不可用，成熟主线路径暂停入选"
+        return "个股成交活跃度数据不可用，牛牛各阶段暂停入选"
     market_percentile = _safe_float(
         values.get("stock_market_amount_percentile"),
         -1.0,
@@ -111,7 +107,11 @@ def niuone_stock_activity_blocker(
         -1.0,
     )
     if (
-        market_percentile + 1e-9
+        not math.isfinite(market_percentile)
+        or not math.isfinite(theme_percentile)
+        or not 0 <= market_percentile <= 100
+        or not 0 <= theme_percentile <= 100
+        or market_percentile + 1e-9
         < NIUONE_MATURE_MIN_MARKET_AMOUNT_PERCENTILE
         or theme_percentile + 1e-9
         < NIUONE_MATURE_MIN_THEME_AMOUNT_PERCENTILE
@@ -120,6 +120,46 @@ def niuone_stock_activity_blocker(
             "个股成交活跃度不足（全市场成交额分位需≥"
             f"{NIUONE_MATURE_MIN_MARKET_AMOUNT_PERCENTILE:g}，题材内需≥"
             f"{NIUONE_MATURE_MIN_THEME_AMOUNT_PERCENTILE:g}）"
+        )
+    return niuone_turnover_blocker(values.get("turnover"))
+
+
+def niuone_turnover_blocker(turnover: Any) -> str | None:
+    """Check cumulative turnover in percentage points, including exactly 3%."""
+    value = _safe_float(turnover, math.nan)
+    if isinstance(turnover, bool) or not math.isfinite(value) or value < 0:
+        return "个股换手率数据不可用，牛牛各阶段暂停买入"
+    if value + 1e-9 < NIUONE_MIN_ENTRY_TURNOVER_PCT:
+        return f"个股当日累计换手率需≥{NIUONE_MIN_ENTRY_TURNOVER_PCT:g}%，当前{value:.2f}%"
+    return None
+
+
+def niu_reversal_entry_price_blocker(
+    *,
+    price: Any,
+    previous_close: Any,
+) -> str | None:
+    """Reject chased first probes using the execution price, never a scan price.
+
+    Composition layers call this only for a zero-position Probe BUY. Existing
+    holdings and mature entry routes keep their own scale-in/entry policies.
+    """
+    current = _safe_float(price, math.nan)
+    reference = _safe_float(previous_close, math.nan)
+    if (
+        isinstance(price, bool)
+        or isinstance(previous_close, bool)
+        or not math.isfinite(current)
+        or not math.isfinite(reference)
+        or current <= 0
+        or reference <= 0
+    ):
+        return "牛牛试仓新开仓缺少有效现价或前收盘价，等待有效报价"
+    change_pct = (current / reference - 1.0) * 100.0
+    if change_pct >= NIUONE_REVERSAL_ENTRY_MAX_CHANGE_PCT_EXCLUSIVE - 1e-9:
+        return (
+            f"牛牛试仓新开仓涨幅{change_pct:.2f}%达到"
+            f"{NIUONE_REVERSAL_ENTRY_MAX_CHANGE_PCT_EXCLUSIVE:g}%，等待回落后重新评估"
         )
     return None
 

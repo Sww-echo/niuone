@@ -215,6 +215,11 @@ class StrategySelectionBacktestingTests(unittest.TestCase):
 
         def scored(strategy_id):
             return {
+                "stock_activity_data_available": True,
+                "stock_market_amount_percentile": 90.0,
+                "stock_theme_amount_percentile": 75.0,
+                "turnover": 4.0,
+                "recent_close": 10.0,
                 "stop_price": 9.5,
                 "stop_source": "niu_structure_low",
                 "atr20": 0.5,
@@ -350,6 +355,10 @@ class StrategySelectionBacktestingTests(unittest.TestCase):
                     strategy_id="niu_leader",
                     score=9.0 - index / 10,
                     metadata={"scored": {
+                        "stock_activity_data_available": True,
+                        "stock_market_amount_percentile": 90.0,
+                        "stock_theme_amount_percentile": 75.0,
+                        "turnover": 4.0,
                         "stop_price": 9.5,
                         "atr20": 0.5,
                         "gap_buffer_pct": 0.5,
@@ -425,6 +434,10 @@ class StrategySelectionBacktestingTests(unittest.TestCase):
                     strategy_id="niu_leader",
                     score=decision_score,
                     metadata={"scored": {
+                        "stock_activity_data_available": True,
+                        "stock_market_amount_percentile": 90.0,
+                        "stock_theme_amount_percentile": 75.0,
+                        "turnover": 4.0,
                         "decision_score": decision_score,
                         "stop_price": 9.5,
                         "atr20": 0.5,
@@ -527,6 +540,10 @@ class StrategySelectionBacktestingTests(unittest.TestCase):
 
     def test_niuone_structure_gate_uses_market_open_before_slippage(self):
         scored = {
+            "stock_activity_data_available": True,
+            "stock_market_amount_percentile": 90.0,
+            "stock_theme_amount_percentile": 75.0,
+            "turnover": 4.0,
             "stop_price": 9.4,
             "atr20": 0.5,
             "gap_buffer_pct": 0.5,
@@ -633,6 +650,10 @@ class StrategySelectionBacktestingTests(unittest.TestCase):
 
     def test_niuone_backtest_allows_defensive_entry_but_not_hard_stop(self):
         scored = {
+            "stock_activity_data_available": True,
+            "stock_market_amount_percentile": 90.0,
+            "stock_theme_amount_percentile": 75.0,
+            "turnover": 4.0,
             "recent_close": 10.0,
             "stop_price": 9.5,
             "stop_source": "niu_structure_low",
@@ -980,6 +1001,11 @@ class StrategySelectionBacktestingTests(unittest.TestCase):
             daily_bar("2026-01-07", 10.0, 10.0, industry="半导体"),
         ]
         scored = {
+            "stock_activity_data_available": True,
+            "stock_market_amount_percentile": 90.0,
+            "stock_theme_amount_percentile": 75.0,
+            "turnover": 4.0,
+            "recent_close": 10.0,
             "stop_price": 9.5,
             "atr20": 0.5,
             "gap_buffer_pct": 0.5,
@@ -1053,6 +1079,75 @@ class StrategySelectionBacktestingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"within \(0, 1\]"):
             NiuOneStrategyBacktestPolicy(entry_order_scale=0)
 
+    def test_entry_activity_uses_signal_turnover_never_next_session_totals(self):
+        scored = {
+            "stock_activity_data_available": True,
+            "stock_market_amount_percentile": 90.0,
+            "stock_theme_amount_percentile": 75.0,
+            "recent_close": 10.0, "stop_price": 9.5, "atr20": 0.5,
+            "gap_buffer_pct": 0.5, "execution_buffer_pct": 0.2,
+            "industry": "半导体", "market_regime": "offensive",
+            "market_allows_buys": True, "market_hard_stop": False,
+        }
+        policy = NiuOneStrategyBacktestPolicy()
+        for signal_turnover, next_day_turnover in ((None, 20), (2.999, 20), (3.0, 0.5)):
+            with self.subTest(signal=signal_turnover, next_day=next_day_turnover):
+                bar = HistoricalBar.from_value("600000", daily_bar(
+                    "2026-01-06", 10.0, turnover=next_day_turnover,
+                ))
+                result = policy.size_entry(
+                    SelectionSignal("600000", strategy_id="niu_reversal_probe", score=9.0,
+                                    metadata={"scored": {**scored, "turnover": signal_turnover}}),
+                    bar, 10.0, None, {}, {}, 100000.0, 100000.0, 0, SelectionCostModel(),
+                )
+                if signal_turnover == 3.0:
+                    self.assertGreater(result.units, 0)
+                else:
+                    self.assertEqual(result.reason, "stock_activity")
+                    self.assertEqual(result.units, 0)
+                    # An existing position and research price override cannot bypass activity.
+                    research_policy = NiuOneStrategyBacktestPolicy(reversal_max_execution_gap_pct=10.0)
+                    added = research_policy.size_entry(
+                        SelectionSignal("600000", strategy_id="niu_reversal_probe", score=9.0,
+                                        metadata={"scored": {**scored, "turnover": signal_turnover}}),
+                        bar, 10.0, {"remaining_units": 100}, {}, {},
+                        100000.0, 100000.0, 0, SelectionCostModel(),
+                    )
+                    self.assertEqual(added.reason, "stock_activity")
+
+    def test_default_probe_entry_guard_uses_fill_price_and_fails_closed(self):
+        scored = {
+            "stock_activity_data_available": True,
+            "stock_market_amount_percentile": 90.0,
+            "stock_theme_amount_percentile": 75.0,
+            "turnover": 4.0,
+            "recent_close": 10.0, "stop_price": 10.0, "atr20": 0.5,
+            "gap_buffer_pct": 0.5, "execution_buffer_pct": 0.2,
+            "industry": "半导体", "market_regime": "offensive",
+            "market_allows_buys": True, "market_hard_stop": False,
+        }
+        bar = HistoricalBar.from_value("600000", daily_bar("2026-01-06", 10.29))
+        policy = NiuOneStrategyBacktestPolicy()
+        for price, previous_close, rejected in (
+            (10.299, 10.0, False), (10.3, 10.0, True),
+            (10.31, 10.0, True), (10.1, None, True),
+            (10.1, float("nan"), True), (10.1, float("inf"), True),
+        ):
+            with self.subTest(price=price, previous_close=previous_close):
+                result = policy.size_entry(
+                    SelectionSignal(
+                        "600000", strategy_id="niu_reversal_probe", score=9.0,
+                        metadata={"scored": {**scored, "recent_close": previous_close}},
+                    ),
+                    bar, price, None, {}, {}, 100000.0, 100000.0, 0,
+                    SelectionCostModel(),
+                )
+                if rejected:
+                    self.assertEqual(result.reason, "reversal_entry_price")
+                    self.assertEqual(result.units, 0)
+                else:
+                    self.assertGreater(result.units, 0)
+
     def test_reversal_execution_gap_cap_is_research_configurable(self):
         rows = [
             daily_bar("2026-01-05", 10.0, 10.0, industry="半导体"),
@@ -1060,6 +1155,10 @@ class StrategySelectionBacktestingTests(unittest.TestCase):
             daily_bar("2026-01-07", 10.2, 10.2, industry="半导体"),
         ]
         scored = {
+            "stock_activity_data_available": True,
+            "stock_market_amount_percentile": 90.0,
+            "stock_theme_amount_percentile": 75.0,
+            "turnover": 4.0,
             "score": 8.0,
             "recent_close": 10.0,
             "stop_price": 9.5,
@@ -1120,6 +1219,10 @@ class StrategySelectionBacktestingTests(unittest.TestCase):
 
     def test_markup_momentum_probe_replays_wide_stop_with_four_percent_cap(self):
         scored = {
+            "stock_activity_data_available": True,
+            "stock_market_amount_percentile": 90.0,
+            "stock_theme_amount_percentile": 75.0,
+            "turnover": 4.0,
             "score": 8.0,
             "recent_close": 10.0,
             "stop_price": 8.4,
@@ -1211,6 +1314,11 @@ class StrategySelectionBacktestingTests(unittest.TestCase):
                 strategy_id=strategy_id,
                 score=9.0,
                 metadata={"scored": {
+                    "stock_activity_data_available": True,
+                    "stock_market_amount_percentile": 90.0,
+                    "stock_theme_amount_percentile": 75.0,
+                    "turnover": 4.0,
+                    "recent_close": 10.0,
                     "stop_price": 9.5,
                     "atr20": 0.5,
                     "gap_buffer_pct": 0.5,
@@ -1566,6 +1674,10 @@ class StrategySelectionBacktestingTests(unittest.TestCase):
             strategy_id="niu_reversal_probe",
             score=8.0,
             metadata={"scored": {
+                "stock_activity_data_available": True,
+                "stock_market_amount_percentile": 90.0,
+                "stock_theme_amount_percentile": 75.0,
+                "turnover": 4.0,
                 "stop_price": 9.0,
                 "market_regime": "recovery",
             }},

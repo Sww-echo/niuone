@@ -29,6 +29,8 @@ from ..policy import (
     NIUONE_MATURE_MIN_MARKET_AMOUNT_PERCENTILE,
     NIUONE_MATURE_MIN_THEME_AMOUNT_PERCENTILE,
     NIUONE_TODAY_OBSERVATION_THRESHOLD,
+    niuone_turnover_blocker,
+    niuone_stock_activity_blocker,
 )
 from ..lifecycle import (
     niuone_lifecycle_entry_blocker,
@@ -399,6 +401,9 @@ def _member_metrics(item: dict[str, Any]) -> dict[str, Any] | None:
     quote_amount = safe_float(quote.get("amount"))
     row_amount = safe_float(latest.get("quote_amount"))
     resolved_amount = quote_amount if quote_amount is not None else row_amount
+    turnover = safe_float(quote.get("turnover"))
+    if turnover is None:
+        turnover = safe_float(latest.get("quote_turnover"))
     return {
         "code": _stock_code(item.get("code") or latest.get("symbol_code")),
         "name": str(item.get("name") or latest.get("stock_name") or ""),
@@ -411,7 +416,12 @@ def _member_metrics(item: dict[str, Any]) -> dict[str, Any] | None:
         "new_high20": bool(highs and close >= max(highs)),
         "volume_ratio": volume_ratio,
         "amount": max(0.0, resolved_amount or 0.0),
-        "amount_available": resolved_amount is not None,
+        "amount_available": (
+            resolved_amount is not None
+            and math.isfinite(resolved_amount)
+            and resolved_amount > 0
+        ),
+        "turnover": turnover,
         "change_pct": live_change if live_change is not None else (safe_float(latest.get("change_pct")) or 0.0),
         "live_change_available": live_change is not None,
         "previous_close": previous_close,
@@ -1963,6 +1973,7 @@ def build_niuone_context(
             )
             activity_confirmed = bool(
                 member.get("amount_available")
+                and niuone_turnover_blocker(member.get("turnover")) is None
                 and market_amount_percentile
                 >= NIUONE_MATURE_MIN_MARKET_AMOUNT_PERCENTILE
                 and theme_amount_percentile
@@ -2033,6 +2044,7 @@ def build_niuone_context(
                 "strong_score": round(float(member["strong_score"]), 2),
                 "amount": round(float(member["amount"]), 2),
                 "amount_available": bool(member.get("amount_available")),
+                "turnover": member.get("turnover"),
                 "market_amount_percentile": round(
                     market_amount_percentile,
                     2,
@@ -2224,6 +2236,7 @@ def build_niuone_context(
                     "strong_score",
                     "amount",
                     "amount_available",
+                    "turnover",
                     "market_amount_percentile",
                     "theme_amount_percentile",
                     "volume_participation_percentile",
@@ -2643,6 +2656,19 @@ def _entry_metrics(
     market = context.get("market") if isinstance(context.get("market"), dict) else {}
     if not isinstance(theme, dict) or not isinstance(stock, dict):
         return None
+    if "quote_turnover" in latest:
+        # Holding-only rescans retain the full-market amount ranks, but must
+        # use this scan's actual turnover, including a missing fresh value.
+        stock["turnover"] = latest.get("quote_turnover")
+        stock["activity_confirmed"] = niuone_stock_activity_blocker(
+            strategy_name,
+            {
+                "stock_activity_data_available": stock.get("amount_available"),
+                "stock_market_amount_percentile": stock.get("market_amount_percentile"),
+                "stock_theme_amount_percentile": stock.get("theme_amount_percentile"),
+                "turnover": stock.get("turnover"),
+            },
+        ) is None
     close = float(common["close"])
     atr = float(common["atr"])
     intraday_low = safe_float(common.get("row_intraday_low"))
@@ -2928,6 +2954,7 @@ def _payload(
             stock.get("activity_gate_required")
         ),
         "stock_activity_data_available": bool(stock.get("amount_available")),
+        "turnover": stock.get("turnover"),
         "stock_amount": stock.get("amount"),
         "stock_market_amount_percentile": stock.get(
             "market_amount_percentile"
@@ -3010,9 +3037,9 @@ def _payload(
             "min_entry_extension_atr",
             0.0,
         ),
-        # Retained as a compatibility field for older Dashboard payloads.  A
-        # NiuOne entry no longer has a fixed daily-gain cap; the execution
-        # layer rejects only a quote that is actually at its board limit.
+        # Retained for older Dashboard payloads. Scoring does not cap daily
+        # gains; first Probe entries recheck the actual quote at execution,
+        # alongside the board-limit guard shared by all entry routes.
         "max_entry_change_pct": chase_limits.get("max_entry_change_pct"),
         "max_entry_extension_atr": chase_limits["max_entry_extension_atr"],
         "gap_buffer_pct": safe_round(metrics["gap_buffer_pct"], 3),
@@ -3145,12 +3172,6 @@ def _common_risks(
         or metrics["stock"].get("strong") is not True
     ):
         risks.append("个股未进入强势行业龙头梯队")
-    if (
-        strategy_name == "niu_reversal_probe"
-        and metrics["stock"].get("activity_gate_required") is True
-        and metrics["stock"].get("activity_confirmed") is not True
-    ):
-        risks.append("个股成交活跃度未达成熟主线标准，仅允许轻仓试仓")
     news = metrics["stock"].get("news_precheck") or {}
     if news.get("available") and news.get("tone") == "negative":
         risks.append("近3日个股消息面偏利空")

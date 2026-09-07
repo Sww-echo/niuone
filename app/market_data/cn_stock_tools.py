@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import math
 import statistics
 import sys
 import time
@@ -66,6 +67,17 @@ def normalize_symbol(raw):
     return {"raw": raw, "market": market, "code": code, "secid": secid, "display": market + code}
 
 
+def _turnover_pct(value: object, *, divisor: float = 1.0) -> float | None:
+    """Normalize provider turnover units without discarding a usable price."""
+    if isinstance(value, bool):
+        return None
+    try:
+        result = float(value) / divisor
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) and result >= 0 else None
+
+
 def get_quote(symbol):
     sym = normalize_symbol(symbol)
     try:
@@ -105,6 +117,7 @@ def get_quote(symbol):
             "amplitude_pct": pct(data.get("f171")),
             "volume_lots": amount(data.get("f47")),
             "turnover_yuan": amount(data.get("f48")),
+            "turnover": _turnover_pct(data.get("f168"), divisor=100.0),
             "volume_ratio": data.get("f50"),
             "source": "Eastmoney push2 quote"
         }
@@ -137,6 +150,7 @@ def get_quote(symbol):
             "amplitude_pct": amplitude_pct,
             "volume_lots": float(parts[6]),
             "turnover_yuan": float(parts[37]) * 10000,
+            "turnover": _turnover_pct(parts[38]) if len(parts) > 38 else None,
             "volume_ratio": None,
             "source": "Tencent qt quote fallback"
         }

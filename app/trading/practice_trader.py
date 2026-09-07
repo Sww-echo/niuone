@@ -162,6 +162,8 @@ from strategies.performance import (
 )
 from strategies.policy import (
     candidate_buy_blockers as _strategy_candidate_buy_blockers,
+    niu_reversal_entry_price_blocker,
+    niuone_turnover_blocker,
     niuone_markup_rebalance_observation,
     niuone_markup_rebalance_reentry_blocker,
     niuone_markup_upgrade_blocker,
@@ -2047,7 +2049,8 @@ def normalize_quote_price(price: float | None, *fallbacks: float | None) -> floa
 def build_quote(code: str, name: str, price: float, prev_close: float | None, open_price: float | None,
                 high: float | None, low: float | None, turnover_yuan: float | None, source: str,
                 quote_time: str | None = None, volume_lots: float | None = None,
-                volume_ratio: float | None = None) -> dict[str, Any]:
+                volume_ratio: float | None = None,
+                turnover: float | None = None) -> dict[str, Any]:
     change = round(price - prev_close, 2) if prev_close else None
     change_pct = round((change / prev_close) * 100, 2) if change is not None and prev_close else None
     return {
@@ -2061,6 +2064,7 @@ def build_quote(code: str, name: str, price: float, prev_close: float | None, op
         "change": change,
         "change_pct": change_pct,
         "turnover_yuan": turnover_yuan,
+        "turnover": turnover,
         "volume_lots": volume_lots,
         "volume_ratio": volume_ratio,
         "quote_time": quote_time or now_ts(),
@@ -2106,6 +2110,7 @@ def parse_tencent_quote_line(line: str) -> dict[str, Any] | None:
         source="Tencent qt realtime quote",
         quote_time=quote_time or None,
         volume_lots=safe_quote_float(parts[6]),
+        turnover=safe_quote_float(parts[38]) if len(parts) > 38 else None,
     )
 
 
@@ -2160,6 +2165,7 @@ def quote_one_as_realtime(code: str) -> dict[str, Any] | None:
         source=q.get("source") or "cn_stock_tools quote fallback",
         volume_lots=q.get("volume_lots") if isinstance(q.get("volume_lots"), (int, float)) else None,
         volume_ratio=q.get("volume_ratio") if isinstance(q.get("volume_ratio"), (int, float)) else None,
+        turnover=q.get("turnover") if isinstance(q.get("turnover"), (int, float)) else None,
     )
 
 
@@ -2194,6 +2200,7 @@ def parse_eastmoney_stock(data: dict[str, Any]) -> dict[str, Any] | None:
         source="Eastmoney push2 stock/get realtime quote",
         volume_lots=data.get("f47") if isinstance(data.get("f47"), (int, float)) else None,
         volume_ratio=data.get("f50") if isinstance(data.get("f50"), (int, float)) else None,
+        turnover=data.get("f168") if isinstance(data.get("f168"), (int, float)) else None,
     )
 
 
@@ -2236,7 +2243,7 @@ def fetch_eastmoney_quotes(codes: list[str]) -> tuple[dict[str, dict[str, Any]],
                 "--data-urlencode", f"ut={EASTMONEY_UT}",
                 "--data-urlencode", "fltt=2",
                 "--data-urlencode", "invt=2",
-                "--data-urlencode", "fields=f43,f57,f58,f60,f169,f170,f46,f44,f45,f47,f48,f50",
+                "--data-urlencode", "fields=f43,f57,f58,f60,f169,f170,f46,f44,f45,f47,f48,f50,f168",
             ], capture_output=True, text=True, timeout=10)
             if proc.returncode != 0 or not proc.stdout.strip():
                 errors.append(f"{code}:curl{proc.returncode}")
@@ -5570,6 +5577,7 @@ NIUONE_ENTRY_CONTEXT_FIELDS = (
     "entry_stock_market_amount_percentile",
     "entry_stock_theme_amount_percentile",
     "entry_stock_activity_confirmed",
+    "entry_turnover_pct",
     "entry_daily_v_recovery_ratio",
     "entry_signal_score",
     "entry_candidate_pool_size",
@@ -11164,6 +11172,24 @@ def execute_actions(
                     category="candidate_eligibility",
                 )
                 continue
+            if buy_strategy == "niu_reversal_probe" and old_qty <= 0:
+                entry_price_blocker = niu_reversal_entry_price_blocker(
+                    price=price,
+                    previous_close=q.get("prev_close"),
+                )
+                if entry_price_blocker:
+                    add_execution_block(
+                        decision,
+                        code,
+                        entry_price_blocker,
+                        category="entry_price_quality",
+                    )
+                    continue
+            if is_niuone_strategy(buy_strategy):
+                turnover_blocker = niuone_turnover_blocker(q.get("turnover"))
+                if turnover_blocker:
+                    add_execution_block(decision, code, turnover_blocker, category="stock_activity")
+                    continue
             if is_niuone_strategy(buy_strategy) and quote_is_at_limit_up(code, str(name), q):
                 add_execution_block(
                     decision,
@@ -12261,6 +12287,7 @@ def execute_actions(
                     signal_theme = niuone_candidate_theme(candidate)
                     if old_qty <= 0:
                         pos["entry_theme"] = signal_theme
+                        pos["entry_turnover_pct"] = q.get("turnover")
                         pos["active_theme"] = signal_theme
                         pos["entry_stock_activity_score"] = candidate.get(
                             "stock_activity_score"

@@ -60,6 +60,8 @@ try:
         niuone_structure_risk_ok,
     )
     from app.strategies.policy import (
+        niu_reversal_entry_price_blocker,
+        niuone_stock_activity_blocker,
         niuone_markup_rebalance_observation,
         niuone_markup_rebalance_reentry_blocker,
         niuone_markup_upgrade_blocker,
@@ -124,6 +126,8 @@ except ImportError:  # pragma: no cover - legacy top-level import path
         niuone_structure_risk_ok,
     )
     from strategies.policy import (
+        niu_reversal_entry_price_blocker,
+        niuone_stock_activity_blocker,
         niuone_markup_rebalance_observation,
         niuone_markup_rebalance_reentry_blocker,
         niuone_markup_upgrade_blocker,
@@ -1738,6 +1742,8 @@ class NiuOneStrategyBacktestPolicy(NiuOneDailyExitStrategy):
         action = "add" if is_add else "open"
         if strategy_id not in NIUONE_ABSOLUTE_POSITION_CAP_PCT:
             return PortfolioEntryDecision(0, "reject", "unsupported_strategy")
+        if niuone_stock_activity_blocker(strategy_id, scored):
+            return PortfolioEntryDecision(0, "reject", "stock_activity")
         if (
             strategy_id == "niu_emerging"
             and entry_subroute == NIUONE_MARKUP_MOMENTUM_PROBE_SUBROUTE
@@ -1748,6 +1754,20 @@ class NiuOneStrategyBacktestPolicy(NiuOneDailyExitStrategy):
                 "reject",
                 "markup_momentum_identity_block",
             )
+        if (
+            not is_add
+            and strategy_id == "niu_reversal_probe"
+            and self.reversal_max_execution_gap_pct is None
+        ):
+            # Default replay uses the production first-entry guard, including
+            # modeled fill slippage. Explicit research caps below retain their
+            # historical next-open comparison for controlled experiments.
+            entry_price_blocker = niu_reversal_entry_price_blocker(
+                price=entry_price,
+                previous_close=scored.get("recent_close"),
+            )
+            if entry_price_blocker:
+                return PortfolioEntryDecision(0, "reject", "reversal_entry_price")
         if (
             not is_add
             and strategy_id == "niu_reversal_probe"

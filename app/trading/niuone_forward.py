@@ -58,12 +58,18 @@ from app.strategies.policy import (
     NIUONE_LEADER_MIN_SECTOR_RANK,
     NIUONE_REVERSAL_CONTINUATION_MIN_STATE_STREAK,
     NIUONE_REVERSAL_CONTINUATION_MIN_STRONG_COUNT,
+    NIUONE_REVERSAL_ENTRY_MAX_CHANGE_PCT_EXCLUSIVE,
+    NIUONE_MIN_ENTRY_TURNOVER_PCT,
+    NIUONE_MATURE_MIN_MARKET_AMOUNT_PERCENTILE,
+    NIUONE_MATURE_MIN_THEME_AMOUNT_PERCENTILE,
+    niuone_turnover_blocker,
+    niuone_stock_activity_blocker,
     NIUONE_TODAY_OBSERVATION_THRESHOLD,
 )
 from app.strategies.selection import strategy_daily_candidate_limit
 
 
-DEFAULT_COHORT_START = "2026-09-03"
+DEFAULT_COHORT_START = "2026-09-08"
 DEFAULT_MIN_COMPLETED_TRADES = 30
 DEFAULT_MIN_CALENDAR_MONTHS = 3
 DEFAULT_SHADOW_EXECUTION_GAP_PCT = 1.0
@@ -72,7 +78,7 @@ DEFAULT_HISTORICAL_REFERENCE_WIN_RATE_PCT = 59.71
 DEFAULT_WIN_RATE_CONFIDENCE_LEVEL = 0.95
 DEFAULT_MAX_PORTFOLIO_DRAWDOWN_PCT = 6.0
 DEFAULT_MIN_RETURN_TO_DRAWDOWN_RATIO = 1.0
-FORWARD_PROTOCOL_VERSION = "niuone-strict-forward-v48"
+FORWARD_PROTOCOL_VERSION = "niuone-strict-forward-v50"
 FORWARD_PERFORMANCE_CLUSTER_UNIT = "entry_date_x_entry_theme"
 FORWARD_SHADOW_CANDIDATES = {
     "execution_gap": "round13_execution_gap_le_1pct",
@@ -88,6 +94,7 @@ FORWARD_REQUIRED_ENTRY_CONTEXT_FIELDS = (
     "entry_stock_market_amount_percentile",
     "entry_stock_theme_amount_percentile",
     "entry_stock_activity_confirmed",
+    "entry_turnover_pct",
     "entry_same_stage_candidate_rank",
     "entry_execution_gap_pct",
     "entry_daily_v_recovery_ratio",
@@ -562,10 +569,15 @@ def decision_candidate_evidence_gaps(
             elif (
                 candidate.get("eligible_for_decision") is True
                 and strategy_id
-                in {"niu_leader", "niu_pullback", "niu_emerging"}
+                in {"niu_leader", "niu_pullback", "niu_emerging", "niu_reversal_probe"}
                 and activity_confirmed is not True
             ):
                 gaps.add("candidate_evidence.stock_activity_consistency")
+            if candidate.get("eligible_for_decision") is True:
+                if niuone_turnover_blocker(candidate.get("turnover")):
+                    gaps.add("candidate_evidence.turnover")
+                if niuone_stock_activity_blocker(strategy_id, candidate):
+                    gaps.add("candidate_evidence.stock_activity_consistency")
     return tuple(sorted(gaps))
 
 
@@ -1598,23 +1610,25 @@ def _entry_attribution_gaps(row: Mapping[str, Any]) -> tuple[str, ...]:
     ):
         if _number(context.get(field)) is None:
             gaps.append(field)
-    for field in (
-        "entry_stock_activity_score",
-        "entry_stock_market_amount_percentile",
-        "entry_stock_theme_amount_percentile",
+    for field, minimum in (
+        ("entry_stock_activity_score", 0),
+        ("entry_stock_market_amount_percentile", NIUONE_MATURE_MIN_MARKET_AMOUNT_PERCENTILE),
+        ("entry_stock_theme_amount_percentile", NIUONE_MATURE_MIN_THEME_AMOUNT_PERCENTILE),
     ):
         value = _number(context.get(field))
-        if value is None or value < 0 or value > 100:
+        if value is None or value < minimum or value > 100:
             gaps.append(field)
     activity_confirmed = context.get("entry_stock_activity_confirmed")
     if not isinstance(activity_confirmed, bool):
         gaps.append("entry_stock_activity_confirmed")
     elif (
         str(row.get("entry_strategy") or "").strip()
-        in {"niu_leader", "niu_pullback", "niu_emerging"}
+        in {"niu_leader", "niu_pullback", "niu_emerging", "niu_reversal_probe"}
         and activity_confirmed is not True
     ):
         gaps.append("entry_stock_activity_confirmed")
+    if niuone_turnover_blocker(context.get("entry_turnover_pct")):
+        gaps.append("entry_turnover_pct")
     rank = _number(context.get("entry_same_stage_candidate_rank"))
     if rank is None or rank <= 0 or not float(rank).is_integer():
         gaps.append("entry_same_stage_candidate_rank")
@@ -3389,6 +3403,24 @@ def evaluate_niuone_forward(
             ),
             "exit_feedback_confidence_level": (
                 EXIT_FEEDBACK_CONFIDENCE_LEVEL
+            ),
+            "niuone_reversal_entry_maximum_change_pct_exclusive": (
+                NIUONE_REVERSAL_ENTRY_MAX_CHANGE_PCT_EXCLUSIVE
+            ),
+            "niuone_minimum_entry_turnover_pct": NIUONE_MIN_ENTRY_TURNOVER_PCT,
+            "niuone_minimum_market_amount_percentile": NIUONE_MATURE_MIN_MARKET_AMOUNT_PERCENTILE,
+            "niuone_minimum_theme_amount_percentile": NIUONE_MATURE_MIN_THEME_AMOUNT_PERCENTILE,
+            "niuone_all_stage_activity_rule": (
+                "Every NiuOne entry and add requires actual cumulative same-day "
+                "turnover >= minimum and valid market/theme amount ranks; no "
+                "Probe or legacy opt-out. Execution rechecks quoted turnover. "
+                "Daily backtests use signal-day observed data, never next-day totals."
+            ),
+            "niuone_reversal_entry_price_rule": (
+                "First or reopened Probe BUY requires a finite positive quote "
+                "previous close and execution-price change strictly below the "
+                "maximum; scan price/percentage cannot replace that reference. "
+                "Existing-position adds and other entry strategies retain their rules."
             ),
             "niuone_reversal_minimum_recovery_ratio_inclusive": (
                 NIUONE_DAILY_V_MIN_RECOVERY_RATIO
