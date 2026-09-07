@@ -7,6 +7,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest.mock import patch
 from datetime import datetime
 from pathlib import Path
 
@@ -32,6 +33,33 @@ from trading.niuone_forward import (  # noqa: E402
 
 
 class TradeAccountingTests(unittest.TestCase):
+    def test_performance_reads_durable_opening_fill_outside_recent_json(self):
+        db_path = Path(self.temp_dir.name) / "performance.db"
+        buy = {"time": "2026-09-08 10:00:00", "action": "BUY", "code": "600000",
+               "shares": 100, "price": 10, "amount": 1000, "fee": 2,
+               "position_before_qty": 0, "position_after_qty": 100,
+               "buy_strategy": "niu_reversal_probe"}
+        sell = {**buy, "time": "2026-09-09 10:00:00", "action": "SELL", "price": 11,
+                "amount": 1100, "pnl": 96, "position_before_qty": 100, "position_after_qty": 0}
+        state = self._base_state(trade_log=[sell])
+        with patch.object(practice_db, "DB_PATH", db_path):
+            practice_db.init_db()
+            self.assertTrue(practice_db.record_trade(buy))
+            self.assertTrue(practice_db.record_trade(sell))
+            performance = trader.build_strategy_performance(state)
+        self.assertTrue(performance["history_complete"])
+        self.assertEqual(performance["source"]["database_trade_row_count"], 2)
+        self.assertEqual(performance["summary"]["closed_trades"], 1)
+        self.assertEqual(performance["summary"]["win_rate"], 100)
+        self.assertEqual(performance["summary"]["total_pnl"], 96)
+        self.assertEqual(state["trade_log"], [sell])
+        with patch.object(practice_db, "DB_PATH", db_path.with_name("missing.db")):
+            fallback = trader.build_strategy_performance(self._base_state(trade_log=[buy, sell]))
+        self.assertFalse(fallback["history_complete"])
+        self.assertEqual(fallback["source"]["error_type"], "FileNotFoundError")
+        self.assertIsNone(fallback["summary"]["win_rate"])
+        self.assertIsNone(fallback["buy_strategy"]["niu_reversal_probe"]["win_rate"])
+
     def setUp(self):
         self.original_state_file = trader.STATE_FILE
         self.original_archive = trader._archive_account_history_before_compaction
@@ -1044,8 +1072,10 @@ class TradeAccountingTests(unittest.TestCase):
         portfolio = trader.enrich_portfolio(state)
         markers = compact_trade_markers(state["trade_log"])
 
-        self.assertEqual(performance["summary"]["closed_trades"], 1)
-        self.assertEqual(performance["summary"]["total_pnl"], 990.0)
+        self.assertEqual(performance["summary"]["closed_trades"], 0)
+        self.assertEqual(performance["summary"]["total_pnl"], 0.0)
+        self.assertEqual(performance["summary"]["sell_fill_count"], 1)
+        self.assertEqual(performance["summary"]["realized_pnl_all_sells"], 990.0)
         self.assertEqual(len(sold_rows), 1)
         self.assertEqual(sold_rows[0]["shares"], 1000)
         self.assertEqual(len(portfolio["trade_log"]), 1)

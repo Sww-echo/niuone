@@ -3161,6 +3161,15 @@ class SellStrategyRuleTests(unittest.TestCase):
             },
         }
 
+        # Each entry/exit pair supplies a verified, fee-net complete lifecycle.
+        for index, trade in enumerate(state["trade_log"]):
+            is_buy = trade["action"] == "BUY"
+            trade.update({
+                "position_before_qty": 0 if is_buy else 1000,
+                "position_after_qty": 1000 if is_buy else 0,
+                "amount": 9578.13 if index == 1 else 10000.0,
+                "fee": 0.0,
+            })
         perf = trader.track_strategy_performance(state)
 
         self.assertEqual(perf["buy_strategy"]["b3_accelerate"]["losses"], 1)

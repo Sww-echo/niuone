@@ -3266,6 +3266,33 @@ class NiuOneStrategyTests(unittest.TestCase):
                 self.assertEqual(state["positions"]["600000"]["qty"], 100)
                 self.assertEqual(len(state["trade_log"]), 1)
 
+    def test_probe_shadow_observes_both_price_groups_after_other_gates_pass(self):
+        for price, turnover, cash, expected_observations, expected_fills in (
+            (10.2, 4.0, 100000.0, 1, 1), (10.3, 4.0, 100000.0, 1, 0),
+            (10.3, 2.0, 100000.0, 0, 0), (10.3, 4.0, 10.0, 0, 0),
+        ):
+            with self.subTest(price=price, turnover=turnover, cash=cash), patch.object(
+                trader, "is_a_share_execution_time", return_value=(True, "连续竞价交易时段"),
+            ), patch.object(trader, "execution_quote", return_value={
+                "price": price, "prev_close": 10.0, "turnover": turnover, "source": "test",
+            }):
+                state = {"cash": cash, "positions": {}, "trade_log": []}
+                decision = {"actions": [{"action": "BUY", "code": "600000", "shares": 100, "reason": "试仓"}]}
+                fills = trader.execute_actions(
+                    state, decision, [reversal_candidate(recent_close=price, stop_price=10.0)],
+                    True, "连续竞价交易时段", {"allow_new_buys": True, "max_open_positions": 6},
+                    datetime(2026, 9, 8, 10, 0),
+                )
+                observations = decision.get("probe_chase_observations") or []
+                self.assertEqual(len(observations), expected_observations, decision)
+                self.assertEqual(len(fills), expected_fills, decision)
+                if observations:
+                    self.assertEqual(observations[0]["filtered_accepts"], price < 10.3)
+                if not expected_fills:
+                    self.assertEqual(state["cash"], cash)
+                    self.assertEqual(state["positions"], {})
+                    self.assertEqual(state["trade_log"], [])
+
     def test_execution_quote_parsers_preserve_observed_turnover(self):
         parts = [""] * 60
         for index, value in {1: "测试", 3: "10", 4: "10", 5: "10", 6: "1000",

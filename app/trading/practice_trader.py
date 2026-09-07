@@ -16,6 +16,7 @@ import concurrent.futures
 import copy
 import hashlib
 import json
+import sqlite3
 import math
 import os
 import re
@@ -1221,6 +1222,28 @@ def reconcile_current_day_equity_history_from_ledger(
             state["daily_equity_history"] = revised_daily[-EQUITY_HISTORY_LIMIT:]
             changed = True
     return changed
+
+
+def build_strategy_performance(state: dict[str, Any]) -> dict[str, Any]:
+    """Use the same durable source and revision precedence as forward reports."""
+    try:
+        from niuniu_db import DB_PATH
+        from trading.niuone_forward import load_niuone_forward_trades_from_db, merge_forward_trade_rows
+
+        archived, diagnostics = load_niuone_forward_trades_from_db(DB_PATH)
+        rows, _ = merge_forward_trade_rows(archived, state.get("trade_log") or [])
+        source = {"kind": "durable_ledger_with_recent_state", **diagnostics}
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        rows = state.get("trade_log") or []
+        source = {"kind": "recent_state_only", "error_type": type(exc).__name__}
+    result = track_strategy_performance(state, trade_rows=rows)
+    result["source"] = source
+    result["history_complete"] = source["kind"] == "durable_ledger_with_recent_state"
+    if not result["history_complete"]:
+        result["summary"]["win_rate"] = None
+        for bucket in result["buy_strategy"].values():
+            bucket["win_rate"] = None
+    return result
 
 
 def load_state() -> dict[str, Any]:
@@ -11172,12 +11195,13 @@ def execute_actions(
                     category="candidate_eligibility",
                 )
                 continue
+            entry_price_blocker = None
             if buy_strategy == "niu_reversal_probe" and old_qty <= 0:
                 entry_price_blocker = niu_reversal_entry_price_blocker(
                     price=price,
                     previous_close=q.get("prev_close"),
                 )
-                if entry_price_blocker:
+                if entry_price_blocker and "缺少有效" in entry_price_blocker:
                     add_execution_block(
                         decision,
                         code,
@@ -12111,6 +12135,19 @@ def execute_actions(
                         f"{buy_strategy_label(buy_strategy)}买入后现金{float(cash_after_trade_pct or 0):.2f}%低于{required_cash_pct:g}%硬下限（含交易费用）",
                         category="risk_ceiling",
                     )
+                    continue
+            if buy_strategy == "niu_reversal_probe" and old_qty <= 0:
+                if not _skip_replacement_preflight and str(action.get("intent") or "").upper() != "REPLACE":
+                    from trading.probe_chase import make_probe_chase_observation
+
+                    observation = make_probe_chase_observation(
+                        code, q, candidate,
+                        observed_at=(evaluated_at or datetime.now()).strftime("%Y-%m-%d %H:%M:%S"),
+                    )
+                    if observation is not None:
+                        decision.setdefault("probe_chase_observations", []).append(observation)
+                if entry_price_blocker:
+                    add_execution_block(decision, code, entry_price_blocker, category="entry_price_quality")
                     continue
             prompt_position_binding: dict[str, Any] | None = None
             if versioned_prompt_buy and old_qty <= 0:
@@ -14138,6 +14175,12 @@ def snapshot_closing_equity_once() -> dict[str, Any]:
             "error": type(exc).__name__,
             "updated_at": now_ts(),
         }
+    try:
+        from trading.probe_chase import refresh_probe_chase_outcomes
+
+        state["probe_chase_summary"] = refresh_probe_chase_outcomes(now=now)
+    except Exception as exc:
+        state["probe_chase_summary"] = {"status": "refresh_failed", "error_type": type(exc).__name__}
     save_state(state)
     _sync_positions_to_db(state)
     today = now.strftime("%Y-%m-%d")
@@ -14216,7 +14259,7 @@ def get_dashboard_payload() -> dict[str, Any]:
     payload["trading_paused"] = state.get("trading_paused", False)
     payload["pause_reason"] = state.get("pause_reason", "")
     payload["pause_since"] = state.get("pause_since", "")
-    payload["strategy_performance"] = track_strategy_performance(state)
+    payload["strategy_performance"] = build_strategy_performance(state)
     payload["trade_rule_note"] = build_trade_rule_note()
     payload["fee_rule"] = {
         "commission_rate": COMMISSION_RATE,

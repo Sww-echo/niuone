@@ -87,6 +87,8 @@ v49 为牛牛试仓首次或清仓后重新开仓增加成交涨幅门：相对�
 
 v50 统一牛牛试仓、启动、领涨、转强及所有加仓的个股活跃度资格：当日实际累计换手率至少 3%、全市场成交额分位至少 60、动作所选题材内成交额分位至少 50，必需数据无效即暂停买入；取消试仓豁免和旧候选的可选绕过。成交前重新读取报价复核换手率，持仓快周期使用最新换手率与最近完整扫描的成交额排名。早盘未达 3% 时继续等待，不以预计全天换手替代，也不把高换手直接视作买点。首次建仓耐久证据新增 `entry_turnover_pct`；保留 v49 的试仓首次建仓涨幅小于 3% 规则，这两个百分比含义不同。日线回测按信号日已发生的换手率筛选，绝不读取次日全天换手率；次日开盘成交因此只是盘中规则的近似，历史换手缺失会拒绝入选。严格前向/管理员回测升级为 `niuone-strict-forward-v50`/`niuone-backtest-v42`；尚未开始的队列仍从 `2026-09-08` 起算。部署前归档旧协议锁、报告与回测结果，保留账户、持仓和成交历史。3% 是本次采用的活跃度偏好门槛，需通过新队列验证收益、回撤和机会数量，不能据此承诺胜率提升。
 
+v51 统一 Dashboard 策略表现与严格前向评估的完整交易计算：由 `trading/lifecycles.py` 按可核验的零仓到零仓合并加仓和分批卖出，按首次入口归因，扣除全部买卖费用；未清仓、孤立卖出或数量链不完整的生命周期不计入分母，盈亏平衡计入分母但不计获胜。Dashboard 优先读取 SQLite 完整耐久账本并合并近期状态，数据库不可读时将胜率标为不可用；单次卖出另称“盈利卖出占比”。决策槽统计只覆盖当前队列日期，缺失槽按模型失败、payload 缺失、候选证据无效或无耐久记录分类，不把失败/中间退出记录补成成功决策。严格前向升级为 `niuone-strict-forward-v51`，管理员回测保持 `niuone-backtest-v42`；未开始的队列仍从 `2026-09-08` 起算，部署前归档 v50 锁与报告，保留账户历史。试仓价格门的预先固定影子对照规则见 [试仓追涨前向对照](../docs/strategies/PROBE_CHASE_FORWARD.md)。
+
 `entrypoints/` 中的脚本是项目支持的启动路径。`compat/` 通过 `_compat.py` 在历史模块命名空间中运行迁移后的实现，供内部裸模块导入和迁移期集成使用。新增业务代码不得写入 `entrypoints/` 或 `compat/`。
 
 Dashboard 继续由 `entrypoints/niuone_dashboard.py` 单端口启动并保留原页面布局。`dashboard/fastapi_app.py` 只负责 FastAPI/Uvicorn 应用组合、中间件、Vue 构建和共享缓存响应，具体 HTTP 接口按 system、messages、market、practice、admin 拆在 `dashboard/routers/`。旧 `BaseHTTPRequestHandler`、`ThreadingHTTPServer` 及原生 HTML/JavaScript 控制器已经删除。`dashboard/security.py`、`dashboard/visit_stats.py` 和 `dashboard/response_cache.py` 分别承载管理员访问控制、访问统计和并发响应缓存，`dashboard/server.py` 保留后台状态、配置、数据源、行情采样和实战计划的组合实现，但不再定义 HTTP 路由。浏览器展示模型由 `dashboard/public_projection.py` 构建，并由 `dashboard/public_snapshots.py` 原子发布；交易和外部请求不得下沉到前端。

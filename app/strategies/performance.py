@@ -7,8 +7,10 @@ from typing import Any
 from .attribution import classify_buy_strategy, classify_exit_rule
 try:
     from trading.accounting import trade_counts_for_account
+    from trading.lifecycles import COMPLETE_TRADE_DEFINITION, reconstruct_trade_lifecycles
 except ModuleNotFoundError:  # package import when only the repository root is on sys.path
     from app.trading.accounting import trade_counts_for_account
+    from app.trading.lifecycles import COMPLETE_TRADE_DEFINITION, reconstruct_trade_lifecycles
 
 
 def _normalize_code(code: str) -> str:
@@ -65,7 +67,7 @@ def _finalize_perf(perf: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]
         row["open_pnl"] = round(float(row.get("open_pnl") or 0), 2)
         row["combined_pnl"] = round(float(row.get("total_pnl") or 0) + float(row.get("open_pnl") or 0), 2)
         row["trigger_count"] = total
-        row["win_rate"] = round(wins / total * 100, 1) if total > 0 else 0
+        row["win_rate"] = round(wins / total * 100, 4) if total > 0 else None
         row["open_win_rate"] = round(open_wins / open_total * 100, 1) if open_total > 0 else 0
         row["avg_pnl"] = round(float(row["total_pnl"]) / total, 2) if total > 0 else 0
         row["items"] = sorted(row.get("items") or [], key=lambda item: str(item.get("time") or ""), reverse=True)
@@ -86,13 +88,15 @@ def latest_buy_strategy_for_code(state: dict[str, Any], code: str) -> str:
     return ""
 
 
-def track_strategy_performance(state: dict[str, Any]) -> dict[str, Any]:
-    """Track entry tactics with open P/L, and closed exits by rule."""
+def track_strategy_performance(
+    state: dict[str, Any], *, trade_rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Report complete fee-net lifecycles; SELL triggers are a separate metric."""
     trade_log = sorted(
         [
             t
-            for t in (state.get("trade_log", []) or [])
-            if isinstance(t, dict) and trade_counts_for_account(t)
+            for t in (trade_rows if trade_rows is not None else (state.get("trade_log", []) or []))
+            if isinstance(t, dict)
         ],
         key=lambda t: str(t.get("time") or ""),
     )
@@ -104,6 +108,16 @@ def track_strategy_performance(state: dict[str, Any]) -> dict[str, Any]:
     total_pnl = 0.0
     total_open_positions = 0
     total_open_pnl = 0.0
+
+    cycles = reconstruct_trade_lifecycles(
+        trade_log,
+        strategy_resolver=lambda row: str(
+            row.get("buy_strategy") or row.get("entry_strategy_id")
+            or (row.get("strategy_mark") or {}).get("strategy_id")
+            or classify_buy_strategy(str(row.get("reason") or ""))
+        ),
+    )
+    trade_log = [item[2] for item in cycles["normalized"]]
 
     for trade in trade_log:
         action = str(trade.get("action") or "").upper()
@@ -132,10 +146,16 @@ def track_strategy_performance(state: dict[str, Any]) -> dict[str, Any]:
             "buy_strategy": entry_strategy,
         }
 
-        _add_perf_trade(entry_perf, entry_strategy, pnl)
         _add_perf_trade(exit_perf, exit_rule, pnl, exit_item)
         total_closed += 1
         total_pnl += pnl
+
+    completed = cycles["completed"]
+    for cycle in completed:
+        _add_perf_trade(entry_perf, cycle["entry_strategy"], cycle["realized_pnl"])
+    opening_strategy = {
+        code: row["entry_strategy"] for code, row in cycles["active"].items()
+    }
 
     for code, pos in (state.get("positions") or {}).items():
         if not isinstance(pos, dict):
@@ -152,7 +172,8 @@ def track_strategy_performance(state: dict[str, Any]) -> dict[str, Any]:
             continue
         norm_code = _normalize_code(code or pos.get("code") or "")
         entry_strategy = str(
-            pos.get("buy_strategy")
+            opening_strategy.get(norm_code)
+            or pos.get("buy_strategy")
             or latest_entry_by_code.get(norm_code)
             or classify_buy_strategy(str(pos.get("entry_reason") or ""))
         )
@@ -161,12 +182,25 @@ def track_strategy_performance(state: dict[str, Any]) -> dict[str, Any]:
         total_open_positions += 1
         total_open_pnl += open_pnl
 
+    exit_results = _finalize_perf(exit_perf)
+    for row in exit_results.values():
+        row["profitable_exit_rate_pct"] = row.pop("win_rate")
+        row["metric_basis"] = "sell_fill_trigger_not_complete_trade"
+    completed_pnl = sum(row["realized_pnl"] for row in completed)
+    wins = sum(row["realized_pnl"] > 0 for row in completed)
+    losses = sum(row["realized_pnl"] < 0 for row in completed)
     return {
+        "metric_definition": COMPLETE_TRADE_DEFINITION,
         "buy_strategy": _finalize_perf(entry_perf),
-        "exit_rule": _finalize_perf(exit_perf),
+        "exit_rule": exit_results,
+        "coverage": cycles["coverage"],
         "summary": {
-            "closed_trades": total_closed,
-            "total_pnl": round(total_pnl, 2),
+            "closed_trades": len(completed),
+            "wins": wins, "losses": losses, "flats": len(completed) - wins - losses,
+            "win_rate": round(wins / len(completed) * 100, 4) if completed else None,
+            "total_pnl": round(completed_pnl, 2),
+            "sell_fill_count": total_closed,
+            "realized_pnl_all_sells": round(total_pnl, 2),
             "open_positions": total_open_positions,
             "open_pnl": round(total_open_pnl, 2),
             "combined_pnl": round(total_pnl + total_open_pnl, 2),

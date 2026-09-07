@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shlex
 import sqlite3
 import threading
@@ -74,6 +75,9 @@ PROTOCOL_SOURCE_PATHS = (
     "app/screening/holding_cycle.py",
     "app/screening/multi_strategy.py",
     "app/trading/fees.py",
+    "app/trading/lifecycles.py",
+    "app/strategies/performance.py",
+    "app/trading/probe_chase.py",
     "app/trading/niuone_forward.py",
     "app/trading/niuone_forward_service.py",
     "app/trading/post_exit_observations.py",
@@ -562,6 +566,8 @@ def _build_protocol_identity(
             "version",
             "cohort_start",
             "minimum_completed_trades",
+            "complete_trade_definition",
+            "probe_chase_experiment",
             "minimum_calendar_months",
             "historical_reference_win_rate_pct",
             "win_rate_confidence_level",
@@ -1040,6 +1046,41 @@ def _apply_operational_coverage(
     first_schedule_time = schedule_times[0] if schedule_times else ""
     b1_history = b1_state.get("day_history")
     b1_history = b1_history if isinstance(b1_history, Mapping) else {}
+    slot_evidence: dict[str, dict[str, Any]] = {}
+    for row in decision_rows:
+        if not isinstance(row, Mapping):
+            continue
+        slot = str(row.get("schedule_slot") or "")[:16]
+        timestamp = _beijing_timestamp(slot)
+        if timestamp is None or not start <= timestamp.date() <= cutoff:
+            continue
+        if str(row.get("schedule_run_kind") or "") not in {"scheduled", "catchup"}:
+            continue
+        detail = slot_evidence.setdefault(slot, {
+            "record_count": 0, "model_error_count": 0,
+            "invalid_candidate_evidence_count": 0, "missing_payload_count": 0,
+            "error_type_counts": {},
+        })
+        detail["record_count"] += 1
+        decision = row.get("decision")
+        decision = decision if isinstance(decision, Mapping) else {}
+        error = str(decision.get("error") or "")
+        if error:
+            detail["model_error_count"] += 1
+            # Only controlled error classes/status codes leave the private logs.
+            error_type = next((name for name in (
+                "TimeoutError", "URLError", "HTTPError", "JSONDecodeError", "RuntimeError",
+            ) if error.startswith(name)), "other_decision_error")
+            http_status = re.search(r"HTTP(?:Error)?\s*[: ]\s*([45]\d\d)", error, re.IGNORECASE)
+            if http_status:
+                error_type = "HTTP_" + http_status.group(1)
+            counts = detail["error_type_counts"]
+            counts[error_type] = counts.get(error_type, 0) + 1
+        if row.get("_forward_payload_available") is not True:
+            detail["missing_payload_count"] += 1
+        if not decision_has_durable_candidate_evidence(row):
+            detail["invalid_candidate_evidence_count"] += 1
+    slot_diagnostics: list[dict[str, Any]] = []
     durable_decision_slots: set[str] = set()
     for row in decision_rows:
         if (
@@ -1059,7 +1100,8 @@ def _apply_operational_coverage(
         ):
             continue
         slot = str(row.get("schedule_slot") or "")[:16]
-        if _beijing_timestamp(slot) is not None:
+        slot_timestamp = _beijing_timestamp(slot)
+        if slot_timestamp is not None and start <= slot_timestamp.date() <= cutoff:
             durable_decision_slots.add(slot)
     missing_days: list[dict[str, Any]] = []
     missing_counts: dict[str, int] = {}
@@ -1111,6 +1153,19 @@ def _apply_operational_coverage(
                 add_missing(missing, f"practice_slot:{slot_time}")
             decision_slot = f"{day_key} {slot_time}"
             if decision_slot not in durable_decision_slots:
+                detail = dict(slot_evidence.get(decision_slot) or {})
+                diagnostic = (
+                    "model_decision_failed" if detail.get("model_error_count")
+                    else "durable_payload_missing" if detail.get("missing_payload_count")
+                    else "candidate_evidence_invalid" if detail.get("invalid_candidate_evidence_count")
+                    else "decision_not_completed" if detail.get("record_count")
+                    else "no_durable_decision_record"
+                )
+                slot_diagnostics.append({
+                    "date": day_key, "slot": slot_time, "reason": diagnostic,
+                    "scheduler_status": str(slot.get("status") or "missing"),
+                    **detail,
+                })
                 add_missing(
                     missing,
                     f"practice_decision_ledger:{slot_time}",
@@ -1190,6 +1245,8 @@ def _apply_operational_coverage(
         ),
         "missing_requirement_counts": dict(sorted(missing_counts.items())),
         "incomplete_operating_days": missing_days,
+        "decision_slot_diagnostics": slot_diagnostics,
+        "decision_slot_count_scope": "cohort_start_through_as_of_inclusive",
     }
     gate = report["evidence_gate"]
     before_operations = bool(gate.get("evidence_gate_met"))
@@ -1504,6 +1561,12 @@ def main(argv: list[str] | None = None) -> int:
             runtime_settings["DASHBOARD_MAX_OPEN_POSITIONS"]
         ),
     )
+    from app.trading.probe_chase import collect_probe_chase_observations, load_probe_chase_outcomes, summarize_probe_chase
+
+    probe_as_of = args.as_of or runtime_now.date().isoformat()
+    probe_observations = collect_probe_chase_observations(decision_rows, as_of=probe_as_of)
+    probe_outcomes = load_probe_chase_outcomes(db_path if args.runtime else args.db) if args.runtime or args.db else []
+    report["probe_chase_comparison"] = summarize_probe_chase(probe_observations, probe_outcomes, as_of=probe_as_of)
     report["source"] = source
     report["generated_on"] = (
         args.as_of or datetime.now(CN_TZ).date().isoformat()

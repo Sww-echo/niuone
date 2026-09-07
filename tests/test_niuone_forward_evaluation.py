@@ -435,6 +435,9 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
             "app/trading/niuone_forward_service.py",
             "app/trading/post_exit_observations.py",
             "app/trading/practice_trader.py",
+            "app/trading/lifecycles.py",
+            "app/strategies/performance.py",
+            "app/trading/probe_chase.py",
         }
         self.assertTrue(expected_sources.issubset(PROTOCOL_SOURCE_PATHS))
         self.assertTrue({
@@ -580,6 +583,9 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
                                 ("niuone_minimum_theme_amount_percentile", 50)):
             self.assertEqual(identity["protocol"][field], expected)
         self.assertIn("actual cumulative same-day", identity["protocol"]["niuone_all_stage_activity_rule"])
+        self.assertIn("verified_zero_to_zero", identity["protocol"]["complete_trade_definition"])
+        self.assertEqual(identity["protocol"]["probe_chase_experiment"]["version"], "probe-chase-forward-v1")
+
 
         self.assertEqual(
             identity["protocol"]
@@ -946,7 +952,7 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
 
         self.assertEqual(first_code, 0)
         self.assertEqual(first_report["protocol_integrity"]["status"], "frozen")
-        self.assertEqual(first_report["protocol_integrity"]["source_file_count"], 26)
+        self.assertEqual(first_report["protocol_integrity"]["source_file_count"], 29)
         self.assertEqual(first_report["protocol_integrity"]["runtime_setting_count"], 57)
         self.assertEqual(
             first_report["evidence_gate"]["status"],
@@ -1069,6 +1075,28 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
             "runtime_settings.DASHBOARD_MAX_TOTAL_POSITION_PCT",
             drift_report["protocol_integrity"]["changed_fields"],
         )
+
+    def test_decision_slot_counts_exclude_other_cohorts_and_explain_failed_attempts(self):
+        scheduler, b1, rows = complete_operating_states(
+            date(2026, 8, 3), date(2026, 8, 4), schedule_times=("09:25",),
+        )
+        report = evaluate_niuone_forward([], as_of="2026-08-03", cohort_start="2026-08-04")
+        _apply_operational_coverage(report, scheduler_state=scheduler, b1_state=b1,
+                                    runtime_settings=operating_settings("09:25"), decision_rows=rows)
+        self.assertEqual(report["operations"]["durable_practice_decision_slot_count"], 0)
+        self.assertEqual(report["operations"]["decision_slot_diagnostics"], [])
+        failed = [dict(row) for row in rows if row.get("schedule_slot") == "2026-08-04 09:25"]
+        self.assertTrue(failed)
+        for row in failed:
+            row["decision"] = {"actions": [], "error": "TimeoutError: private provider detail"}
+        report = evaluate_niuone_forward([], as_of="2026-08-04", cohort_start="2026-08-04")
+        _apply_operational_coverage(report, scheduler_state=scheduler, b1_state=b1,
+                                    runtime_settings=operating_settings("09:25"), decision_rows=failed)
+        detail = report["operations"]["decision_slot_diagnostics"][0]
+        self.assertEqual(detail["reason"], "model_decision_failed")
+        self.assertGreater(detail["error_type_counts"]["TimeoutError"], 0)
+        self.assertNotIn("private provider detail", json.dumps(report))
+        self.assertIn("practice_decision_ledger:09:25", report["operations"]["missing_requirement_counts"])
 
     def test_operational_coverage_requires_every_configured_cycle(self):
         rows = [
@@ -2786,7 +2814,7 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
 
         self.assertEqual(report["overall"]["completed_trade_count"], 1)
         self.assertEqual(report["coverage"]["duplicate_trade_count"], 2)
-        self.assertEqual(report["protocol"]["version"], "niuone-strict-forward-v50")
+        self.assertEqual(report["protocol"]["version"], "niuone-strict-forward-v51")
         self.assertEqual(
             report["protocol"][
                 "niuone_markup_upgrade_absolute_position_cap_pct"

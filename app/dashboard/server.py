@@ -1621,7 +1621,7 @@ def get_practice_payload() -> dict[str, Any]:
         payload["pause_reason"] = state.get("pause_reason", "")
         payload["pause_since"] = state.get("pause_since", "")
         strategy_performance = (
-            trader.track_strategy_performance(state)
+            (getattr(trader, "build_strategy_performance", trader.track_strategy_performance))(state)
             if hasattr(trader, "track_strategy_performance")
             else {}
         )
@@ -1845,7 +1845,7 @@ def get_practice_payload_fast() -> dict[str, Any]:
         payload["trading_paused"] = state.get("trading_paused", False)
         payload["pause_reason"] = state.get("pause_reason", "")
         payload["pause_since"] = state.get("pause_since", "")
-        strategy_performance = trader.track_strategy_performance(state) if hasattr(trader, "track_strategy_performance") else {}
+        strategy_performance = (getattr(trader, "build_strategy_performance", trader.track_strategy_performance))(state) if hasattr(trader, "track_strategy_performance") else {}
         payload["strategy_performance"] = compact_strategy_performance(strategy_performance)
         if hasattr(trader, "build_trade_rule_note"):
             payload["trade_rule_note"] = trader.build_trade_rule_note()

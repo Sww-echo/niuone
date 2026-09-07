@@ -52,6 +52,11 @@ from app.strategies.exit_feedback import (
     EXIT_FEEDBACK_MAX_WINDOW_SAMPLES,
     EXIT_FEEDBACK_PARAMETER_BOUNDS,
 )
+from app.trading.probe_chase import probe_chase_protocol
+from app.trading.lifecycles import (
+    COMPLETE_TRADE_DEFINITION, reconstruct_trade_lifecycles,
+    _trade_identity, _buy_cost, _sell_proceeds,
+)
 from app.strategies.policy import (
     NIUONE_DAILY_V_MAX_RECOVERY_RATIO,
     NIUONE_DAILY_V_MIN_RECOVERY_RATIO,
@@ -78,7 +83,7 @@ DEFAULT_HISTORICAL_REFERENCE_WIN_RATE_PCT = 59.71
 DEFAULT_WIN_RATE_CONFIDENCE_LEVEL = 0.95
 DEFAULT_MAX_PORTFOLIO_DRAWDOWN_PCT = 6.0
 DEFAULT_MIN_RETURN_TO_DRAWDOWN_RATIO = 1.0
-FORWARD_PROTOCOL_VERSION = "niuone-strict-forward-v50"
+FORWARD_PROTOCOL_VERSION = "niuone-strict-forward-v51"
 FORWARD_PERFORMANCE_CLUSTER_UNIT = "entry_date_x_entry_theme"
 FORWARD_SHADOW_CANDIDATES = {
     "execution_gap": "round13_execution_gap_le_1pct",
@@ -185,14 +190,6 @@ FORWARD_REQUIRED_CANDIDATE_EVIDENCE_FIELDS = (
     "eligible_for_decision",
     "eligibility_blockers",
 )
-
-
-def _trade_identity(trade: Mapping[str, Any]) -> tuple[str, ...]:
-    """Return the same stable fill identity used by the practice ledger."""
-    return tuple(
-        json.dumps(trade.get(field, ""), ensure_ascii=False, sort_keys=True)
-        for field in ("time", "action", "code", "shares", "price", "reason")
-    )
 
 
 def merge_forward_trade_rows(
@@ -1964,28 +1961,6 @@ def _exit_context(trade: Mapping[str, Any]) -> dict[str, Any]:
     return dict(context) if isinstance(context, Mapping) else {}
 
 
-def _buy_cost(trade: Mapping[str, Any]) -> float | None:
-    explicit = _number(trade.get("total_cost"))
-    if explicit is not None and explicit > 0:
-        return explicit
-    amount = _number(trade.get("amount"))
-    fee = _number(trade.get("fee")) or 0.0
-    if amount is None or amount <= 0:
-        return None
-    return amount + fee
-
-
-def _sell_proceeds(trade: Mapping[str, Any]) -> float | None:
-    explicit = _number(trade.get("net_proceeds"))
-    if explicit is not None and explicit >= 0:
-        return explicit
-    amount = _number(trade.get("amount"))
-    fee = _number(trade.get("fee")) or 0.0
-    if amount is None or amount <= 0 or amount < fee:
-        return None
-    return amount - fee
-
-
 def _full_months(start: date, end: date) -> int:
     if end < start:
         return 0
@@ -2906,172 +2881,28 @@ def evaluate_niuone_forward(
             "minimum_return_to_drawdown_ratio must be positive"
         )
 
-    normalized: list[tuple[date, int, Mapping[str, Any]]] = []
-    seen_trade_ids: set[tuple[str, ...]] = set()
-    duplicate_trade_count = 0
-    invalid_timestamp_count = 0
-    inactive_accounting_trade_count = 0
-    for index, trade in enumerate(trade_rows):
-        if not isinstance(trade, Mapping):
-            invalid_timestamp_count += 1
-            continue
-        if not trade_counts_for_account(trade):
-            inactive_accounting_trade_count += 1
-            continue
-        identity = _trade_identity(trade)
-        if identity in seen_trade_ids:
-            duplicate_trade_count += 1
-            continue
-        seen_trade_ids.add(identity)
-        try:
-            trade_date = _date_value(trade.get("time"), field_name="trade time")
-        except ValueError:
-            invalid_timestamp_count += 1
-            continue
-        if trade_date <= cutoff:
-            normalized.append((trade_date, index, trade))
-    normalized.sort(key=lambda item: (item[0], str(item[2].get("time") or ""), item[1]))
-
-    active: dict[str, dict[str, Any]] = {}
-    completed: list[dict[str, Any]] = []
-    orphan_sell_count = 0
-    invalid_trade_count = 0
-    oversold_lifecycle_count = 0
-    unverified_open_count = 0
-    inconsistent_quantity_count = 0
-    for trade_date, _index, trade in normalized:
-        action = str(trade.get("action") or "").upper()
-        code = str(trade.get("code") or "").strip()
-        if action not in {"BUY", "SELL"} or not code:
-            continue
-        quantity = _shares(trade.get("shares"))
-        if quantity <= 0:
-            invalid_trade_count += 1
-            continue
-        if action == "BUY":
-            cost = _buy_cost(trade)
-            if cost is None:
-                invalid_trade_count += 1
-                continue
-            before_quantity = _optional_quantity(
-                trade.get("position_before_qty")
-            )
-            after_quantity = _optional_quantity(
-                trade.get("position_after_qty")
-            )
-            lifecycle = active.get(code)
-            if lifecycle is None:
-                verified_open = before_quantity == 0
-                if not verified_open:
-                    unverified_open_count += 1
-                lifecycle = {
-                    "entry_date": trade_date,
-                    "entry_time": str(trade.get("time") or ""),
-                    "entry_strategy": _strategy_id(trade),
-                    "entry_context": _entry_context(trade),
-                    "entry_fill_shares": quantity,
-                    "entry_payload_available": trade.get(
-                        "_forward_payload_available"
-                    ),
-                    "exit_context": {},
-                    "exit_payload_available": None,
-                    "quantity": before_quantity or 0,
-                    "buy_cost": 0.0,
-                    "sell_proceeds": 0.0,
-                    "transaction_count": 0,
-                    "verified_open": verified_open,
-                }
-                active[code] = lifecycle
-            elif (
-                before_quantity is not None
-                and before_quantity != int(lifecycle["quantity"])
-            ):
-                lifecycle["verified_open"] = False
-                inconsistent_quantity_count += 1
-            expected_after = int(lifecycle["quantity"]) + quantity
-            if after_quantity is not None and after_quantity != expected_after:
-                lifecycle["verified_open"] = False
-                inconsistent_quantity_count += 1
-            lifecycle["quantity"] = (
-                after_quantity if after_quantity is not None else expected_after
-            )
-            lifecycle["buy_cost"] += cost
-            lifecycle["transaction_count"] += 1
-            continue
-
-        lifecycle = active.get(code)
-        if lifecycle is None:
-            orphan_sell_count += 1
-            continue
-        proceeds = _sell_proceeds(trade)
-        if proceeds is None:
-            invalid_trade_count += 1
-            continue
-        before_quantity = _optional_quantity(trade.get("position_before_qty"))
-        after_quantity = _optional_quantity(trade.get("position_after_qty"))
-        if (
-            before_quantity is not None
-            and before_quantity != int(lifecycle["quantity"])
-        ):
-            lifecycle["verified_open"] = False
-            inconsistent_quantity_count += 1
-        if quantity > int(lifecycle["quantity"]):
-            oversold_lifecycle_count += 1
-            active.pop(code, None)
-            continue
-        expected_after = int(lifecycle["quantity"]) - quantity
-        if after_quantity is not None and after_quantity != expected_after:
-            lifecycle["verified_open"] = False
-            inconsistent_quantity_count += 1
-        lifecycle["quantity"] = (
-            after_quantity if after_quantity is not None else expected_after
-        )
-        lifecycle["sell_proceeds"] += proceeds
-        lifecycle["transaction_count"] += 1
-        lifecycle["exit_context"] = _exit_context(trade)
-        lifecycle["exit_payload_available"] = trade.get(
-            "_forward_payload_available"
-        )
-        if lifecycle["quantity"] > 0:
-            continue
-
-        active.pop(code, None)
-        entry_date = lifecycle["entry_date"]
-        entry_strategy = str(lifecycle["entry_strategy"] or "")
-        buy_cost = float(lifecycle["buy_cost"])
-        if (
-            entry_date < start
-            or entry_strategy not in NIUONE_STRATEGY_IDS
-            or buy_cost <= 0
-            or lifecycle["verified_open"] is not True
-        ):
-            continue
-        realized_pnl = float(lifecycle["sell_proceeds"]) - buy_cost
-        context = lifecycle["entry_context"]
-        completed.append({
-            "entry_date": entry_date.isoformat(),
-            "entry_time": lifecycle["entry_time"],
-            "exit_date": trade_date.isoformat(),
-            "exit_time": str(trade.get("time") or ""),
-            "entry_strategy": entry_strategy,
-            "net_return_pct": realized_pnl / buy_cost * 100.0,
-            "realized_pnl": realized_pnl,
-            "holding_calendar_days": (trade_date - entry_date).days,
-            "transaction_count": int(lifecycle["transaction_count"]),
-            "entry_context": context,
-            "entry_fill_shares": lifecycle["entry_fill_shares"],
-            "entry_payload_available": lifecycle[
-                "entry_payload_available"
-            ],
-            "exit_context": lifecycle["exit_context"],
-            "exit_payload_available": lifecycle[
-                "exit_payload_available"
-            ],
-            "required_holding_dates": [
-                value for value in resolved_expected_operating_dates
-                if entry_date.isoformat() <= value <= trade_date.isoformat()
-            ],
-        })
+    lifecycle_result = reconstruct_trade_lifecycles(
+        trade_rows, as_of=cutoff, strategy_resolver=_strategy_id,
+    )
+    normalized = lifecycle_result["normalized"]
+    active = lifecycle_result["active"]
+    completed = [
+        {**row, "required_holding_dates": [
+            value for value in resolved_expected_operating_dates
+            if row["entry_date"] <= value <= row["exit_date"]
+        ]}
+        for row in lifecycle_result["completed"]
+        if row["entry_date"] >= start.isoformat()
+        and row["entry_strategy"] in NIUONE_STRATEGY_IDS
+    ]
+    duplicate_trade_count = lifecycle_result["coverage"]["duplicate_trade_count"]
+    invalid_timestamp_count = lifecycle_result["coverage"]["invalid_timestamp_count"]
+    inactive_accounting_trade_count = lifecycle_result["coverage"]["inactive_accounting_trade_count"]
+    orphan_sell_count = lifecycle_result["coverage"]["orphan_sell_count"]
+    invalid_trade_count = lifecycle_result["coverage"]["invalid_trade_count"]
+    oversold_lifecycle_count = lifecycle_result["coverage"]["oversold_lifecycle_count"]
+    unverified_open_count = lifecycle_result["coverage"]["unverified_open_count"]
+    inconsistent_quantity_count = lifecycle_result["coverage"]["inconsistent_quantity_count"]
 
     elapsed_days = max(0, (cutoff - start).days)
     elapsed_months = _full_months(start, cutoff)
@@ -3283,6 +3114,8 @@ def evaluate_niuone_forward(
             "cohort_start": start.isoformat(),
             "as_of": cutoff.isoformat(),
             "minimum_completed_trades": minimum_completed_trades,
+            "complete_trade_definition": COMPLETE_TRADE_DEFINITION,
+            "probe_chase_experiment": probe_chase_protocol(),
             "minimum_calendar_months": minimum_calendar_months,
             "historical_reference_win_rate_pct": (
                 historical_reference_win_rate_pct

@@ -193,6 +193,13 @@ def init_db():
         UNIQUE(history_kind, event_key)
     );
 
+    CREATE TABLE IF NOT EXISTS probe_chase_outcomes (
+        observation_key TEXT PRIMARY KEY,
+        protocol_version TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        recorded_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS post_exit_observations (
         trade_key TEXT NOT NULL,
         horizon INTEGER NOT NULL,
@@ -1108,6 +1115,30 @@ def query_post_exit_reentry_audits(limit: int = 5000) -> list[dict[str, Any]]:
                 ),
             })
     return audits
+
+
+def record_probe_chase_outcomes(rows: list[dict[str, Any]]) -> int:
+    """Only append mature shadow outcomes; retry or missing data cannot rewrite them."""
+    values = [
+        (row["observation_key"], row["protocol_version"],
+         json.dumps(row, ensure_ascii=False, sort_keys=True, allow_nan=False),
+         datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        for row in rows if row.get("completed") is True
+    ]
+    if not values:
+        return 0
+    conn = _connect()
+    try:
+        before = conn.total_changes
+        conn.executemany(
+            "INSERT OR IGNORE INTO probe_chase_outcomes "
+            "(observation_key,protocol_version,payload_json,recorded_at) VALUES (?,?,?,?)",
+            values,
+        )
+        conn.commit()
+        return conn.total_changes - before
+    finally:
+        conn.close()
 
 
 def upsert_post_exit_observations(rows: list[dict[str, Any]]) -> int:
