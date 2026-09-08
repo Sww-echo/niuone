@@ -32,6 +32,8 @@ NIUONE_DAILY_V_MAX_RECOVERY_RATIO = 2.0
 NIUONE_REVERSAL_CONTINUATION_MIN_STRONG_COUNT = 6
 NIUONE_REVERSAL_CONTINUATION_MIN_STATE_STREAK = 3
 NIUONE_REVERSAL_ENTRY_MAX_CHANGE_PCT_EXCLUSIVE = 3.0
+NIUONE_THEME_ATTRIBUTION_CONFIDENCE_SCORE = 60.0
+NIUONE_THEME_LEADER_MIN_ATTRIBUTION_WEIGHT = 0.15
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -179,6 +181,65 @@ def niu_reversal_recovery_blocker(
         recovery_pct = NIUONE_DAILY_V_MAX_RECOVERY_RATIO * 100
         return f"V型右侧修复已达到左侧跌幅的{recovery_pct:g}%，不再按早期试仓"
     return None
+
+
+def niu_reversal_theme_attribution_blocker(
+    values: Mapping[str, Any],
+) -> str | None:
+    """Require participation in the selected theme, even for non-leader probes.
+
+    Action routing retains a weak fallback for diagnostics. It is not entry
+    evidence. Reuse the established theme membership boundary and preserve
+    the high-evidence primary-theme exception for multi-concept stocks.
+    """
+    raw_weight = values.get("signal_theme_attribution_weight")
+    raw_score = values.get("signal_theme_attribution_score")
+    weight = _safe_float(raw_weight, math.nan)
+    score = _safe_float(raw_score, math.nan)
+    if (
+        isinstance(raw_weight, bool) or isinstance(raw_score, bool)
+        or not math.isfinite(weight) or not 0 <= weight <= 1
+        or not math.isfinite(score) or not 0 <= score <= 100
+    ):
+        return "牛牛试仓题材归因数据不可用，等待有效归因证据"
+    if weight >= NIUONE_THEME_LEADER_MIN_ATTRIBUTION_WEIGHT:
+        return None
+
+    # Recompute primary identity from the complete attribution list; a model
+    # flag or a high score on a secondary theme cannot grant this exception.
+    attributions = values.get("theme_attributions")
+    if isinstance(attributions, list) and attributions:
+        valid: list[Mapping[str, Any]] = []
+        for item in attributions:
+            if not isinstance(item, Mapping):
+                break
+            item_score = _safe_float(item.get("attribution_score"), math.nan)
+            if (
+                not str(item.get("theme") or "").strip()
+                or isinstance(item.get("attribution_score"), bool)
+                or not math.isfinite(item_score) or not 0 <= item_score <= 100
+            ):
+                break
+            valid.append(item)
+        if len(valid) == len(attributions):
+            # The scorer already orders score ties by stock rank and name;
+            # max preserves that order without requiring omitted rank fields.
+            primary = max(valid, key=lambda item: float(item["attribution_score"]))
+            if (
+                str(primary["theme"]).strip()
+                == str(values.get("signal_theme") or values.get("industry") or "").strip()
+                and score >= NIUONE_THEME_ATTRIBUTION_CONFIDENCE_SCORE
+                and math.isclose(score, float(primary["attribution_score"]), abs_tol=1e-9)
+                and math.isclose(
+                    weight, _safe_float(primary.get("attribution_weight"), math.nan),
+                    abs_tol=1e-9,
+                )
+            ):
+                return None
+    return (
+        "牛牛试仓题材归因不足（权重需≥15%，"
+        "或为归因分≥60的首要题材）"
+    )
 
 
 def niu_reversal_continuation_blocker(
@@ -451,6 +512,9 @@ def candidate_buy_blockers(
         ):
             blockers.append("主升动量试仓身份条件不完整")
     if strategy_id == "niu_reversal_probe":
+        attribution_blocker = niu_reversal_theme_attribution_blocker(candidate)
+        if attribution_blocker and attribution_blocker not in blockers:
+            blockers.append(attribution_blocker)
         recovery_blocker = niu_reversal_recovery_blocker(candidate)
         if recovery_blocker and recovery_blocker not in blockers:
             blockers.append(recovery_blocker)

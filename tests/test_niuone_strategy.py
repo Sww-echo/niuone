@@ -259,6 +259,28 @@ def reversal_candidate(**updates) -> dict:
 
 
 class NiuOneStrategyTests(unittest.TestCase):
+    def test_weak_theme_probe_cannot_pass_selection_or_execution_with_high_score(self):
+        candidate = reversal_candidate(
+            best_score=9.8,
+            signal_theme_attribution_score=22.0,
+            signal_theme_attribution_weight=0.008,
+            theme_attribution_confident=False,
+        )
+        self.assertFalse(candidate_is_trade_ready(candidate))
+        self.assertTrue(any("题材归因" in reason for reason in trader.candidate_buy_blockers(candidate)))
+        state = {"cash": 100000.0, "positions": {}, "trade_log": []}
+        with patch.object(trader, "is_a_share_execution_time", return_value=(True, "test")), \
+                patch.object(trader, "execution_quote", return_value={
+                    "price": 10.0, "prev_close": 10.0, "turnover": 4.0, "source": "test",
+                }):
+            fills = trader.execute_actions(
+                state, {"actions": [{"action": "BUY", "code": "600000", "shares": 100}]},
+                [candidate], True, "test", {}, evaluated_at=datetime(2026, 6, 24, 10, 0),
+            )
+        self.assertEqual(fills, [])
+        self.assertEqual(state["positions"], {})
+        self.assertEqual(state["cash"], 100000.0)
+
     def test_compact_stock_context_fails_closed_without_strong_score(self):
         rows = make_rows("600000", "半导体", 0.02)
         context = {
@@ -570,6 +592,10 @@ class NiuOneStrategyTests(unittest.TestCase):
             },
         }
 
+        context["stocks"]["600000"].update({
+            "attribution_score": 80.0,
+            "attribution_weight": 0.5,
+        })
         result = score_niu_reversal_probe(rows, context)
 
         self.assertIsNotNone(result)
@@ -588,6 +614,17 @@ class NiuOneStrategyTests(unittest.TestCase):
         self.assertEqual(result["hard_blockers"], [])
         self.assertTrue(result["actionable"])
         self.assertTrue(candidate_is_trade_ready(result))
+
+        # A weak routing fallback remains visible but cannot enter a trade.
+        context["stocks"]["600000"].update({
+            "attribution_score": 22.0,
+            "attribution_weight": 0.008,
+        })
+        weak = score_niu_reversal_probe(rows, context)
+        self.assertIsNotNone(weak)
+        self.assertTrue(weak["daily_v_reversal"])
+        self.assertFalse(weak["actionable"])
+        self.assertTrue(any("题材归因" in reason for reason in weak["hard_blockers"]))
 
     def test_reversal_probe_requires_controlled_right_side_extension(self):
         payload = with_strategy_profile("niu_reversal_probe", {
@@ -675,6 +712,8 @@ class NiuOneStrategyTests(unittest.TestCase):
 
     def test_defensive_reversal_probe_remains_actionable_without_hard_stop(self):
         base = {
+            "signal_theme_attribution_score": 80.0,
+            "signal_theme_attribution_weight": 0.5,
             "stock_activity_data_available": True,
             "stock_market_amount_percentile": 90.0,
             "stock_theme_amount_percentile": 75.0,

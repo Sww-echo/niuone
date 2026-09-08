@@ -5912,6 +5912,7 @@ PRACTICE_CANDIDATE_EVIDENCE_FIELDS = (
     "industry",
     "sector",
     "signal_theme",
+    "theme_attributions",
     "signal_theme_attribution_score",
     "signal_theme_attribution_weight",
     "signal_theme_historical_prior_score",

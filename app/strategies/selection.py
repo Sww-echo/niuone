@@ -3,6 +3,7 @@ import os
 from typing import Any
 
 from .registry import DISPLAY_STRATEGY_ORDER, STRATEGY_DEFINITIONS
+from .policy import niu_reversal_theme_attribution_blocker
 from .scoring import (
     COMMON_MAX_BBI_DISTANCE_PCT,
     niu_reversal_entry_stage_blocker,
@@ -80,6 +81,7 @@ def candidate_is_trade_ready(item: dict[str, Any]) -> bool:
                 reversal_probe
                 and item.get("daily_v_reversal") is True
                 and niu_reversal_entry_stage_blocker(item) is None
+                and niu_reversal_theme_attribution_blocker(item) is None
             )
             or (
                 not reversal_probe

@@ -68,6 +68,8 @@ from app.strategies.policy import (
     NIUONE_MIN_ENTRY_TURNOVER_PCT,
     NIUONE_MATURE_MIN_MARKET_AMOUNT_PERCENTILE,
     NIUONE_MATURE_MIN_THEME_AMOUNT_PERCENTILE,
+    NIUONE_THEME_ATTRIBUTION_CONFIDENCE_SCORE,
+    NIUONE_THEME_LEADER_MIN_ATTRIBUTION_WEIGHT,
     niuone_turnover_blocker,
     niuone_stock_activity_blocker,
     NIUONE_TODAY_OBSERVATION_THRESHOLD,
@@ -75,7 +77,7 @@ from app.strategies.policy import (
 from app.strategies.selection import strategy_daily_candidate_limit
 
 
-DEFAULT_COHORT_START = "2026-09-08"
+DEFAULT_COHORT_START = "2026-09-09"
 DEFAULT_MIN_COMPLETED_TRADES = 30
 DEFAULT_MIN_CALENDAR_MONTHS = 3
 DEFAULT_SHADOW_EXECUTION_GAP_PCT = 1.0
@@ -84,7 +86,7 @@ DEFAULT_HISTORICAL_REFERENCE_WIN_RATE_PCT = 59.71
 DEFAULT_WIN_RATE_CONFIDENCE_LEVEL = 0.95
 DEFAULT_MAX_PORTFOLIO_DRAWDOWN_PCT = 6.0
 DEFAULT_MIN_RETURN_TO_DRAWDOWN_RATIO = 1.0
-FORWARD_PROTOCOL_VERSION = "niuone-strict-forward-v52"
+FORWARD_PROTOCOL_VERSION = "niuone-strict-forward-v53"
 FORWARD_PERFORMANCE_CLUSTER_UNIT = "entry_date_x_entry_theme"
 FORWARD_SHADOW_CANDIDATES = {
     "execution_gap": "round13_execution_gap_le_1pct",
@@ -3318,6 +3320,18 @@ def evaluate_niuone_forward(
             ),
             "niuone_reversal_daily_candidate_limit": (
                 strategy_daily_candidate_limit("niu_reversal_probe")
+            ),
+            "niuone_reversal_minimum_theme_attribution_weight": (
+                NIUONE_THEME_LEADER_MIN_ATTRIBUTION_WEIGHT
+            ),
+            "niuone_reversal_primary_theme_minimum_score": (
+                NIUONE_THEME_ATTRIBUTION_CONFIDENCE_SCORE
+            ),
+            "niuone_reversal_theme_attribution_rule": (
+                "Probes require selected-theme weight >= 0.15 or the highest-"
+                "score primary theme >= 60 with matching attribution-list "
+                "evidence; invalid/missing evidence fails closed at scoring, "
+                "selection and execution; diagnostic fallback is never eligibility"
             ),
             "niuone_same_theme_position_count_limit": None,
             "niuone_same_theme_capacity_rule": (

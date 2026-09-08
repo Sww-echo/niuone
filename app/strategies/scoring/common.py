@@ -14,6 +14,7 @@ from ..policy import (
     niu_leader_entry_breadth_blocker,
     niu_reversal_continuation_blocker,
     niu_reversal_recovery_blocker,
+    niu_reversal_theme_attribution_blocker,
     niuone_stock_activity_blocker,
     niu_startup_theme_blocker,
 )
@@ -257,6 +258,9 @@ def strategy_hard_blockers(strategy_name: str, payload: dict[str, Any]) -> list[
         extension_source = str(payload.get("entry_extension_source") or "ema20")
         change = safe_float(payload.get("change_pct"))
         if strategy_name == "niu_reversal_probe":
+            attribution_blocker = niu_reversal_theme_attribution_blocker(payload)
+            if attribution_blocker:
+                blockers.append(attribution_blocker)
             if status == "candidate" and payload.get("stock_strong") is True:
                 blockers.append("候选题材中的强势股需等待牛牛启动确认")
             min_extension = safe_float(

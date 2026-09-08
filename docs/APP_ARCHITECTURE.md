@@ -116,3 +116,5 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py'
 
 
 v52 将牛牛硬退出的数值观测判定集中到 `strategies/exits.py`，由本地风控、模型成交前复核及前向证据校验复用。模型文字不能授权硬清仓；分阶段确认跨轮询保留，明确 HOLD 重置。详见 [v52 规则](strategies/README.md#v52模型卖出须有硬退出证据)。
+
+v53 将试仓题材归因资格放在 `strategies/policy.py`，由评分、候选选择和成交前检查共同调用；回测复用评分边界，候选证据保存完整归因列表。新队列从 2026-09-09 开始，协议为严格前向 v53/回测 v43；诊断候选不再取得交易资格，现有持仓不因此触发退出。
