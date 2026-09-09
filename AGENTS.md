@@ -147,6 +147,9 @@ Dashboard、定时任务、消息通知与策略研究。修改时优先保证�
 
 ## Git、提交与 PR 风格
 
+- 后续默认直接在 `main` 分支完成本地修改和提交。未经用户明确要求，不得自动新建分支，
+  包括任务分支、备份分支及 worktree 附带分支。若当前位于其他分支，先核对工作区和提交
+  归属，再安全切换到 `main`；不得为切换分支丢弃或覆盖用户已有修改。
 - 提交和 PR 标题使用 Conventional Commits：`type(scope): subject`。
 - 常用 `type`：`feat`、`fix`、`refactor`、`perf`、`docs`、`test`、`chore`。
 - `scope` 取主要领域，例如：`dashboard`、`market`、`settings`、`strategy`、`trading`、
