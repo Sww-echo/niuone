@@ -1,0 +1,23 @@
+# Model reliability and risk comparisons
+
+## Production behavior (v54)
+
+Model calls sharing a runtime directory coordinate through `DASHBOARD_HOME/model_admission.sqlite3`. Scope is a SHA-256 hash of provider origin and credential, covering Dashboard, Scheduler, reports, Chat/Responses and streaming. Only hashes, leases and timing metadata are stored. Separate hosts or runtime directories do not share admission.
+
+Each scope permits one active request, with at least two seconds between starts and at most five seconds of queueing. HTTP 429 ends the current request and establishes shared exponential cooldowns of 60/120/240/300 seconds. A longer `Retry-After` is respected. Success resets consecutive rate-limit failures. Without a known provider quota this is concurrency control and reactive suppression, not exact RPM/TPM allocation. Unavailable coordination fails model calls closed; expired leases recover after process failure. Hard exits never acquire model leases.
+
+Connection, JSON/SSE body reads, transport retries, truncated-answer repair and sizing refinement share one model deadline. Real urllib calls use admission; injected custom transports retain their historical contract and are responsible for coordination. Normal network failures retain bounded short retries; 429 does not use the former one/two-second retries. Direct decisions expire 180 seconds after signal generation. Intentional session deferrals expire 180 seconds after the planned execution time. Execution rechecks after quotes and before accounting; completed valid fills remain recorded. Deferred proposals and rejection evidence remain auditable, while legacy entries lacking valid due times expire. The independent `--auto-exits` command and local exits before model work retain their order and require no model call.
+
+Positions distinguish `original_structural_stop_price`, `cost_protection_stop_price` and `effective_stop_price`; exit evidence includes `stop_kind`. The legacy `entry_stop_price` effective-stop projection and signal identifiers remain compatible. A historical original stop that was overwritten and has no separately sourced record stays unknown. Production continues immediate cost and structure exits; confirmation delay is research-only.
+
+## Offline research
+
+Run `python3 scripts/research_niuone_entry_risk.py --input /tmp/niuone-study-input.json --output /tmp/niuone-study-result.json` on minimized observations, never against the production account. Input has a `records` array with `context` (`stage`, `strength`, `change_pct`, `stop_distance_pct`), `entry_price`, `structural_stop`, and exactly five subsequent complete daily `bars` containing `date/open/high/low/close`. Optional `source_quality` records provenance and missing data.
+
+Analyze the groups separately: divergence with intraday theme strength below 55 and a gain of at least 5% from prior close; climax with an original structural-stop distance of at least 8%. Compare original size, half initial size, and waiting for one of the first two later sessions to close above both the original fill and its open without breaking structure, then entering at the following open. Gap-up sizing cannot increase original cash risk. Price confirmation does not establish theme recovery.
+
+All variants share the original structural exit and fifth-session closing horizon, obey T+1 and 100-share lots, and use a fixed CNY10,000 allocation. Assumed fees are 3bp commission with a CNY5 minimum, 0.1bp transfer fee each way and 5bp sales stamp duty. Idle cash earns zero and is not recycled. No additional slippage or full profit-taking/replacement replay is modeled. This is a paired entry stress test, not full-strategy performance evidence.
+
+Research-only `bounded_cost_confirmation` allows grace only when original structure is known and intact and the cost breach is at most 0.25%. Two distinct fresh quotes at least 15 seconds apart trigger exit, with a maximum duration of 60 seconds. Structural breaks, hard market/theme failures and deeper cost breaches exit immediately. Unknown structure receives no grace. Missing/stale quotes generate an exit requirement, never a fabricated fill. Duplicate quotes cannot extend the first deadline. Recovery ends the episode. Daily bars cannot validate minute confirmation returns.
+
+After regressions and full validation, privately archive prior protocol/report evidence before deployment and preserve account/ledger data. Strict-forward becomes `niuone-strict-forward-v54`, with a new default cohort of `2026-09-10`; never overwrite a sampled v53 lock under its old date. An invested baseline still blocks account attribution. The admin daily backtest remains v43, and research conditions do not enter production eligibility or sizing.

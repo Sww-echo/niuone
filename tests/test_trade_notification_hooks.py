@@ -6,6 +6,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest.mock import patch
 from datetime import datetime
 from pathlib import Path
 
@@ -53,6 +54,15 @@ def sample_sell() -> dict:
 
 
 class TradeNotificationHookTests(unittest.TestCase):
+    def setUp(self):
+        class FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 7, 11, 10, 0, tzinfo=tz)
+        self.clock = patch.object(trader, "datetime", FrozenDateTime)
+        self.clock.start()
+        self.addCleanup(self.clock.stop)
+
     def test_rejected_fill_is_not_returned_to_notification_dispatcher(self):
         active = sample_sell()
         rejected = {
@@ -144,7 +154,7 @@ class TradeNotificationHookTests(unittest.TestCase):
             "pending_decisions": [{
                 "id": "pending-1",
                 "status": "pending",
-                "due_at": "",
+                "due_at": "2026-07-11 13:00:00",
                 "decision": {"summary": "延迟测试", "actions": []},
                 "candidates": [],
                 "schedule_slot": "2026-07-11 09:25",

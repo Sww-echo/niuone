@@ -82,6 +82,9 @@ PROTOCOL_SOURCE_PATHS = (
     "app/trading/niuone_forward_service.py",
     "app/trading/post_exit_observations.py",
     "app/trading/practice_trader.py",
+    "app/trading/decision_freshness.py",
+    "app/core/model_api.py",
+    "app/core/model_request_guard.py",
 )
 PROTOCOL_RUNTIME_SETTING_DEFAULTS = {
     FORWARD_COHORT_START_ENV: DEFAULT_COHORT_START,

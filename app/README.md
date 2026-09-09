@@ -99,3 +99,5 @@ Dashboard 继续由 `entrypoints/niuone_dashboard.py` 单端口启动并保留�
 v52 将牛牛硬退出的数值观测判定集中到 `strategies/exits.py`，由本地风控、模型成交前复核及前向证据校验复用。模型文字不能授权硬清仓；分阶段确认跨轮询保留，明确 HOLD 重置。详见 [v52 规则](../docs/strategies/README.md#v52模型卖出须有硬退出证据)。
 
 v53 在 `strategies/policy.py` 共用试仓题材归因资格，评分、选择、执行与回测拒绝弱归因诊断兜底；完整归因列表进入候选证据。严格前向/管理员回测为 v53/v43，新队列默认从 2026-09-09 开始，旧历史保持独立。见 [试仓题材归因](../docs/strategies/README.md#v53试仓必须具备有效题材归因)。
+
+v54 的 `core/model_request_guard.py` 在模型传输层提供跨进程共享限流与退避；`trading/decision_freshness.py` 检查执行有效期。硬退出继续独立于模型。`strategies/exits.py` 分离原始结构线和成本保护线，`backtesting/entry_risk_study.py` 承载研究对照，不由模拟交易加载。严格前向升级 v54，新队列默认从 2026-09-10 开始。见 [模型可靠性与风险对照](../docs/strategies/model-reliability-risk-study.md)。

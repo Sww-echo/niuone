@@ -13,6 +13,8 @@ import json
 import re
 import urllib.error
 import urllib.request
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Iterator
 
@@ -22,9 +24,103 @@ from .model_reasoning import (
     reasoning_effort_capability,
     resolve_model_reasoning_effort,
 )
+from .model_request_guard import (
+    MAX_QUEUE_SECONDS,
+    ModelAdmissionError,
+    ModelRequestExpired,
+    budgeted_model_call,
+    remaining_model_seconds,
+    request_scope,
+    shared_model_coordinator,
+)
 
 
 UrlOpen = Callable[..., Any]
+_STANDARD_OPENER = urllib.request.urlopen
+
+
+class _DeadlineResponse:
+    """Bound slow JSON/SSE bodies as well as the initial connection."""
+    def __init__(self, response: Any, deadline: float):
+        self.response, self.deadline = response, deadline
+        self.buffer = b""
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.response, name)
+
+    def _chunk(self) -> bytes:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise ModelRequestExpired("model_response_deadline_exceeded")
+        # HTTPResponse's read1 returns available data instead of waiting for
+        # the entire body. Bound each socket read by the remaining deadline.
+        sock = getattr(getattr(getattr(self.response, "fp", None), "raw", None), "_sock", None)
+        if sock is not None:
+            sock.settimeout(remaining)
+        reader = getattr(self.response, "read1", None)
+        result = reader(65536) if callable(reader) else self.response.read()
+        if time.monotonic() >= self.deadline:
+            raise ModelRequestExpired("model_response_deadline_exceeded")
+        return result
+
+    def read(self) -> bytes:
+        chunks = [self.buffer]
+        self.buffer = b""
+        while chunk := self._chunk():
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    def readline(self) -> bytes:
+        while b"\n" not in self.buffer:
+            chunk = self._chunk()
+            if not chunk:
+                result, self.buffer = self.buffer, b""
+                return result
+            self.buffer += chunk
+            if len(self.buffer) > 16 * 1024 * 1024:
+                raise ModelResponseParseError("model_stream_line_too_large")
+        line, self.buffer = self.buffer.split(b"\n", 1)
+        return line + b"\n"
+
+
+@contextmanager
+def _model_response(req: urllib.request.Request, api_key: str, opener: UrlOpen,
+                    **kwargs: Any) -> Iterator[Any]:
+    # Custom transports retain the historical injection/monkeypatch contract.
+    # The production urllib transport shares admission across every consumer.
+    if opener is not _STANDARD_OPENER:
+        with opener(req, **kwargs) as response:
+            yield response
+        return
+    timeout = remaining_model_seconds(float(kwargs["timeout"]))
+    deadline = time.monotonic() + timeout
+    coordinator = shared_model_coordinator()
+    scope = request_scope(req.full_url, api_key)
+    queue_deadline = min(deadline, time.monotonic() + MAX_QUEUE_SECONDS)
+    while True:
+        try:
+            lease = coordinator.acquire(scope, duration=max(0.001, deadline - time.monotonic()))
+            break
+        except ModelAdmissionError as exc:
+            if exc.reason not in {"spacing", "busy"} or time.monotonic() >= queue_deadline:
+                raise
+            time.sleep(min(0.1, max(0.0, queue_deadline - time.monotonic())))
+    success = False
+    try:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ModelRequestExpired("model_request_deadline_exceeded")
+        with opener(req, **{**kwargs, "timeout": remaining}) as response:
+            yield _DeadlineResponse(response, deadline)
+            success = True
+    except urllib.error.HTTPError as exc:
+        if exc.code == 429:
+            delay = coordinator.rate_limited(scope, lease, exc.headers.get("Retry-After") if exc.headers else None)
+            exc.close()
+            raise ModelAdmissionError("upstream_http_429", delay) from exc
+        raise
+    finally:
+        coordinator.release(scope, lease, success=success)
 
 
 class ModelResponseParseError(ValueError):
@@ -422,7 +518,7 @@ def _request_once(
     kwargs: dict[str, Any] = {"timeout": timeout}
     if ssl_context is not None:
         kwargs["context"] = ssl_context
-    with opener(req, **kwargs) as response:
+    with _model_response(req, api_key, opener, **kwargs) as response:
         content_type = _response_content_type(response)
         raw = response.read().decode("utf-8", "ignore")
     return parse_model_response(raw, content_type)
@@ -509,7 +605,7 @@ def _stream_once(
     kwargs: dict[str, Any] = {"timeout": timeout}
     if ssl_context is not None:
         kwargs["context"] = ssl_context
-    with opener(req, **kwargs) as response:
+    with _model_response(req, api_key, opener, **kwargs) as response:
         yield from _stream_response_text(response)
 
 
@@ -686,6 +782,7 @@ def _collect_streamed_model_response(
     return ParsedModelResponse(content, detail)
 
 
+@budgeted_model_call
 def request_model_complete(
     request: ModelRequest,
     api_key: str,

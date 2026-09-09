@@ -41,6 +41,14 @@ from core.model_api import (
     request_model,
     request_model_complete,
 )
+from core.model_request_guard import (
+    ModelAdmissionError,
+    ModelRequestExpired,
+    budgeted_model_call,
+    remaining_model_seconds,
+    model_request_budget,
+)
+from app.trading.decision_freshness import decision_expiry, decision_is_expired
 from core.shared_model_config import (
     LEGACY_SUMMARY_MODEL_ENV_NAMES,
     SHARED_MODEL_ENV_NAMES,
@@ -124,6 +132,7 @@ from strategies.exits import (
     evaluate_strategy_time_exit,
     niuone_climax_runner_active,
     niuone_hard_exit_evidence,
+    niuone_stop_levels,
     resolve_niuone_partial_take_profit,
 )
 from strategies.exit_feedback import (
@@ -6959,15 +6968,16 @@ def _resolve_staged_soft_exit(
 def _niuone_position_hard_exit_evidence(
     pos: Mapping[str, Any], current_price: float,
 ) -> dict[str, Any]:
-    stop = 0.0 if pos.get("shaofu_stop_source") == "fallback_pct" else _safe_float(
-        pos.get("shaofu_stop_price") or pos.get("entry_stop_price"), 0.0,
+    levels = niuone_stop_levels(
+        pos, cost=_safe_float(pos.get("avg_cost"), 0.0),
+        break_even=NIUONE_BREAK_EVEN_AFTER_PARTIAL,
     )
-    if NIUONE_BREAK_EVEN_AFTER_PARTIAL and pos.get("partial_tp_done"):
-        stop = max(stop, _safe_float(pos.get("avg_cost"), 0.0))
     return niuone_hard_exit_evidence(
         strategy_id=position_entry_strategy(pos),
         current_price=current_price,
-        structural_stop=stop,
+        structural_stop=levels["effective_stop_price"],
+        cost_protection_stop=levels["cost_protection_stop_price"],
+        original_structural_stop=levels["original_structural_stop_price"],
         market_hard_stop=bool(pos.get("market_hard_stop")),
         theme_score=_safe_float(pos.get("mainline_score"), 100.0),
         theme_state=str(pos.get("mainline_state") or ""),
@@ -7104,6 +7114,8 @@ def evaluate_sell_signal(
     shaofu_stop = 0.0 if pos.get("shaofu_stop_source") == "fallback_pct" else float(
         pos.get("shaofu_stop_price") or pos.get("entry_stop_price") or 0
     )
+    if niuone_position:
+        pos.update(niuone_stop_levels(pos, cost=avg_cost, break_even=NIUONE_BREAK_EVEN_AFTER_PARTIAL))
     if (
         niuone_position
         and NIUONE_BREAK_EVEN_AFTER_PARTIAL
@@ -9285,6 +9297,7 @@ def decision_json_response_format(model_name: str) -> dict[str, str] | None:
     return None
 
 
+@budgeted_model_call
 def request_chat_content(
     base_url: str,
     api_key: str,
@@ -9321,10 +9334,12 @@ def request_chat_content(
             parsed = request_model_complete(
                 model_request,
                 api_key,
-                timeout=timeout,
+                timeout=remaining_model_seconds(timeout),
                 stream_mode=stream_mode or DECISION_STREAM_MODE,
                 opener=urllib.request.urlopen,
             )
+        except (ModelAdmissionError, ModelRequestExpired):
+            raise
         except urllib.error.HTTPError as exc:
             last_err = format_http_error(exc, model_name)
         except Exception as exc:
@@ -9347,10 +9362,14 @@ def request_chat_content(
             last_err = empty_error
         transport_attempt += 1
         if transport_attempt < transport_attempt_limit:
-            _time.sleep(2 ** (transport_attempt - 1))
+            delay = 2 ** (transport_attempt - 1)
+            if remaining_model_seconds(timeout) <= delay:
+                raise ModelRequestExpired("model_retry_deadline_exceeded")
+            _time.sleep(delay)
     raise last_err or RuntimeError(f"model={model_name} request failed")
 
 
+@budgeted_model_call
 def request_chat_json_object(
     base_url: str,
     api_key: str,
@@ -9399,6 +9418,7 @@ def request_chat_json_object(
     raise last_error or RuntimeError(f"model={model_name} did not return a JSON object")
 
 
+@budgeted_model_call
 def api_call_with_retry(base_url: str, api_key: str, payload: dict, max_retries: int = 3, timeout: int = 60) -> dict:
     """带重试的 API 调用。空响应/JSON解析失败时自动重试。"""
     import time as _time
@@ -9418,15 +9438,19 @@ def api_call_with_retry(base_url: str, api_key: str, payload: dict, max_retries:
             parsed = request_model(
                 model_request,
                 api_key,
-                timeout=timeout,
+                timeout=remaining_model_seconds(timeout),
                 opener=urllib.request.urlopen,
             )
             if parsed.data is None:
                 raise ValueError("空响应")
             return parsed.data
+        except (ModelAdmissionError, ModelRequestExpired):
+            raise
         except Exception as e:
             last_err = e
             if attempt < max_retries - 1:
+                if remaining_model_seconds(timeout) <= 2 ** attempt:
+                    raise ModelRequestExpired("model_retry_deadline_exceeded") from e
                 _time.sleep(2 ** attempt)  # 1s, 2s, 4s 退避
     raise last_err
 
@@ -10932,6 +10956,15 @@ def annotate_niuone_full_book_candidates(
     return records
 
 
+def _block_expired_decision(decision: dict[str, Any], now: datetime) -> bool:
+    if not decision_is_expired(decision, now):
+        return False
+    decision["execution_blocked_reason"] = "决策已过期，等待新一轮行情与决策"
+    if not any(item.get("category") == "decision_expired" for item in decision.get("execution_blocks", [])):
+        add_execution_block(decision, "", decision["execution_blocked_reason"], category="decision_expired")
+    return True
+
+
 def execute_actions(
     state: dict[str, Any],
     decision: dict[str, Any],
@@ -10944,6 +10977,16 @@ def execute_actions(
     _skip_replacement_preflight: bool = False,
 ) -> list[dict[str, Any]]:
     executed = []
+    execution_started = time.monotonic()
+
+    def execution_now() -> datetime:
+        return (
+            evaluated_at + timedelta(seconds=time.monotonic() - execution_started)
+            if evaluated_at is not None else datetime.now()
+        )
+
+    if _block_expired_decision(decision, execution_now()):
+        return executed
     cand_by_code = {normalize_code(c.get("code", "")): c for c in candidates}
     positions = state.setdefault("positions", {})
     cash = float(state.get("cash") or 0)
@@ -10985,6 +11028,8 @@ def execute_actions(
                 in replacement_codes
             ]),
         }
+        if "decision_expires_at" in decision:
+            dry_decision["decision_expires_at"] = decision["decision_expires_at"]
         dry_executed = execute_actions(
             copy.deepcopy(state),
             dry_decision,
@@ -11049,6 +11094,8 @@ def execute_actions(
         else 5
     )
     for action in prepared_actions[:action_limit]:
+        if _block_expired_decision(decision, execution_now()):
+            break
         current_allowed, current_reason = is_a_share_execution_time(evaluated_at)
         if not current_allowed:
             decision["execution_blocked_reason"] = f"执行前复核失败：{current_reason}"
@@ -11062,6 +11109,8 @@ def execute_actions(
         if not code or act == "HOLD":
             continue
         q = execution_quote(code)
+        if _block_expired_decision(decision, execution_now()):
+            break
         price = q.get("price") if isinstance(q.get("price"), (int, float)) else None
         if not price or price <= 0:
             continue
@@ -12192,6 +12241,8 @@ def execute_actions(
                         category="strategy_policy",
                     )
                     continue
+            if _block_expired_decision(decision, execution_now()):
+                break
             buy_trade_time = now_ts()
             pos = positions.setdefault(code, {"code": code, "name": name, "qty": 0, "avg_cost": 0.0, "buy_date_lots": {}, "last_price": price})
             if old_qty <= 0:
@@ -13097,6 +13148,8 @@ def execute_actions(
                 if is_niuone_strategy(entry_strategy)
                 else {}
             )
+            if _block_expired_decision(decision, execution_now()):
+                break
             position_before_qty = position_qty(pos)
             pos["qty"] = position_qty(pos) - qty
             pos.pop("shares", None)
@@ -13590,6 +13643,7 @@ def queue_deferred_decision(
 def execute_due_pending_decisions(now: datetime | None = None) -> dict[str, Any]:
     """Execute queued model decisions once the next A-share executable window opens."""
     now = now or datetime.now()
+    pending_started = time.monotonic()
     trade_allowed, trade_reason = is_a_share_execution_time(now)
     if not trade_allowed:
         return {"executed": [], "attempted": 0, "reason": trade_reason}
@@ -13605,10 +13659,15 @@ def execute_due_pending_decisions(now: datetime | None = None) -> dict[str, Any]
     for entry in pending:
         if not isinstance(entry, dict) or entry.get("status") != "pending":
             continue
+        current = now + timedelta(seconds=time.monotonic() - pending_started)
         due_dt = parse_ts(entry.get("due_at") or "")
-        if due_dt and now < due_dt:
+        if due_dt and current < due_dt:
             continue
-        if due_dt and now.date() > due_dt.date():
+        queued_decision = entry.get("decision") or {}
+        if "decision_expires_at" not in queued_decision:
+            queued_decision["decision_expires_at"] = decision_expiry(due_dt) if due_dt else "invalid"
+            entry["decision"] = queued_decision
+        if _block_expired_decision(queued_decision, current):
             entry["status"] = "expired"
             entry["expired_at"] = now_ts()
             changed = True
@@ -13642,14 +13701,22 @@ def execute_due_pending_decisions(now: datetime | None = None) -> dict[str, Any]
                 else []
             )
             decision["summary"] += "；策略已切换，旧策略买入候选已移除"
-        market_strategy_ctx = select_current_market_strategy_context(state, now)
-        refine_overlimit_buy_actions(
-            decision,
-            state,
-            candidates if isinstance(candidates, list) else [],
-            enrich_portfolio(state),
-            market_strategy_ctx,
-        )
+        market_strategy_ctx = select_current_market_strategy_context(state, current)
+        refinement_started = time.monotonic()
+        try:
+            remaining = (datetime.fromisoformat(decision["decision_expires_at"]) - current).total_seconds()
+            with model_request_budget(min(DECISION_REQUEST_TIMEOUT, remaining)):
+                refine_overlimit_buy_actions(
+                    decision,
+                    state,
+                    candidates if isinstance(candidates, list) else [],
+                    enrich_portfolio(state),
+                    market_strategy_ctx,
+                )
+        except (ModelAdmissionError, ModelRequestExpired) as exc:
+            decision["error"] = f"{type(exc).__name__}: {exc}"
+            # Keep the proposal for audit, but do not execute an unreviewed order.
+            add_execution_block(decision, "", str(exc), category="model_unavailable")
         decision["_niuone_execution_context"] = {
             "entry_signal_generated_at": entry.get("b1_generated_at") or "",
             "entry_schedule_slot": entry.get("schedule_slot") or "",
@@ -13657,15 +13724,19 @@ def execute_due_pending_decisions(now: datetime | None = None) -> dict[str, Any]
             "entry_schedule_triggered_at": entry.get("schedule_triggered_at") or "",
             "entry_execution_mode": "deferred",
         }
-        executed = execute_actions(
+        execution_now = current + timedelta(seconds=time.monotonic() - refinement_started)
+        expired = _block_expired_decision(decision, execution_now)
+        executed = [] if expired or decision.get("error") else execute_actions(
             state,
             decision,
             candidates if isinstance(candidates, list) else [],
             True,
             f"延迟成交触发：原计划{entry.get('schedule_slot') or '-'}，{trade_reason}",
             market_strategy_ctx,
+            evaluated_at=execution_now,
         )
-        entry["status"] = "executed"
+        entry["status"] = "expired" if expired else "failed" if decision.get("error") else "executed"
+        entry["decision"] = _json_safe_copy(decision)
         entry["executed_at"] = now_ts()
         entry["executed_count"] = len(executed)
         changed = True
@@ -13899,6 +13970,24 @@ def run_decision_after_b1(b1_payload: dict[str, Any], force: bool = False) -> di
     )
 
     def make_decision(reason: str) -> dict[str, Any]:
+        # Only intentional session deferral changes the execution anchor.
+        # Model generation/refinement still shares one elapsed-time budget.
+        anchor = parse_ts(deferred_due_at or str(generated_at))
+        if not deferred_due_at and anchor is not None and anchor > datetime.now() + timedelta(seconds=5):
+            raise ModelRequestExpired("decision_input_clock_invalid")
+        expiry = decision_expiry(anchor) if anchor is not None else "invalid"
+        freshness = {"decision_expires_at": expiry}
+        if decision_is_expired(freshness, datetime.now()):
+            raise ModelRequestExpired("decision_input_expired")
+        remaining = (datetime.fromisoformat(expiry) - datetime.now()).total_seconds()
+        with model_request_budget(min(DECISION_REQUEST_TIMEOUT, remaining)):
+            resolved_decision = generate_decision(reason)
+            resolved_decision.update(freshness)
+            if not _block_expired_decision(resolved_decision, datetime.now()) and frozen_prompt_version is None:
+                refine_overlimit_buy_actions(resolved_decision, state, candidates, portfolio, market_strategy_ctx)
+        return resolved_decision
+
+    def generate_decision(reason: str) -> dict[str, Any]:
         if frozen_prompt_version is not None:
             resolved_decision = build_local_prompt_decision(
                 candidates,
@@ -13959,8 +14048,6 @@ def run_decision_after_b1(b1_payload: dict[str, Any], force: bool = False) -> di
                 f"请正常生成买卖策略，系统会在{deferred_due_at[-8:-3]}开盘后复核并成交。"
             )
             decision = make_decision(model_trade_reason)
-            if frozen_prompt_version is None:
-                refine_overlimit_buy_actions(decision, state, candidates, portfolio, market_strategy_ctx)
             execution_allowed, execution_reason = is_a_share_execution_time()
             if execution_allowed:
                 trade_allowed = True
@@ -14014,8 +14101,6 @@ def run_decision_after_b1(b1_payload: dict[str, Any], force: bool = False) -> di
             executed = []
         else:
             decision = make_decision(trade_reason)
-            if frozen_prompt_version is None:
-                refine_overlimit_buy_actions(decision, state, candidates, portfolio, market_strategy_ctx)
             execution_allowed, execution_reason = is_a_share_execution_time()
             if not execution_allowed:
                 decision["decision_trade_reason"] = trade_reason

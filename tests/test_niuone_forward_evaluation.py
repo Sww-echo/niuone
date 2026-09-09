@@ -421,7 +421,7 @@ def operating_settings(*times: str) -> dict[str, str]:
 
 class NiuOneForwardEvaluationTests(unittest.TestCase):
     def test_protocol_identity_covers_evidence_pipeline_and_effective_paths(self):
-        self.assertEqual(DEFAULT_COHORT_START, "2026-09-09")
+        self.assertEqual(DEFAULT_COHORT_START, "2026-09-10")
         expected_sources = {
             "app/automation/cron.py",
             "app/automation/scheduler_service.py",
@@ -435,6 +435,9 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
             "app/trading/niuone_forward_service.py",
             "app/trading/post_exit_observations.py",
             "app/trading/practice_trader.py",
+            "app/trading/decision_freshness.py",
+            "app/core/model_api.py",
+            "app/core/model_request_guard.py",
             "app/trading/lifecycles.py",
             "app/strategies/performance.py",
             "app/trading/probe_chase.py",
@@ -952,7 +955,7 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
 
         self.assertEqual(first_code, 0)
         self.assertEqual(first_report["protocol_integrity"]["status"], "frozen")
-        self.assertEqual(first_report["protocol_integrity"]["source_file_count"], 29)
+        self.assertEqual(first_report["protocol_integrity"]["source_file_count"], 32)
         self.assertEqual(first_report["protocol_integrity"]["runtime_setting_count"], 57)
         self.assertEqual(
             first_report["evidence_gate"]["status"],
@@ -2822,7 +2825,7 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
 
         self.assertEqual(report["overall"]["completed_trade_count"], 1)
         self.assertEqual(report["coverage"]["duplicate_trade_count"], 2)
-        self.assertEqual(report["protocol"]["version"], "niuone-strict-forward-v53")
+        self.assertEqual(report["protocol"]["version"], "niuone-strict-forward-v54")
         self.assertEqual(
             report["protocol"][
                 "niuone_markup_upgrade_absolute_position_cap_pct"

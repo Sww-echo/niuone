@@ -1,7 +1,7 @@
 """Strategy-specific exit rules without market-data or execution side effects."""
 from __future__ import annotations
 
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 import math
 from typing import Any
 
@@ -65,6 +65,42 @@ def _sell_signal(reason: str, signal: str, sell_ratio: float = 1.0) -> dict[str,
     return {"reason": reason, "signal": signal, "sell_ratio": sell_ratio}
 
 
+def niuone_stop_levels(position: Mapping[str, Any], *, cost: float, break_even: bool) -> dict[str, Any]:
+    """Separate immutable structure from cost protection without inventing history.
+
+    entry_stop_price remains the legacy effective-stop projection. Old positions
+    already overwritten with niu_breakeven have unknown original structure unless
+    a separately sourced shaofu stop survives.
+    """
+    def positive(value: Any) -> float:
+        try:
+            number = float(value or 0)
+        except (ValueError, TypeError):
+            return 0.0
+        return number if math.isfinite(number) and number > 0 else 0.0
+
+    source = str(position.get("entry_stop_source") or "")
+    shaofu_source = str(position.get("shaofu_stop_source") or "")
+    legacy = 0.0 if shaofu_source == "fallback_pct" else positive(
+        position.get("shaofu_stop_price") or position.get("entry_stop_price")
+    )
+    original = positive(position.get("original_structural_stop_price"))
+    if not original:
+        if positive(position.get("shaofu_stop_price")) and shaofu_source not in {"fallback_pct", "niu_breakeven"}:
+            original = positive(position.get("shaofu_stop_price"))
+        elif source not in {"niu_breakeven", "fallback_pct"} and shaofu_source != "fallback_pct":
+            original = positive(position.get("entry_stop_price"))
+    protection = positive(cost) if break_even and position.get("partial_tp_done") else 0.0
+    # An already applied legacy cost stop remains protected if a setting changes.
+    if source == "niu_breakeven":
+        protection = max(protection, positive(position.get("entry_stop_price")))
+    return {
+        "original_structural_stop_price": original or None,
+        "cost_protection_stop_price": protection,
+        "effective_stop_price": max(legacy, original, protection),
+    }
+
+
 def niuone_hard_exit_evidence(
     *,
     strategy_id: str,
@@ -73,6 +109,8 @@ def niuone_hard_exit_evidence(
     market_hard_stop: bool,
     theme_score: float,
     theme_state: str,
+    cost_protection_stop: float = 0.0,
+    original_structural_stop: float | None = None,
 ) -> dict[str, Any]:
     """Verify hard risk conditions from observations, never model prose."""
     price = float(current_price)
@@ -82,9 +120,17 @@ def niuone_hard_exit_evidence(
     stop = stop if math.isfinite(stop) and stop > 0 else 0.0
     score = score if math.isfinite(score) else 100.0
     signal, reason = "", ""
+    stop_kind = ""
     if price > 0 and stop > 0 and price < stop:
         signal = "niu_structure_stop"
-        reason = f"现价跌破牛牛结构/成本保护线 (现价{price:.2f} < 止损{stop:.2f})"
+        if original_structural_stop and price < original_structural_stop:
+            stop_kind = "structure"
+        elif cost_protection_stop > 0 and price < cost_protection_stop:
+            stop_kind = "cost_protection"
+        else:
+            stop_kind = "structure"
+        label = "成本保护线" if stop_kind == "cost_protection" else "结构止损线"
+        reason = f"现价跌破牛牛{label} (现价{price:.2f} < 止损{stop:.2f})"
     elif market_hard_stop and (score < 55 or theme_state in {"fading", "inactive"}):
         signal = "niu_market_hard_stop"
         reason = f"市场硬停止且主线转弱 (分数{score:.1f}，状态{theme_state or '-'})"
@@ -98,6 +144,9 @@ def niuone_hard_exit_evidence(
         "reason": reason,
         "current_price": price,
         "structural_stop": stop,
+        "stop_kind": stop_kind,
+        "original_structural_stop": original_structural_stop,
+        "cost_protection_stop": cost_protection_stop,
         "market_hard_stop": bool(market_hard_stop),
         "theme_score": score,
         "theme_state": theme_state,

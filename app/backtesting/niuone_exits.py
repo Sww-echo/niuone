@@ -32,6 +32,7 @@ try:
         evaluate_strategy_time_exit,
         niuone_climax_runner_active,
         resolve_niuone_partial_take_profit,
+        niuone_stop_levels,
     )
     from app.strategies.niuone_risk import (
         NIUONE_ABSOLUTE_POSITION_CAP_PCT,
@@ -98,6 +99,7 @@ except ImportError:  # pragma: no cover - legacy top-level import path
         evaluate_strategy_time_exit,
         niuone_climax_runner_active,
         resolve_niuone_partial_take_profit,
+        niuone_stop_levels,
     )
     from strategies.niuone_risk import (
         NIUONE_ABSOLUTE_POSITION_CAP_PCT,
@@ -784,6 +786,7 @@ class NiuOneDailyExitStrategy:
                     position["niu_leader_lost_last_session"] = context.session_index
 
         stop_price = _number(position.get("entry_stop_price"), 0.0)
+        position.update(niuone_stop_levels(position, cost=entry_price, break_even=self.break_even_after_partial))
         if self.break_even_after_partial and position.get("partial_tp_done"):
             stop_price = max(stop_price, entry_price)
             position["entry_stop_price"] = stop_price
