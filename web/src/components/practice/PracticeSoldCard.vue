@@ -15,8 +15,8 @@ import {
 } from '../../utils/practiceDisplay.js'
 
 const props = defineProps({ sold: { type: Object, required: true } })
-const realized = computed(() => Number(props.sold.realized_pnl))
-const realizedPct = computed(() => Number(props.sold.realized_pnl_pct))
+const realized = computed(() => finitePracticeNumber(props.sold.realized_pnl))
+const realizedPct = computed(() => finitePracticeNumber(props.sold.realized_pnl_pct))
 const afterPnl = computed(() => finitePracticeNumber(props.sold.after_sell_pnl))
 const afterPct = computed(() => finitePracticeNumber(props.sold.change_after_sell_pct))
 const currentPct = computed(() => finitePracticeNumber(props.sold.current_change_pct))
@@ -56,7 +56,7 @@ const currentColor = computed(() => Number.isFinite(currentPct.value)
     </div>
     <div class="position-metrics">
       <div class="position-metric"><div class="position-label">卖出/现价</div><div class="position-value combo">{{ formatPracticeNumber(sold.avg_sell_price) }} / {{ sold.current_price == null ? '--' : formatPracticeNumber(sold.current_price) }}</div></div>
-      <div class="position-metric"><div class="position-label">已实现盈亏</div><div class="position-value strong combo" :style="`color:${practiceValueColor(realized)}`">{{ realizedText }}</div></div>
+      <div class="position-metric realized-return-metric" title="本轮累计已实现盈亏 ÷ 本轮累计买入成本（含费用）"><div class="position-label">已实现盈亏 / 收益率</div><div class="position-value strong combo" :style="`color:${practiceValueColor(realized)}`">{{ realizedText }}</div></div>
       <div class="position-metric"><div class="position-label">卖后变化</div><div class="position-value strong combo" :style="`color:${afterColor}`">{{ afterText }}</div></div>
       <div class="position-metric"><div class="position-label">观察</div><div class="position-value strong" :style="`color:${afterColor}`">{{ observation }}</div></div>
       <div class="position-metric"><div class="position-label">实时涨幅</div><div class="position-value strong" :style="`color:${currentColor}`">{{ Number.isFinite(currentPct) ? signedPracticeNumber(currentPct) : '--' }}</div></div>

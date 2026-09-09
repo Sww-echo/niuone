@@ -18,7 +18,7 @@ from app.dashboard.today_candidates import (
 )
 
 
-PUBLIC_SCHEMA_VERSION = 12
+PUBLIC_SCHEMA_VERSION = 13
 
 ACCOUNT_FIELDS = (
     "initial_cash",
@@ -69,6 +69,9 @@ TRADE_FIELDS = (
     "fee",
     "pnl",
     "pnl_pct",
+    "cumulative_realized_pnl",
+    "realized_return_pct",
+    "realized_return_status",
     "is_full_exit",
     "position_after_trade_pct",
     "reason",

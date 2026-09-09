@@ -4,6 +4,10 @@
 
 This manual is for maintainers and developers and covers NiuOne operation, validation, deployment, log inspection, and rollback. Native deployments store real runtime data in `.local-data/`, while Docker Compose deployments use the named volume `niuone-data`. Neither is tracked by Git, and they do not synchronize automatically.
 
+Paper-account sold cards, fill logs, chart markers, and trade notifications show cumulative realized P&L for the holding cycle and its realized return: the sum of net fill P&L through that sale divided by all buy costs in the cycle up to that time, including buy fees. Investing 10,000 and realizing 500 by selling half displays +500 / +5%. Adds increase the denominator; reopening after a full exit starts a new cycle. Today’s sold cards include earlier realized P&L from cycles sold today, taking the last cumulative value once per cycle. Unverifiable opening or quantity history displays unavailable. Original fill P&L, account cash, strategy performance, and execution rules retain their existing definitions.
+
+Sell notification headings emphasize the fraction of the stock's entire pre-sale holding sold in that fill. Full exits are explicitly labeled “清仓 · 卖出100%持仓”. Notifications also highlight the sale amount as a percentage of account equity and show shares remaining. Full-exit status uses filled shares, before/after quantities, and explicit execution flags, never rounded account weights. Missing or contradictory quantity evidence displays the reduction percentage as unavailable.
+
 ## 1. Directory Conventions
 
 ```text

@@ -152,6 +152,9 @@ def _feishu_card_elements(notification: Notification) -> list[dict[str, Any]]:
         sequence = str(section.get("sequence") or "").strip()
         if action in {"BUY", "SELL"} and name and code:
             direction = "买入" if action == "BUY" else "卖出"
+            direction = _escape_markdown(str(section.get("action_label") or direction))
+            if section.get("emphasize_action") is True:
+                direction = f"**{direction}**"
             direction_color = "red" if action == "BUY" else "green"
             sequence_prefix = f"{_escape_markdown(sequence)}. " if sequence else ""
             heading_content = (

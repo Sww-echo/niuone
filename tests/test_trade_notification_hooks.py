@@ -84,7 +84,10 @@ class TradeNotificationHookTests(unittest.TestCase):
             else:
                 sys.modules["notifications"] = original
 
-        self.assertEqual(dispatched, [[active]])
+        self.assertEqual(len(dispatched), 1)
+        self.assertEqual(len(dispatched[0]), 1)
+        self.assertEqual({key: dispatched[0][0][key] for key in active}, active)
+        self.assertIsNone(dispatched[0][0]["cumulative_realized_pnl"])
 
     def test_auto_exit_notifies_only_after_state_is_saved(self):
         events = []

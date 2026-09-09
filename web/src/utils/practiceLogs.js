@@ -1,5 +1,6 @@
 import { currentChinaDateKey } from './practiceChart.js'
 import {
+  finitePracticeNumber,
   formatPracticeAmount,
   formatPracticeNumber,
   localizePracticeReason,
@@ -28,12 +29,15 @@ function tradeLogEntry(trade, index) {
   const shares = trade.shares == null ? '' : `${trade.shares}股`
   const price = Number(trade.price)
   const amount = Number(trade.amount)
-  const pnl = Number(trade.pnl)
+  const pnl = finitePracticeNumber(trade.cumulative_realized_pnl)
+  const realizedRate = finitePracticeNumber(trade.realized_return_pct)
   const details = [
     Number.isFinite(price) ? `价 ${formatPracticeNumber(price, 3)}` : '',
     shares,
     Number.isFinite(amount) ? `额 ${formatPracticeAmount(amount)}` : '',
-    isSell && Number.isFinite(pnl) ? `盈亏 ${pnl >= 0 ? '+' : ''}${formatPracticeAmount(pnl)}` : '',
+    isSell ? (Number.isFinite(pnl)
+      ? `已实现盈亏 ${pnl >= 0 ? '+' : ''}${formatPracticeAmount(pnl)}${Number.isFinite(realizedRate) ? ` / ${realizedRate >= 0 ? '+' : ''}${formatPracticeNumber(realizedRate)}%` : ''}`
+      : '已实现盈亏 / 收益率 暂不可用') : '',
     compactStrategyText(trade.reason || trade.trade_reason || '', 100),
   ].filter(Boolean)
   return {

@@ -5444,7 +5444,7 @@ console.log(JSON.stringify([
         self.assertIn('class="practice-chart-title-measure"', PRACTICE_COMPONENTS)
         self.assertIn('class="practice-chart-hover-layer"', PRACTICE_COMPONENTS)
         self.assertIn('class="practice-trade-marker-tooltip"', PRACTICE_COMPONENTS)
-        self.assertIn("trade.action === 'SELL' && trade.isFullExit", PRACTICE_COMPONENTS)
+        self.assertIn("trade.action === 'SELL' && Number.isFinite(trade.pnl)", PRACTICE_COMPONENTS)
         self.assertIn('touch-action:none', DASHBOARD_FRONTEND)
         self.assertIn('.practice-trade-marker.sell-partial', DASHBOARD_FRONTEND)
         self.assertIn('.practice-trade-marker.sell-full', DASHBOARD_FRONTEND)

@@ -1,4 +1,5 @@
 import { mergePracticeTimedRows } from './practicePayload.js'
+import { finitePracticeNumber } from './practiceDisplay.js'
 
 export function currentChinaDateKey(date = new Date()) {
   try {
@@ -139,8 +140,8 @@ export function normalizePracticeTradeMarkers(payload) {
       name: String(raw?.name || ''),
       shares: Number(raw?.shares),
       price: Number(raw?.price),
-      pnl: Number(raw?.pnl),
-      pnlPct: Number(raw?.pnl_pct),
+      pnl: finitePracticeNumber(raw?.cumulative_realized_pnl),
+      pnlPct: finitePracticeNumber(raw?.realized_return_pct),
       isFullExit: raw?.is_full_exit === true
         || (action === 'SELL' && afterPct != null && Number(afterPct) <= 0),
     }

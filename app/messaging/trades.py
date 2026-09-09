@@ -28,6 +28,48 @@ def _finite_float(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _position_quantity(value: Any) -> int | None:
+    number = _finite_float(value)
+    if isinstance(value, bool) or number is None or number < 0 or not number.is_integer():
+        return None
+    return int(number)
+
+
+def _sell_position_details(
+    trade: Mapping[str, Any], shares: int,
+) -> tuple[str | None, int | None]:
+    """Resolve reduction against all held shares, without rounded weight guesses."""
+    before = _position_quantity(trade.get("position_before_qty"))
+    after = _position_quantity(trade.get("position_after_qty"))
+    if shares <= 0 or _position_quantity(trade.get("shares")) != shares or any(
+        trade.get(field) is not None and value is None
+        for field, value in (("position_before_qty", before), ("position_after_qty", after))
+    ):
+        return None, None
+    if before is not None:
+        expected_after = before - shares
+        if expected_after < 0 or (after is not None and after != expected_after):
+            return None, None
+        after = expected_after
+    elif after is not None:
+        before = shares + after
+    elif trade.get("position_fully_closed") is True:
+        before, after = shares, 0
+    else:
+        return None, None
+    if (
+        (trade.get("position_fully_closed") is True and after != 0)
+        or (trade.get("position_fully_closed") is False and after == 0)
+    ):
+        return None, None
+    if after == 0:
+        return "100%", 0
+    ratio = shares / before * 100
+    displayed = round(ratio, 2)
+    ratio_text = "<100%" if displayed >= 100 else "<0.01%" if displayed <= 0 else f"{ratio:.2f}%"
+    return ratio_text, after
+
+
 def _money(value: Any) -> str:
     number = _finite_float(value)
     return f"¥{number:,.2f}" if number is not None else "-"
@@ -95,7 +137,7 @@ def _append_rich_field(
     markdown_value = _markdown_text(value)
     html_label = html.escape(label, quote=False)
     html_value = html.escape(value, quote=False)
-    if color == "red":
+    if color in {"red", "green"}:
         markdown_lines.append(f"**{label}**　**{markdown_value}**  ")
         html_lines.append(f"<b>{html_label}　{html_value}</b>")
     else:
@@ -137,6 +179,13 @@ def _trade_notification(trades: Iterable[Mapping[str, Any]]) -> Notification | N
         except (TypeError, ValueError, OverflowError):
             shares = 0
 
+        sell_ratio, remaining_shares = (
+            _sell_position_details(trade, shares) if action == "SELL" else (None, None)
+        )
+        if sell_ratio is not None:
+            label = f"卖出{sell_ratio}持仓"
+            if remaining_shares == 0:
+                label = f"清仓 · {label}"
         heading = f"{index}. {label}｜{name}（{code}）"
         card_fields: list[dict[str, Any]] = []
         if plain_lines:
@@ -147,6 +196,17 @@ def _trade_notification(trades: Iterable[Mapping[str, Any]]) -> Notification | N
         markdown_lines.append(f"#### {_markdown_text(heading)}")
         html_lines.append(f"<b>{html.escape(heading, quote=False)}</b>")
 
+        if action == "SELL":
+            _append_rich_field(
+                plain_lines, markdown_lines, html_lines, card_fields,
+                "卖出比例（占该股持仓）", sell_ratio or "暂不可用",
+                color="green", short=False,
+            )
+            if remaining_shares is not None:
+                _append_rich_field(
+                    plain_lines, markdown_lines, html_lines, card_fields,
+                    "卖后持股", f"{remaining_shares:,} 股", short=False,
+                )
         _append_rich_field(
             plain_lines,
             markdown_lines,
@@ -175,27 +235,27 @@ def _trade_notification(trades: Iterable[Mapping[str, Any]]) -> Notification | N
                 markdown_lines,
                 html_lines,
                 card_fields,
-                "本笔成交仓位",
+                "卖出仓位（占总资产）" if action == "SELL" else "本笔成交仓位",
                 _percentage(order_position_pct),
-                color="red" if order_position_number > 10 else "",
+                color="green" if action == "SELL" else "red" if order_position_number > 10 else "",
             )
         if action == "SELL":
-            pnl = _finite_float(trade.get("pnl"))
-            pnl_pct = _finite_float(trade.get("pnl_pct"))
+            pnl = _finite_float(trade.get("cumulative_realized_pnl"))
+            pnl_pct = _finite_float(trade.get("realized_return_pct"))
+            pnl_text = "暂不可用（持仓历史不完整）"
             if pnl is not None:
                 pnl_text = _signed_money(pnl)
                 if pnl_pct is not None:
                     pnl_text += f"（{_signed_percentage(pnl_pct)}）"
-                _append_rich_field(
-                    plain_lines,
-                    markdown_lines,
-                    html_lines,
-                    card_fields,
-                    "盈亏",
-                    pnl_text,
-                    short=False,
-                    card_label="成交盈亏",
-                )
+            _append_rich_field(
+                plain_lines,
+                markdown_lines,
+                html_lines,
+                card_fields,
+                "已实现盈亏 / 收益率",
+                pnl_text,
+                short=False,
+            )
         trade_time = _clean_trade_text(trade.get("time"), 32)
         if trade_time:
             _append_rich_field(
@@ -237,6 +297,8 @@ def _trade_notification(trades: Iterable[Mapping[str, Any]]) -> Notification | N
             "title": heading,
             "sequence": index,
             "action": action,
+            "action_label": label,
+            "emphasize_action": sell_ratio is not None,
             "name": name,
             "code": code,
             "fields": tuple(card_fields),

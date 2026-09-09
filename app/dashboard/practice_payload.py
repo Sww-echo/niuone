@@ -287,6 +287,7 @@ def compact_trade_markers(
     """Keep the compact fill fields needed to annotate equity charts."""
     fields = (
         "time", "action", "code", "name", "shares", "price", "pnl", "pnl_pct",
+        "cumulative_realized_pnl", "realized_return_pct", "realized_return_status",
         "position_after_trade_pct", "position_after_trade_qty",
     )
     source_rows: list[dict[str, Any]] = []

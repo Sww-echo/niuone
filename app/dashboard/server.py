@@ -1581,7 +1581,9 @@ def get_practice_payload() -> dict[str, Any]:
         now = current_cn_datetime()
         trader = get_trader_module()
         state = trader.load_state()
-        payload = trader.enrich_portfolio(state)
+        payload = getattr(
+            trader, "enrich_portfolio_with_realized_history", trader.enrich_portfolio,
+        )(state)
         equity_history = state.get("equity_history", []) or []
         daily_equity_history = state.get("daily_equity_history", []) or []
         history_loader = getattr(trader, "load_account_history", None)
@@ -1615,7 +1617,7 @@ def get_practice_payload() -> dict[str, Any]:
             source_updated_at=payload["source_updated_at"],
             now=now,
         )
-        payload["trade_markers"] = compact_trade_markers(state.get("trade_log") or [])
+        payload["trade_markers"] = compact_trade_markers(payload.get("trade_log") or state.get("trade_log") or [])
         payload["trading_calendar"] = dashboard_trading_day_status(now)
         payload["trading_paused"] = state.get("trading_paused", False)
         payload["pause_reason"] = state.get("pause_reason", "")
@@ -1823,7 +1825,9 @@ def get_practice_payload_fast() -> dict[str, Any]:
         now = current_cn_datetime()
         trader = get_trader_module()
         state = trader.load_state()
-        payload = trader.enrich_portfolio(state)
+        payload = getattr(
+            trader, "enrich_portfolio_with_realized_history", trader.enrich_portfolio,
+        )(state)
         equity_history = state.get("equity_history", []) or []
         daily_equity_history = state.get("daily_equity_history", []) or []
         # Keep the same intraday point density as the full payload. Otherwise the
@@ -1838,7 +1842,7 @@ def get_practice_payload_fast() -> dict[str, Any]:
             source_updated_at=payload["source_updated_at"],
             now=now,
         )
-        payload["trade_markers"] = compact_trade_markers(state.get("trade_log") or [])
+        payload["trade_markers"] = compact_trade_markers(payload.get("trade_log") or state.get("trade_log") or [])
         payload["trade_log"] = filter_today_log_entries(payload.get("trade_log") or [], now=now)
         payload["decision_log"] = filter_today_log_entries(payload.get("decision_log") or [], now=now)
         payload["trading_calendar"] = dashboard_trading_day_status(now)

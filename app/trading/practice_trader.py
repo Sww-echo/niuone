@@ -151,6 +151,8 @@ from strategies.display import (
 )
 from strategies.lifecycle import NIUONE_LIFECYCLE_STAGES
 from trading.accounting import ACCOUNTING_AUDIT_FIELDS, trade_counts_for_account
+from trading.realized_returns import annotate_realized_returns
+from trading.lifecycles import _trade_identity
 from trading.fees import (
     A_SHARE_COMMISSION_RATE,
     A_SHARE_MINIMUM_COMMISSION,
@@ -626,7 +628,12 @@ def _notify_trade_executions_safely(executed: list[dict[str, Any]]) -> None:
     try:
         from notifications import notify_trade_executions
 
-        results = notify_trade_executions(accounted_executions)
+        display_rows = _realized_display_trade_history(accounted_executions)
+        display_by_key = {_trade_identity(row): row for row in display_rows}
+        results = notify_trade_executions([
+            display_by_key.get(_trade_identity(row), row)
+            for row in accounted_executions
+        ])
         failed_count = sum(1 for result in (results or []) if not bool(getattr(result, "ok", False)))
         if failed_count:
             print(
@@ -1232,6 +1239,28 @@ def reconcile_current_day_equity_history_from_ledger(
             state["daily_equity_history"] = revised_daily[-EQUITY_HISTORY_LIMIT:]
             changed = True
     return changed
+
+
+def _realized_display_trade_history(
+    recent_trades: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Read durable fills for display only, with a bounded SQLite fallback."""
+    error_type = ""
+    try:
+        from niuniu_db import DB_PATH
+        from trading.niuone_forward import load_niuone_forward_trades_from_db, merge_forward_trade_rows
+
+        archived, _ = load_niuone_forward_trades_from_db(DB_PATH)
+        rows, _ = merge_forward_trade_rows(archived, recent_trades)
+    except (ImportError, OSError, ValueError, sqlite3.Error) as exc:
+        rows = recent_trades
+        error_type = type(exc).__name__
+    annotated = annotate_realized_returns(rows)
+    if error_type:
+        for row in annotated:
+            if row.get("realized_return_status") == "incomplete_history":
+                row["realized_return_status"] = f"history_unavailable:{error_type}"
+    return annotated
 
 
 def build_strategy_performance(state: dict[str, Any]) -> dict[str, Any]:
@@ -2548,6 +2577,14 @@ def _cached_today_sold_quotes(state: dict[str, Any], today: str) -> dict[str, di
     return quotes
 
 
+def enrich_portfolio_with_realized_history(state: dict[str, Any]) -> dict[str, Any]:
+    """Use archived fills only in the user-facing read path."""
+    return enrich_portfolio({
+        **state,
+        "trade_log": _realized_display_trade_history(state.get("trade_log") or []),
+    })
+
+
 def enrich_portfolio(state: dict[str, Any]) -> dict[str, Any]:
     positions = state.get("positions") or {}
     total_mv = 0.0
@@ -2731,7 +2768,11 @@ def enrich_portfolio(state: dict[str, Any]) -> dict[str, Any]:
         if parse_ts(time_text) is not None and math.isfinite(equity):
             source_equity_times.append(time_text)
     source_last_equity_time = max(source_equity_times, default="")
-    today_sold_stocks = build_today_sold_stocks(state, today=today)
+    display_history = annotate_realized_returns(state.get("trade_log") or [])
+    display_by_key = {_trade_identity(row): row for row in display_history}
+    today_sold_stocks = build_today_sold_stocks(
+        state, today=today, trade_rows=display_history,
+    )
     today_sold_quote_refresh = state.get("today_sold_quote_refresh") or {}
     if (
         not isinstance(today_sold_quote_refresh, dict)
@@ -2759,7 +2800,7 @@ def enrich_portfolio(state: dict[str, Any]) -> dict[str, Any]:
         "niuone_open_risk_pct": round(niuone_open_risk_pct, 4),
         "positions": rows,
         "trade_log": list(reversed([
-            trade
+            display_by_key.get(_trade_identity(trade), trade)
             for trade in state.get("trade_log", [])
             if isinstance(trade, dict) and trade_counts_for_account(trade)
         ][-TRADE_LOG_LIMIT:])),
@@ -3486,11 +3527,15 @@ def build_today_sold_stocks(
     *,
     quote_map: dict[str, dict[str, Any]] | None = None,
     quote_meta: dict[str, Any] | None = None,
+    trade_rows: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Build today's sold cards from the trade ledger without external I/O."""
     today = today or today_key()
     sold: dict[str, dict[str, Any]] = {}
-    for trade in state.get("trade_log", []) or []:
+    display_rows = trade_rows if trade_rows is not None else annotate_realized_returns(
+        state.get("trade_log") or [],
+    )
+    for trade in display_rows:
         if not isinstance(trade, dict):
             continue
         if not trade_counts_for_account(trade):
@@ -3516,6 +3561,7 @@ def build_today_sold_stocks(
             "buy_strategies": [],
             "first_sell_time": trade.get("time") or "",
             "last_sell_time": trade.get("time") or "",
+            "realized_cycles": {},
         })
         amount = float(trade.get("amount") or (float(trade.get("price") or 0) * shares))
         fee = float(trade.get("fee") or 0)
@@ -3526,6 +3572,8 @@ def build_today_sold_stocks(
         row["net_proceeds"] += net_proceeds
         row["realized_pnl"] += pnl
         row["fee"] += fee
+        cycle_key = trade.get("realized_cycle_key") or str(trade.get("time") or "")
+        row["realized_cycles"][cycle_key] = trade
         row["last_sell_time"] = max(str(row.get("last_sell_time") or ""), str(trade.get("time") or ""))
         reason = str(trade.get("reason") or "").strip()
         if reason and reason not in row["reasons"]:
@@ -3547,12 +3595,14 @@ def build_today_sold_stocks(
     for code, row in sold.items():
         shares = int(row["shares"] or 0)
         avg_sell_price = (float(row["sell_amount"]) / shares) if shares > 0 else 0.0
-        cost_basis = float(row["net_proceeds"]) - float(row["realized_pnl"])
         quote = resolved_quote_map.get(code) or {}
         current_price = quote.get("price") if isinstance(quote.get("price"), (int, float)) else None
         change_after_sell = ((float(current_price) / avg_sell_price - 1) * 100) if current_price and avg_sell_price > 0 else None
         after_sell_pnl = ((float(current_price) - avg_sell_price) * shares) if current_price and shares > 0 else None
-        realized_pnl = float(row["realized_pnl"])
+        cycles = list(row["realized_cycles"].values())
+        verified = all(item.get("realized_return_status") == "verified" for item in cycles)
+        realized_pnl = sum(float(item["cumulative_realized_pnl"]) for item in cycles) if verified else None
+        realized_buy_cost = sum(float(item["realized_buy_cost"]) for item in cycles) if verified else 0.0
         rows.append({
             "code": code,
             "name": row.get("name") or quote.get("name") or "",
@@ -3560,8 +3610,9 @@ def build_today_sold_stocks(
             "avg_sell_price": round(avg_sell_price, 3),
             "current_price": round(float(current_price), 3) if current_price else None,
             "current_change_pct": quote.get("change_pct"),
-            "realized_pnl": round(realized_pnl, 2),
-            "realized_pnl_pct": round((realized_pnl / cost_basis * 100), 2) if cost_basis > 0 else 0,
+            "realized_pnl": round(realized_pnl, 2) if realized_pnl is not None else None,
+            "realized_pnl_pct": round(realized_pnl / realized_buy_cost * 100, 2) if realized_buy_cost > 0 else None,
+            "realized_return_status": "verified" if verified else "incomplete_history",
             "sell_amount": round(float(row["sell_amount"]), 2),
             "net_proceeds": round(float(row["net_proceeds"]), 2),
             "fee": round(float(row["fee"]), 2),
@@ -14351,7 +14402,7 @@ def get_dashboard_payload() -> dict[str, Any]:
     save_state(state)
     _sync_positions_to_db(state)
     
-    payload = enrich_portfolio(state)
+    payload = enrich_portfolio_with_realized_history(state)
     payload["equity_history"] = load_account_history(
         "equity_history",
         state.get("equity_history", []),

@@ -55,6 +55,17 @@ function restoreFromUrl() {
   mode.value = new URLSearchParams(location.search).get('curve') === 'daily' ? 'daily' : 'intraday'
 }
 
+function positionTradeTooltip(event) {
+  const marker = event.currentTarget
+  const tooltip = marker.querySelector('.practice-trade-marker-tooltip')
+  if (!tooltip) return
+  const bounds = marker.getBoundingClientRect()
+  const center = bounds.left + bounds.width / 2
+  const left = Math.max(8, Math.min(window.innerWidth - tooltip.offsetWidth - 8, center - tooltip.offsetWidth / 2))
+  marker.style.setProperty('--tooltip-offset', `${left - center}px`)
+  marker.classList.toggle('place-bottom', bounds.top < tooltip.offsetHeight + 16)
+}
+
 function updateHover(event) {
   const points = chart.value.points || []
   if (!points.length) return
@@ -180,7 +191,10 @@ onBeforeUnmount(() => window.removeEventListener('popstate', restoreFromUrl))
         :class="trade.sideClass"
         :style="`--marker-x:${trade.xPct}%;top:${trade.yPct}%`"
         :aria-label="trade.text"
-      >{{ trade.marker }}<span class="practice-trade-marker-tooltip" aria-hidden="true"><span class="practice-trade-marker-time">{{ trade.time.slice(11, 16) }}</span><span class="practice-trade-marker-line" :class="trade.action === 'BUY' ? 'buy' : 'sell'"><span class="practice-trade-marker-side">{{ trade.side }}</span><span class="practice-trade-marker-stock">{{ trade.name || trade.code }}</span><span class="practice-trade-marker-fill">{{ Number.isFinite(trade.shares) ? trade.shares : '--' }}股×{{ Number.isFinite(trade.price) ? trade.price.toFixed(2) : '--' }}</span><span v-if="trade.action === 'SELL' && trade.isFullExit && Number.isFinite(trade.pnl)" class="practice-trade-marker-pnl" :class="trade.pnl >= 0 ? 'up' : 'down'">盈亏{{ signedPracticeAmount(trade.pnl) }}<template v-if="Number.isFinite(trade.pnlPct)"> ({{ signedPracticeNumber(trade.pnlPct) }})</template></span></span></span></button>
+        @mouseenter="positionTradeTooltip"
+        @focus="positionTradeTooltip"
+        @touchstart.passive="positionTradeTooltip"
+      >{{ trade.marker }}<span class="practice-trade-marker-tooltip" aria-hidden="true"><span class="practice-trade-marker-time">{{ trade.time.slice(11, 16) }}</span><span class="practice-trade-marker-line" :class="trade.action === 'BUY' ? 'buy' : 'sell'"><span class="practice-trade-marker-side">{{ trade.side }}</span><span class="practice-trade-marker-stock">{{ trade.name || trade.code }}</span><span class="practice-trade-marker-fill">{{ Number.isFinite(trade.shares) ? trade.shares : '--' }}股×{{ Number.isFinite(trade.price) ? trade.price.toFixed(2) : '--' }}</span><span v-if="trade.action === 'SELL' && Number.isFinite(trade.pnl)" class="practice-trade-marker-pnl" :class="trade.pnl >= 0 ? 'up' : 'down'">已实现盈亏{{ signedPracticeAmount(trade.pnl) }}<template v-if="Number.isFinite(trade.pnlPct)"> ({{ signedPracticeNumber(trade.pnlPct) }})</template></span></span></span></button>
       <span v-for="(tick, index) in chart.timeTicks" :key="`label-${tick.label}-${tick.x}`" class="practice-time-label" :class="index === 0 ? 'start' : index === chart.timeTicks.length - 1 ? 'end' : 'mid'" :style="`left:${tick.x / chart.width * 100}%`">{{ tick.label }}</span>
     </div>
   </div>
