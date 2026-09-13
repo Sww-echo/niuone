@@ -105,6 +105,36 @@ process.stdout.write(JSON.stringify({{
         self.assertNotIn('practice-axis-label bot', component)
         self.assertNotIn('.practice-axis-label.bot', css)
 
+    def test_calendar_date_state_hides_future_days(self):
+        scenario = f"""
+import {{ practiceCalendarDateState }} from {json.dumps(CHART_UTILS_PATH.as_uri())};
+process.stdout.write(JSON.stringify([
+  practiceCalendarDateState('2026-08-25', '2026-08-26'),
+  practiceCalendarDateState('2026-08-26', '2026-08-26'),
+  practiceCalendarDateState('2026-08-27', '2026-08-26'),
+]));
+"""
+        result = subprocess.run(
+            ['node', '--input-type=module', '-e', scenario],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            json.loads(result.stdout),
+            [
+                {'today': False, 'future': False},
+                {'today': True, 'future': False},
+                {'today': False, 'future': True},
+            ],
+        )
+
+        component = (
+            ROOT / 'web' / 'src' / 'components' / 'practice' / 'PracticeCalendar.vue'
+        ).read_text(encoding='utf-8')
+        self.assertIn('v-else-if="!cell.future"', component)
+        self.assertIn(':disabled="!canNextMonth"', component)
+
 
 if __name__ == '__main__':
     unittest.main()

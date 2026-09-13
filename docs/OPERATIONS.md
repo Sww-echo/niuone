@@ -2,7 +2,11 @@
 
 简体中文 | [English](OPERATIONS_EN.md)
 
-本文档记录 NiuOne 的本地运行、验证、部署、日志检查和回滚流程。真实运行数据统一保存在 `.local-data/`，该目录不进入 Git。
+本文档面向维护者和开发者，记录 NiuOne 的运行、验证、部署、日志检查和回滚流程。原生部署的真实运行数据保存在 `.local-data/`，Docker Compose 部署保存在命名卷 `niuone-data`；两者都不进入 Git，也不会自动同步。
+
+模拟账户的卖出卡片、成交日志、图表和消息通知统一显示本轮持仓的累计已实现盈亏与收益率：累计已实现盈亏为截至该次卖出的各笔净盈亏之和，收益率为该金额除以截至当时本轮累计买入成本（含买入费用）。例如投入 10,000 元、卖出一半盈利 500 元，显示 +500 元 / +5%。加仓增加分母，清仓后重新买入开始新一轮；今日卖出卡片包含当天卖出所涉及持仓周期的此前已实现盈亏。同一周期当天多次卖出只取最后一次累计值，多个周期分别计入一次。历史不足以核验开仓和数量链时显示暂不可用。原始逐笔盈亏、账户资金、策略绩效和交易决策保持原口径。
+
+卖出通知在标题突出本次卖出占该股卖前全部持仓的比例；全部卖出时标注“清仓 · 卖出100%持仓”。通知同时高亮“卖出仓位（占总资产）”，并列出卖后持股数。清仓以成交股数、卖前/卖后股数及明确的成交清仓标记核验，不根据四舍五入后的账户仓位比例推断；数量信息缺失或矛盾时，卖出比例显示暂不可用。
 
 ## 1. 目录约定
 
@@ -17,11 +21,10 @@
 ├── run.sh                  # macOS/Linux 一键启动
 ├── run.bat                 # Windows BAT 一键启动
 ├── run-dashboard.sh        # 网页服务启动入口
-├── run-niuone-cron-scheduler.sh
-└── run-x-watchlist-daemon.sh
+└── run-niuone-cron-scheduler.sh
 ```
 
-运行数据默认位于：
+原生部署的运行数据默认位于：
 
 ```text
 .local-data/
@@ -75,43 +78,95 @@ http://127.0.0.1:8787/
 
 设置页末尾的“关于”分组展示项目作者、GitHub 仓库、Apache License 2.0、当前版本和 Docker Hub 最新发行版本，并可点击“检查更新”跳过服务端缓存、主动重新查询。“开启自动检测新版本”默认启用并在运行时生效，也可在 `dashboard.env` 中设置 `DASHBOARD_AUTO_VERSION_CHECK_ENABLED=0` 关闭。更新弹窗的“此版本不再提醒”仅保存在当前浏览器；手动点击首页版本号仍可复查，且更高版本发布后会重新提醒。
 
-## 3. 模型配置
+## 3. 模型与数据源配置
 
-NiuOne 需要大模型驱动完整工作流。X 关注列表监控和美股机构评级日报推荐使用 Grok；A 股盘面总结增强可使用任意兼容 `/chat/completions` 的模型；A 股候选股及龙虎榜连板/连榜股票的消息面预检使用独立配置、具备实时搜索能力的模型；选股后的买卖决策可配置兼容模型，推荐使用 DeepSeek。
+NiuOne 需要大模型驱动完整交易决策工作流。设置页的“模型配置”集中维护一套共享模型，供买卖决策、文字策略 AI 细化、问财消息判断、A 股竞价/午盘/盘后总结及隔夜美股总结共同使用。
+
+升级时，旧 `A_SHARE_MODEL_SUMMARY_*` 模型字段仅作为共享配置尚未完整设置时的兼容回退；下一次保存“模型配置”后会把可用旧值安全迁移到 `DASHBOARD_DECISION_*`，并移除重复旧字段。
 
 核心配置项：
 
 | 场景 | 配置项 |
 |---|---|
-| 牛牛美股总开关 | `DASHBOARD_US_FEATURES_ENABLED` |
-| Grok API | `DASHBOARD_GROK_BASE_URL`、`DASHBOARD_GROK_API_KEY`、`DASHBOARD_GROK_MODEL`、`DASHBOARD_GROK_API_MODE`、`DASHBOARD_GROK_CONTEXT_LENGTH` |
-| A 股盘面模型总结单独覆盖 | `A_SHARE_MODEL_SUMMARY_BASE_URL`、`A_SHARE_MODEL_SUMMARY_API_KEY`、`A_SHARE_MODEL_SUMMARY_MODEL`、`A_SHARE_MODEL_SUMMARY_MAX_TOKENS` |
-| 消息面预检 API | `DASHBOARD_NEWS_BASE_URL`、`DASHBOARD_NEWS_API_KEY`、`DASHBOARD_NEWS_MODEL`、`DASHBOARD_NEWS_API_MODE`、`DASHBOARD_NEWS_MAX_TOKENS`、`DASHBOARD_NEWS_CONCURRENCY` |
-| 问财内置数据源 | `IWENCAI_ENABLED`、`IWENCAI_BASE_URL`、`IWENCAI_API_KEY`、`IWENCAI_TIMEOUT_SECONDS`、`IWENCAI_MAX_RETRIES`、`IWENCAI_MAX_CONCURRENCY`、`IWENCAI_CACHE_TTL_SECONDS`、`IWENCAI_DRAGON_TIGER_CRON` |
-| 买卖决策 API | `DASHBOARD_DECISION_BASE_URL`、`DASHBOARD_DECISION_API_KEY`、`DASHBOARD_DECISION_MODEL` |
+| 共享模型（买卖决策与盘面总结） | `DASHBOARD_DECISION_BASE_URL`、`DASHBOARD_DECISION_API_KEY`、`DASHBOARD_DECISION_MODEL`、`DASHBOARD_DECISION_STREAM_MODE`、`DASHBOARD_DECISION_REASONING_EFFORT`、`DASHBOARD_DECISION_CONTEXT_LENGTH`、`DASHBOARD_DECISION_MAX_TOKENS` |
+| 问财内置数据源与消息面预检 | `IWENCAI_ENABLED`、`IWENCAI_NEWS_PRECHECK_ENABLED`、`IWENCAI_BASE_URL`、`IWENCAI_API_KEY`、`IWENCAI_TIMEOUT_SECONDS`、`IWENCAI_MAX_RETRIES`、`IWENCAI_MAX_CONCURRENCY`、`IWENCAI_CACHE_TTL_SECONDS`、`IWENCAI_DRAGON_TIGER_CRON` |
 | 买卖决策情报包 | `DASHBOARD_DECISION_INTELLIGENCE_ENABLED`、`DASHBOARD_DECISION_INTELLIGENCE_TTL_SECONDS`、`DASHBOARD_DECISION_INTELLIGENCE_MAX_ITEMS` |
 | 买卖决策交易纪律 | `DASHBOARD_TRADE_DISCIPLINE_TEXT`；为空时使用内置默认纪律，填写后进入模型 prompt 的“必须遵守”段 |
 | 模拟账户节奏与仓位参考 | `DASHBOARD_MAX_OPEN_POSITIONS`、`DASHBOARD_MAX_NEW_BUYS_PER_DECISION`、`DASHBOARD_MAX_SINGLE_POSITION_PCT`、`DASHBOARD_MAX_TOTAL_POSITION_PCT`、`DASHBOARD_MIN_CASH_RESERVE_PCT`；默认作为模型参考，Z 哥和板块潮汐等注册硬限制策略会在模拟执行层取全局与策略限制的更严格值 |
-| 美股评级单独覆盖 | `US_RATING_BASE_URL`、`US_RATING_API_KEY`、`US_RATING_MODEL`、`US_RATING_MAX_TOKENS` |
-| X 关注列表单独覆盖 | `X_WATCHLIST_BASE_URL`、`X_WATCHLIST_API_KEY`、`X_WATCHLIST_MODEL`、`X_WATCHLIST_MAX_TOKENS` |
 
-完成管理员认证后，优先通过页面上的设置按钮进入设置页维护。所有需要模型和 API Key 的分组都提供“测试模型连接”按钮；测试使用页面当前填写值但不会自动保存，API Key 输入框留空时会复用已保存密钥。推文监控和美股评级相关设置由“开启牛牛美股”开关控制；关闭时设置页会隐藏这些项，后台 X 监控和美股评级定时任务也会跳过。也可以直接编辑 `.local-data/dashboard.env`，保存后按配置影响范围重启或等待下一轮任务读取。
-`DASHBOARD_GROK_API_MODE` 可设为 `auto`、`responses` 或 `chat`。默认 `auto` 会为 Grok 4.5 使用带 `web_search`/`x_search` 工具的 Responses API，其他模型保持 Chat Completions；兼容网关可显式选择对应模式。`X_WATCHLIST_REQUEST_TIMEOUT_SECONDS` 控制 X 单账号请求超时，默认 `45` 秒。
-`DASHBOARD_NEWS_API_MODE` 同样可设为 `auto`、`responses` 或 `chat`。默认 `auto` 会为 Grok 4.5 和 GPT-5 系列搜索模型使用带 `web_search` 工具的 Responses API；Grok Responses 预检模型还会加入 `x_search`，其他模型通过 `web_search` 检索可公开索引的雪球/X 页面，不会改用 `DASHBOARD_GROK_*`。
+完成管理员认证后，优先通过页面上的设置按钮进入独立的“模型配置”栏目维护。该栏目提供“测试模型连接”；测试使用页面当前填写值但不会自动保存，API Key 输入框留空时会复用已保存密钥。也可以直接编辑 `.local-data/dashboard.env`，保存后等待下一轮任务读取。
+共享模型的 `DASHBOARD_DECISION_REASONING_EFFORT` 可填写模型或网关支持的枚举值，留空时不发送思考强度参数。下表中的已知官方模型会在保存、连接测试和运行请求前执行本地校验；表外自定义模型或网关别名仍可自由填写。连接测试使用当前未保存值；成功只表示网关接受当前请求，不代表上游一定执行了对应强度。不支持参数或值非法时会给出针对性提示，并且运行时不会静默删除参数重试。
+
+共享模型的 `DASHBOARD_DECISION_STREAM_MODE` 支持 `auto`、`stream`、`non_stream`。默认 `auto` 保持非流式请求；当网关明确返回必须设置 `stream=true` 时自动以流式重试。`stream` 强制流式，`non_stream` 强制非流式。后台任务即使使用流式传输，也会先拼接完整内容，再执行 JSON 校验、落盘和交易决策。
+文字策略的 AI 细化需要在浏览器实时展示模型输出，因此复用共享模型时，`auto` 保持原有流式展示；选择 `non_stream` 可改为整段返回。
+
+### 常见模型思考强度表
+
+以下能力核对于 **2026-08-13**。其中“允许填写”表示官方接口接受的输入，“实际级别/映射”用于说明兼容值不一定按字面生效。
+
+| 模型 | 允许填写 | 实际级别/兼容映射 | 默认值 |
+|---|---|---|---|
+| Qwen `qwen3.8-max` | `none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max` | Responses 原生 7 档；Chat 原生 `low/medium/xhigh`，并映射 `minimal → low`、`high/max → xhigh`、`none → 关闭` | `xhigh` |
+| Qwen 3.5–3.7、Qwen3 Max、Qwen Plus/Flash/Coder 常用 Responses 型号 | `none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max` | `auto` 使用 Responses 保留 7 档；强制 Chat 时 `none` 关闭、其他值均为开启；`xhigh/max` 仅北京和新加坡地域支持 | `xhigh` |
+| Qwen 其他混合思考 Chat 型号 | `disabled`、`enabled` | 自动转换为顶层 `enable_thinking` 开关，不支持多档强度 | 依型号为关闭或开启 |
+| Qwen3.7 Max Preview、Qwen3 Thinking、QwQ Plus | 仅可留空 | 固定始终思考，不能关闭或调节强度 | 始终思考 |
+| MiniMax `MiniMax-M3` | `none`、`minimal`、`low`、`medium`、`high` | `none` 关闭；其余值均开启 `adaptive`，不会改变思考深度 | Chat 为 `adaptive`；Responses 为 `none` |
+| MiniMax `MiniMax-M2` / M2.1 / M2.5 / M2.7（含 highspeed） | `none`、`minimal`、`low`、`medium`、`high` | 始终思考；Responses 接受兼容值但不能关闭，Chat 不发送控制字段 | 始终思考 |
+| DeepSeek `deepseek-v4-pro` | `low`、`medium`、`high`、`xhigh`、`max` | 实际为 `high`、`max`；`low → high`、`medium → high`、`xhigh → max` | `high` |
+| DeepSeek `deepseek-v4-flash` | `low`、`medium`、`high`、`xhigh`、`max` | 实际为 `low`、`high`、`max`；`medium → high`、`xhigh → high` | `high` |
+| 智谱 `glm-5.2` | `none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max` | 实际为关闭、`high`、`max`；`minimal → none`、`low/medium → high`、`xhigh → max` | `max` |
+| 智谱 GLM 4.5–5.1 常用文本/视觉型号 | `disabled`、`enabled` | 原生 `thinking.type` 开关，不支持多档强度 | `enabled` |
+| 小米 `mimo-v2.5` / `mimo-v2.5-pro` | `none`、`low`、`medium`、`high` | `none` 关闭；目前 `low/medium/high` 均为相同的开启思考效果 | 开启思考 |
+| xAI `grok-4.3` / `grok-4.3-latest` / `grok-latest` | `none`、`low`、`medium`、`high` | 同填写值；`none` 关闭推理 | 官方型号页未注明 |
+| xAI `grok-4.5` | `low`、`medium`、`high` | 同填写值；不能用该参数关闭推理 | `high` |
+| OpenAI `gpt-5.6` / `sol` / `terra` / `luna` | `none`、`low`、`medium`、`high`、`xhigh`、`max` | 同填写值 | `medium` |
+| OpenAI `gpt-5.4-pro` | `medium`、`high`、`xhigh` | 同填写值 | `medium` |
+| OpenAI `gpt-5.4` / `mini` / `nano` | `none`、`low`、`medium`、`high`、`xhigh` | 同填写值 | `none` |
+| OpenAI `gpt-5.2-pro` | `medium`、`high`、`xhigh` | 同填写值 | `medium` |
+| OpenAI `gpt-5.2` | `none`、`low`、`medium`、`high`、`xhigh` | 同填写值 | `none` |
+| OpenAI `gpt-5.1` | `none`、`low`、`medium`、`high` | 同填写值 | `none` |
+| OpenAI `gpt-5-pro` | `high` | 同填写值 | `high` |
+| OpenAI `gpt-5` | `minimal`、`low`、`medium`、`high` | 同填写值 | 官方模型页未注明 |
+
+来源：[Qwen Responses](https://help.aliyun.com/zh/model-studio/qwen-api-via-openai-responses)、[Qwen Chat](https://help.aliyun.com/zh/model-studio/qwen-api-via-openai-chat-completions)、[Qwen 深度思考](https://help.aliyun.com/zh/model-studio/deep-thinking)、[MiniMax Responses](https://platform.minimax.io/docs/api-reference/responses-create)、[MiniMax Chat](https://platform.minimax.io/docs/api-reference/text-chat-openai)、[DeepSeek Chat Completions](https://api-docs.deepseek.com/api/create-chat-completion/)、[智谱深度思考](https://docs.bigmodel.cn/cn/guide/capabilities/thinking)、[小米 MiMo Responses](https://mimo.mi.com/docs/zh-CN/api/chat/responses)、[xAI Grok 4.3](https://docs.x.ai/developers/models/grok-4.3)、[xAI Reasoning](https://docs.x.ai/developers/model-capabilities/text/reasoning)、[OpenAI GPT-5.6](https://developers.openai.com/api/docs/models/gpt-5.6-sol) 及各型号官方模型页。Claude、Gemini 等原生 API 使用不同的思考控制字段，不在这个 OpenAI 兼容表中；如果兼容网关提供同名字段，作为表外自定义值处理。
 `*_CONTEXT_LENGTH` 仅表示模型上下文窗口，默认 `128000`；`*_MAX_TOKENS` 表示期望的最大输出长度，调用层会按接口映射为 `max_tokens` 或 `max_output_tokens`。已知不接受 Responses 输出长度参数的 GPT-5.6 网关别名会省略该参数，其他网关若明确返回不支持也会自动去参重试一次。模型响应同时兼容 JSON 和 SSE，即使网关在 `stream=false` 时仍强制返回 SSE。
-消息面预检默认最多并发检查 5 只候选股；如果上游出现限流或 403/429，可将 `DASHBOARD_NEWS_CONCURRENCY` 降为 `2` 或 `1`。旧快照中的 `unclassified_response` 若能从已保存摘要唯一判断“利好/利空/中性”，补检流程会在本地修复标签并保留原查询时间，不新增模型请求；仍有歧义时保持未识别。
+买卖决策模型因输出长度耗尽而返回空正文或截断 JSON 时，会从当前输出长度开始逐级翻倍重试，自动上限为 `65536`；显式配置高于该值时，重试不会反向降低用户配置。到达上限后不再增加额度，JSON 仍不可解析时只允许一次同额度补救。已知支持原生 JSON 输出的 DeepSeek V4 决策型号会同时发送 `response_format=json_object`，其他自定义网关不强制携带该参数。
+`IWENCAI_NEWS_PRECHECK_ENABLED` 默认关闭，并位于“问财数据源”设置分组。开启后复用 `IWENCAI_*` 检索配置和 `DASHBOARD_DECISION_*` 买卖决策模型配置。问财官方 `announcement-search`、`news-search` 和 `hithink-event-query` 负责检索，公告、新闻和带日期的事件结果限制在最近 3 天并跨来源去重。存在有效证据时由买卖决策模型输出结构化利好、利空或中性判断；没有证据时直接记为中性。模型未配置、超时或输出不可解析时标记判断不可用，不回退关键词规则。每个问财技能独立记录状态，行情或资金流永远不能替代消息。旧 `DASHBOARD_NEWS_*` 配置不再读取。
 
-问财数据源默认关闭。“问财数据源”设置分组提供“测试问财接口”按钮，会使用页面当前地址和密钥发送一次轻量只读查询，不保存配置或改写龙虎榜快照。启用并配置 API Key 后，Dashboard 提供固定用途的
-`/api/iwencai/dragon-tiger?date=YYYY-MM-DD&page=1&limit=100` 龙虎榜接口；接口不接受任意自然语言问句，
-单页最多 100 只股票，并复用 Dashboard 限流和缓存。返回结果按股票代码去重，`sector` 提供所属行业，`limit_up_reason` 和 `limit_up_reason_category` 分别提供问财归纳的涨停原因及原因类别，重复榜单记录保留在 `details` 中。每日快照会与前一 A 股交易日的滚动快照比较；同一股票连续出现时写入 `consecutive_listed`、`consecutive_list_days` 和最多 10 个 `consecutive_list_dates`，缺失相邻快照时安全重置，不跨数据缺口推测。消息面预检批次使用 `IWENCAI_DRAGON_TIGER_CRON` 配置的龙虎榜计划查询时间作为起始时间，不使用上游响应的 `generated_at`；龙虎榜成功返回后，快照中尚未检索且满足连板（`limit_up_streak >= 2`）或连续上榜（`consecutive_listed = true` 且 `consecutive_list_days >= 2`）任一条件的股票使用 `DASHBOARD_NEWS_*` 配置查询最近 3 天消息，最多保持 5 路并发。公告、交易所披露和主流财经媒体用于事实核验，雪球与 X/Twitter 仅作为单独的市场舆情，不得把未核实帖子写成公司事实。每只股票的 `news_precheck.checked` 以及汇总字段 `limit_up_news_checked_codes`、`limit_up_news_pending_codes` 会持久化；旧的 `continuous_news_*` 字段作为兼容别名保留。调度器启动时会追补最近应有的交易日快照，每次新拉取前也先补检当前快照，因此周五遗漏可在周末重启或下次拉取前完成。全部完成后，后续同日拉取不会重复调用模型。模型未配置或失败不影响主榜快照，也不会回退到 `DASHBOARD_GROK_*`。`seats` 保留买卖前五的机构专用、普通营业部及问财明确标注的游资/量化席位，并记录同一营业部可能同时出现的 `buy_rank`、`sell_rank` 和金额；`institution_seats` 继续提供机构子集以兼容现有消费者。
+问财数据源默认关闭。“问财数据源”设置分组提供“测试问财接口”按钮，会使用页面当前地址和密钥执行只读验证，不保存配置或改写龙虎榜快照：始终测试行情技能，若页面已开启消息面预检则同时测试公告、新闻和事件三个技能。启用并配置 API Key 后，Dashboard 提供固定用途的
+`/api/iwencai/dragon-tiger?date=YYYY-MM-DD&page=1&limit=100` 龙虎榜接口；接口不接受任意自然语言问句。
+单页最多 100 只股票，并复用 Dashboard 限流和缓存。返回结果按股票代码去重，`sector` 提供所属行业，`limit_up_reason` 和 `limit_up_reason_category` 分别提供问财归纳的涨停原因及原因类别，重复榜单记录保留在 `details` 中。每日快照会与前一 A 股交易日的滚动快照比较；同一股票连续出现时写入 `consecutive_listed`、`consecutive_list_days` 和最多 10 个 `consecutive_list_dates`，缺失相邻快照时安全重置。开启消息面预检后，符合条件的股票通过问财三个技能检查最近 3 天信息，再由买卖决策模型判断方向；每只股票的检索/判断版本和状态会持久化，同日完成后不重复查询，版本升级会自动使旧缓存失效。任何检索或模型判断失败均不影响龙虎榜主体快照。
 问财响应属于研究数据快照，发生超时、计数不一致或上游失败时会返回明确状态，不会覆盖账户、成交或其他真实交易记录。Dashboard 的 `/dragon-tiger` 栏目可按交易日实时查询；当日数据以及下一次成功查询前仍在滚动快照中的最近数据无需密码，更早日期必须输入管理员密码并建立有效会话。当日实时回源为空时，接口继续返回最近成功快照，避免零点后在新榜单生成前把页面替换为空状态。所有非当日响应均不进入公共或 CDN 缓存，确保新数据覆盖后旧日期立即恢复保护。只有与最新快照日期一致的请求会在回源前直接复用本地数据，其他日期不持久化。Cron 默认在 A 股交易日北京时间
 18:00 更新 `.local-data/runtime/cron/output/iwencai_dragon_tiger_latest.json`。该文件只保留最近一次非空成功查询，下一次成功查询会原子覆盖它，并清理旧版本生成的 `iwencai_dragon_tiger/YYYY-MM-DD.json` 归档；空结果或主榜失败继续保留上一份有效快照。席位明细失败不会阻断股票榜单；查询日期未变化时，当前快照中的有效席位记录不会被缺失结果覆盖。
 
-买卖决策情报包默认开启。每次实战选股扫描后的模型决策都会读取盘面监控、隔夜美股、指数行情、板块涨跌、行业资金、热门股、候选消息面和账户仓位摘要，并把压缩后的 `decision_intelligence` 写入模拟交易决策日志。行情源失败时会保留 `source_status`，本轮决策继续按可用信息和既有风控执行。
+管理员策略回测仍优先使用完整东方财富行业/概念快照，并在刷新失败时复用已校验的旧快照。只有首次部署等完全没有东方财富快照时，已启用并配置密钥的问财数据源才作为冷启动备用源，完整分页查询当前 A 股的同花顺行业与概念。备用结果必须通过上游总数、分页和去重代码完整性校验后才写入独立的 `iwencai_stock_boards.json` 私有缓存；回测结果会标记实际分类来源，两个来源都不可用时明确失败，不以空分类继续计算。
+
+买卖决策情报包默认开启。每次实战选股扫描后的模型决策都会读取盘面监控、隔夜美股、指数行情、板块涨跌、行业资金、热门股、候选消息面和账户仓位摘要；用户还可在“财经快讯”设置中开启重要快讯辅助。压缩后的 `decision_intelligence` 会写入模拟交易决策日志。行情源失败时会保留 `source_status`，本轮决策继续按可用信息和既有风控执行。
 
 实战页面的规范地址为 `/practice`，候选查询与刷新接口分别为 `/api/practice_candidates` 和 `/api/practice_candidates/refresh`。基于 `?category=practice` 或 `?category=b1_screen` 的旧链接及 `/api/b1_screen` 接口仅作为兼容入口保留。
 
-### 3.1 行情与资金流设置
+### 3.1 财经快讯
+
+`/realtime-news` 由 Dashboard 服务端调用 NewsNow，不需要 API Key。Compose 默认启动 `ghcr.io/ourongxing/newsnow:latest` 并通过内网 `http://newsnow:4444/api/s` 使用；该容器不映射宿主机端口，即使只启动 Dashboard 也会被自动带起。Dashboard 只等待 NewsNow 容器进入 started 状态，不等待其健康检查，因此后续抓取异常不会拖垮主服务。默认来源为财联社电报 `cls-telegraph`、金十数据 `jin10` 和华尔街见闻快讯 `wallstreetcn-quick`；管理设置的“财经快讯”页面仅提供财经商业分类下 12 个实际来源的搜索与多选。总览页在右下角复用同一份快讯数据，纵向展示最近 5 条；默认只显示上游标记或本地规则识别出的重要快讯，可在设置中关闭该筛选。浏览器与买卖决策共用同一个进程内刷新器；服务端按 `NEWSNOW_REFRESH_SECONDS` 合并重复请求，并继续遵守各来源在 NewsNow 注册表中的上游更新间隔。成功响应会按新闻 ID 合并到本地滚动历史，默认最多保留 300 条，其中重要快讯优先保留且最多 50 条。
+
+| 配置 | 默认值 | 可选范围 | 生效方式 |
+|---|---:|---:|---|
+| `NEWSNOW_ENABLED` | `1` | `0` 或 `1` | 运行时热应用 |
+| `NEWSNOW_DECISION_ENABLED` | `1` | `0` 或 `1`；重要快讯辅助买卖决策 | 运行时热应用 |
+| `NEWSNOW_OVERVIEW_IMPORTANT_ONLY` | `1` | `0` 或 `1`；只影响总览快讯条 | 运行时热应用 |
+| `NEWSNOW_SOURCES` | `cls-telegraph,jin10,wallstreetcn-quick` | 管理页列出的 NewsNow 实际来源；至少一项 | 运行时热应用 |
+| `NEWSNOW_MAX_ITEMS` | `300` | `1`～`3000` 条；完整滚动历史总上限 | 运行时热应用 |
+| `NEWSNOW_MAX_IMPORTANT_ITEMS` | `50` | `1`～`1000` 条，且不得大于总上限 | 运行时热应用 |
+| `NEWSNOW_REFRESH_SECONDS` | `60` | `15`～`1800` 秒 | 运行时热应用 |
+| `NEWSNOW_TIMEOUT_SECONDS` | `10` | `2`～`30` 秒 | 运行时热应用 |
+| `NEWSNOW_MAX_RETRIES` | `1` | `0`～`2` | 运行时热应用 |
+| `NEWSNOW_MAX_CONCURRENCY` | `3` | `1`～`3` | 运行时热应用 |
+
+`NEWSNOW_DECISION_ENABLED` 默认开启。决策器只使用上游明确标记为重要且具备可靠发布时间的快讯。A 股交易日 15:00 前发布的条目归属当日盘中决策；15:00 后及休市日发布的条目归属下一交易日。未来时间、普通快讯和无法安全确定发布时间的条目不会进入决策。证据包保留来源、发布时间、目标交易日、当日/次日角色和陈旧状态；快讯只能辅助已有候选的 BUY/SELL/HOLD 判断，不能新增候选、放宽资格或突破仓位与风控。已显式保存为关闭的部署仍保持关闭。
+
+各来源在有界并发和超时内独立获取。成功结果与已有记录按 ID 去重合并，新副本优先，并按时间裁剪到 `NEWSNOW_MAX_ITEMS`；最多 `NEWSNOW_MAX_IMPORTANT_ITEMS` 条重要快讯在总容量内优先保留。结果原子保存到 `.local-data/runtime/news/realtime_news_latest.json`；单个来源失败时只回退该来源已保存的历史并标记 `stale/cache`，全部失败也不会用空结果覆盖缓存。内置 NewsNow 的状态保存在 `newsnow-data` volume，并跟随 `docker compose up/down` 自动启动和停止；用户不需要配置服务地址。来源越多，首次聚合耗时和上游请求量越大，应按需选择。运维排障可使用 `docker compose ps newsnow` 和 `docker compose logs newsnow`，如需固定上游版本可选设置 `NEWSNOW_IMAGE`。服务必须能出站访问所选来源，并按各内容来源的服务条款处理展示、存储和转载。
+
+### 3.2 行情与资金流设置
 
 设置页的“行情与资金流设置”集中维护指数行情与行业资金流参数：
 
@@ -130,21 +185,25 @@ NiuOne 需要大模型驱动完整工作流。X 关注列表监控和美股机�
 
 行业资金流默认只在 A 股交易日北京时间 09:25～11:31、13:00～15:01 采样，可在设置页分别修改四个边界时间。保存时必须满足“上午开始 < 上午结束 < 下午开始 < 下午结束”。调整采样窗口或间隔不会删除已经保存的真实采样点；窗口外的历史点不参与当前动画，新采样按更新后的窗口和最小时间间隔追加。
 
-指数行情页的“主力资金流向”和资金流动页共享东方财富行业板块接口的“今日主力净额”口径（字段 `f62`，单位由元换算为亿元），并共用同一份 60 秒缓存。新版快照和采样历史分别保存为 `industry_main_money_flow_cache.json`、`industry_main_flow_history.json`。旧版总流入减总流出口径的缓存与历史文件会保留，但不会与主力净额动画混合播放。
+指数行情页的“主力资金流向”和资金流动页共享东方财富行业板块接口的“今日主力净额”口径（字段 `f62`，单位由元换算为亿元），并共用同一份 60 秒缓存。新版快照和采样历史分别保存为 `industry_main_money_flow_cache.json`、`industry_main_flow_history.json`。旧版总流入减总流出口径的缓存与历史文件会保留，但不会与主力净额动画混合播放。强制刷新使用三次有界请求和递增退避；全部失败时仍保留旧缓存，但盘面总结状态会同时显示经过压缩的底层失败原因，便于区分超时、HTTP/TLS 异常和不完整响应。
 
 指数行情页的 A 股市场情绪曲线默认每 30 秒读取一次腾讯证券沪深 A 股全市场快照，并用行情返回的现价、最高价、涨停价和跌停价计算涨停板、跌停板与炸板数量；红盘、绿盘按行情涨跌幅正负统计。同一次通过完整性校验的逐股最新报价还会交给题材强度快速计算器，不会为题材页面重复请求腾讯。快速计算器只读取私有日 K 与行业映射缓存，沿用最近完整研究扫描的龙虎榜确认分量且不读取消息数据，并把最新行情时间和计算完成时间分别写入题材快照；覆盖不足、时间戳过期或计算失败时保留上一份有效题材结果。该行为由 `DASHBOARD_NIUONE_MAINLINE_MINUTE_REFRESH_ENABLED` 控制，共享采样间隔由 `DASHBOARD_MARKET_BREADTH_SAMPLE_INTERVAL_SECONDS` 控制。页面下方的实际量能优先使用东方财富上证指数与深证成指当日 1 分钟成交额合计；该请求失败或滞后时，回退到同一批腾讯全市场行情的累计成交额，并在接口和页面标明实际来源。预测全天量能采用分段口径：09:30～09:34 只使用 09:25 已撮合完成的全市场竞价成交额作为今日实时输入，以最近最多 20 个有效配对交易日的全天成交额中位数为基线，按“历史全天成交额中位数 ×（今日竞价成交额 ÷ 历史竞价成交额中位数）^0.5”估算，避免样本外的极端竞价额被按 1:1 弹性放大；盘中实际累计量能不参与这五分钟的预测，竞价有效配对少于 10 日时只保留实际量能。09:35 起改用最近 20 个完整交易日的 5 分钟累计成交分布，以当前实际累计量能除以相同时点累计占比的中位数估算全天量能；完整样本不足 20 日时同样不生成替代预测。竞价任务只保存 09:27 前且覆盖不少于 4,000 只股票的结构化样本，开盘后补跑数据不会混入。预测增量为“预测全天量能 − 最近一个完整上一交易日的全天成交额”，允许为负；比较基准独立于当前预测模型的训练样本，同一交易日所有有效增量点使用同一基准日。历史文件在当天完整市场宽度样本之外，只精简保留最近一个交易日的实际累计量能曲线；30 秒采样最多保留 600 个聚合点，足以覆盖完整交易日。接口按相同交易进度对齐“今日实际量能”和“前日同期量能”，并计算“较昨日同期差”（今日实际量能减去前一交易日同进度量能），正值表示放量、负值表示缩量。所有量能曲线单位均为亿元。接口同时返回当前阶段采用的数据源、样本区间、样本数和 5 分钟间隔（如适用）。统计口径包含 ST，不含 B 股、北交所及无有效现价证券。后台只在 A 股交易日 09:30～11:30、13:00～15:00 采样，真实点保存在 `market_breadth_history.json`；旧样本缺少成交额或增量字段时原样保留并显示为空缺，不补写零值。若同一天包含不同预测模型的历史点，接口仅隐藏与最新模型不兼容的预测和增量字段，红绿盘、涨跌停及实际量能等真实记录仍然保留。腾讯分片不完整、成交额覆盖不足或请求失败时保留上一份有效历史，不写入伪零值。
 
 盘中 20 日成交分布模型首次成功构建后，会原子保存到私有运行目录的 `cron/output/turnover_profile_cache.json`。Dashboard 重启时只恢复缓存键与当前交易日一致、模型版本匹配且通过完整性校验的模型，然后继续用最新实际累计量能重新计算预测；跨日、损坏或不完整缓存不会被复用。上游刷新失败不会覆盖已有有效模型缓存。
 
-行业资金流快照、资金流采样和市场情绪曲线以北京时间 09:00 作为展示日切点：前一自然日的收盘数据在零点后继续展示至次日 08:59:59，09:00 起清空当日展示并等待新的有效采样。市场情绪历史在展示日完整采样之外，额外保留最近一个交易日的精简实际量能曲线。Dashboard 启动时会校验文件日期，常驻后台任务在每日北京时间 09:00 原子清空 `industry_main_money_flow_cache.json`，并按样本时间滚动 `industry_main_flow_history.json`：只移除非当前展示日的样本，顶层日期过期或文件中混有跨日样本都不会删除有效的当日记录。每次行业资金成功采样时还会先原子更新 `industry_main_flow_history.recovery.json` 恢复副本；重启时主文件缺失、损坏或意外变空，会从副本合并恢复当日真实样本。市场宽度历史同步滚动 `market_breadth_history.json`，移除上一展示日红绿盘、涨跌停等情绪字段，仅归档其实际累计量能。相关 API 内存缓存会同步失效。09:00 后若上游仍返回前一日时间戳，服务端会拒绝重新展示或写入该快照，页面保持空状态直到取得当日首个有效采样。
+Dashboard 在 A 股交易日启动后会自动检查当日市场情绪曲线；盘中后台先等待一个启动后新采样作为恢复边界，再找出从 09:31 到该边界之间所有缺失分钟（包括曲线开头和停机形成的中段缺口）。盘中只有最新缺口之后仍有至少 3 个不同分钟的真实采样可作交叉验证时，才通过跨进程租约启动隔离补齐任务；收盘后启动则检查到 15:00，并允许用最接近缺口的至少 3 个既有真实分钟校验尾部缺口。该任务不阻塞服务启动，完整曲线幂等跳过，上游失败最多有界重试 3 次；真实点不足 3 个时保留现有记录，不降低校验门槛。也可执行 `python3 app/entrypoints/recover_market_breadth_history.py` 做只读恢复演练。该入口只处理北京时间当天：先取得与实时采样相同的腾讯有效股票池和涨跌停价，再用腾讯当日 1 分钟 OHLC 重算每分钟红盘、绿盘、涨跌停和累计最高价对应的炸板状态，并用沪深指数分钟累计金额恢复实际量能。它要求所有有效股票都有可验证结果，并至少使用 3 个仍然存在的同分钟真实点交叉检查股票数、五条情绪序列和量能；任何覆盖缺口或差异超限都会停止。逐股结果只在内存中聚合，私有检查点只保存聚合值和已验证代码，可在上游中断后续跑。演练通过后，显式增加 `--write` 才会先把主文件和 recovery 文件备份到私有 `backups/`，再以“相同时间戳的原始记录优先”方式原子合并恢复点。自动流程直接使用相同的 `--write` 安全入口。该入口不做插值、不使用 B1 子股票池补洞，也不回填历史交易日。
 
-### 3.2 实战策略调度与进程归属
+行业资金流快照、资金流采样和市场情绪曲线以北京时间 09:00 作为展示日切点：前一自然日的收盘数据在零点后继续展示至次日 08:59:59，09:00 起清空当日展示并等待新的有效采样。市场情绪历史在展示日完整采样之外，额外保留最近一个交易日的精简实际量能曲线。Dashboard 启动时会校验文件日期，常驻后台任务在每日北京时间 09:00 原子清空 `industry_main_money_flow_cache.json`，并按样本时间滚动 `industry_main_flow_history.json`：只移除非当前展示日的样本，顶层日期过期或文件中混有跨日样本都不会删除有效的当日记录。每次行业资金成功采样时还会先原子更新 `industry_main_flow_history.recovery.json` 恢复副本；重启时主文件缺失、损坏或意外变空，会从副本合并恢复当日真实样本。市场宽度历史同样原子维护 `market_breadth_history.recovery.json`；启动、日切和追加新采样前都会按样本时间合并主文件与恢复副本，较短的同日曲线不能覆盖已保存的较完整真实曲线。日切后的 `market_breadth_history.json` 会移除上一展示日红绿盘、涨跌停等情绪字段，仅归档其实际累计量能。相关 API 内存缓存会同步失效。09:00 后若上游仍返回前一日时间戳，服务端会拒绝重新展示或写入该快照，页面保持空状态直到取得当日首个有效采样。
+
+### 3.3 实战策略调度与进程归属
 
 严格前向 v18 把牛牛新仓容量与组合回测对齐：每个北京时间交易日跨 Practice 决策轮次累计最多首次建仓 2 只。执行层从持久化成交状态重建当天已开仓代码并按代码幂等去重；加仓和其他策略的新仓不占牛牛额度，达到上限后的新标的以 `position_capacity` 拒绝。该数值和计数规则随协议一并冻结。
 
-实战策略没有各自独立的选股定时任务。Dashboard 默认在交易日 09:10 启动全量非 ST 股票日 K 预热，把最近 500 根腾讯前复权日线保存到私有 SQLite；实战策略继续按需只读取最近 120 根，额外历史供技术分析周线聚合使用。冷部署、卷丢失、日期过期或旧版缓存只有 120 根时，不再等待 09:10 窗口，而会在服务启动后立即有界初始化。中断后的同日重试只补缺失或历史窗口不足的股票，成功序列不会被失败结果覆盖。默认覆盖率达到 90% 才允许实战扫描；Dashboard 启动的扫描只读取日期有效的本地历史并合并批量实时行情，不在交互任务内逐股回源。覆盖不足时，手动任务排队等待初始化并在页面展示阶段、完成数和失败数；定时任务明确记为数据未就绪，不会使用不完整数据进入模拟交易。
+实战策略没有各自独立的选股定时任务。Dashboard 默认在交易日 09:10 启动全量非 ST 股票日 K 预热，把最近 500 根前复权日线保存到私有 SQLite；下载优先尝试腾讯的多个有界入口，全部失败时降级到东方财富同口径行情。常规扫描保持 120 根默认读取窗口，提示词策略按执行计划读取所需历史，额外历史也供技术分析周线聚合使用。冷部署、卷丢失、日期过期或旧版缓存只有 120 根时，不再等待 09:10 窗口，而会在服务启动后立即有界初始化。中断后的同日重试只补缺失或历史窗口不足的股票，成功序列不会被失败结果覆盖。默认覆盖率达到 90% 才允许实战扫描；Dashboard 启动的扫描只读取日期有效的本地历史并合并批量实时行情，不在交互任务内逐股回源。覆盖不足时，手动任务排队等待初始化并在页面展示阶段、完成数和失败数；定时任务明确记为数据未就绪，不会使用不完整数据进入模拟交易。
 
 Dashboard 内置的 B1 调度器在每个计划时间先使用实时指数、行业涨跌、行业主力资金、市场宽度/量能与已有盘面扫描生成统一的“此刻盘面总结与评价”，再启动共享扫描器。腾讯全市场实时报价阶段另有 90 秒默认总预算，避免单个上游慢响应耗尽整个 480 秒扫描预算。扫描器读取 `DASHBOARD_ACTIVE_STRATEGY`，只运行当前策略套件的评分器；扫描结束后，定时流程一方面把同一份总结与评价传入模型判断和模拟执行层复核，另一方面在后台启动独立的全市场题材强度研究扫描。后者忽略 `DASHBOARD_ACTIVE_STRATEGY`，只更新题材专用缓存，不参与候选或买卖。同一运行目录下的多个 Dashboard 实例通过进程租约互斥预热和完整扫描，防止重复扫描与重复交易；手动任务终态会原子持久化，服务重启只把未完成任务标记为中断，不自动重放交易。
+
+完整扫描结果继续原子覆盖 `multi_strategy_latest.json` 和兼容用的 `b1_screen_latest.json`，但历史只写入 `multi_strategy_history/`。每轮成功扫描后自动停写并清理旧的 `b1_history/` 重复归档，同时把主归档限制为最近一个归档日期、该日期最多 12 轮；清理只识别标准日期目录和时间戳 JSON，未知文件、嵌套目录与符号链接保持不动。该清理不触碰最新缓存、模拟账户、SQLite 成交/决策证据、严格前向报告或调度状态。
 
 实战页不再用 B1 涨跌家数的独立阈值规则生成另一个“盘面评价”。总结产物的 `tone` / `tone_label` 同时作为页面评价和交易上下文风险级别；模型不可用时调用同一模块的本地汇总规则。手动点击“生成此刻盘面总结与评价”或“手动运行选股与交易策略”会刷新该产物；定时运行则复用 `DASHBOARD_PRACTICE_SCHEDULE_TIMES`。生成失败时保留当日上一份有效总结和评价，不用不完整快照覆盖。
 
@@ -153,6 +212,8 @@ Dashboard 内置的 B1 调度器在每个计划时间先使用实时指数、行
 | `DASHBOARD_ACTIVE_STRATEGY` | `niuone` | 当前新候选、模型 Prompt 和新买入规则 | 运行时热应用；下一轮扫描生效 |
 | `DASHBOARD_B1_SCHEDULE_ENABLED` | `1` | 是否启动 Dashboard 内置选股调度线程 | 需要重启 Dashboard |
 | `DASHBOARD_PRACTICE_SCHEDULE_TIMES` | `09:25,10:00,10:30,11:00,11:20,13:00,13:30,14:00,14:30,14:50` | 实战盘面总结评价、当前策略选股及买卖决策时间点 | 运行时热应用；旧键 `DASHBOARD_B1_SCHEDULE_TIMES` 仅作兼容读取 |
+| `DASHBOARD_PRACTICE_FAST_CYCLE_ENABLED` | `0` | 是否启用仅面向当前持仓的同策略快周期 | 运行时热应用；默认关闭 |
+| `DASHBOARD_PRACTICE_FAST_CYCLE_INTERVAL_SECONDS` | `300` | 持仓快周期触发间隔，允许 60～900 秒 | 运行时热应用 |
 | `DASHBOARD_B1_SCHEDULE_CATCHUP_MINUTES` | `35` | Dashboard 短暂离线后的漏触发补跑窗口 | 需要重启 Dashboard |
 | `DASHBOARD_B1_SCAN_TIMEOUT_SECONDS` | `480` | 一轮完整选股进程的硬超时；超时时返回当前阶段而非统一错误 | 需要重启 Dashboard |
 | `DASHBOARD_TENCENT_QUOTE_STAGE_TIMEOUT_SECONDS` | `90` | 腾讯全市场批量实时报价阶段的总预算，允许 15～300 秒 | 需要重启 Dashboard |
@@ -171,7 +232,11 @@ Dashboard 内置的 B1 调度器在每个计划时间先使用实时指数、行
 | `DASHBOARD_NIUONE_FORWARD_PREFLIGHT_CRON` | `5 9 * * 1-5` | 在首轮实战决策前冻结或校验严格前向协议 | Scheduler 启动时立即运行，之后在周一至周五按 Cron 复检 |
 | `DASHBOARD_NIUONE_EQUITY_SNAPSHOT_CRON` | `15 15 * * 1-5` | 无交易副作用地刷新行情并保存盘后账户权益 | 后续 Cron 周期读取；必须早于严格前向评估 |
 | `DASHBOARD_NIUONE_FORWARD_CRON` | `20 15 * * 1-5` | 从完整模拟成交账本生成牛牛严格前向报告 | 周一至周五的后续 Cron 周期读取 |
-| `DASHBOARD_NIUONE_FORWARD_COHORT_START` | `2026-08-04` | 严格前向队列纳入首次 BUY 的起始交易日 | 后续 Cron 周期读取；改值后必须建立新协议锁 |
+| `DASHBOARD_NIUONE_FORWARD_COHORT_START` | `2026-09-08` | 严格前向队列纳入首次 BUY 的起始交易日 | 后续 Cron 周期读取；改值后必须建立新协议锁 |
+| `DASHBOARD_EXIT_FEEDBACK_AUTO_TUNE_ENABLED` | `1` | 是否启用受约束的 5 日卖后自动调参；设为 `0` 可关闭 | 下一轮盘后复盘读取 |
+| `DASHBOARD_EXIT_FEEDBACK_MIN_SAMPLES` | `30` | 调参最少独立有效样本簇，允许 20～500 | 下一轮盘后复盘读取 |
+| `DASHBOARD_EXIT_FEEDBACK_MIN_MONTHS` | `3` | 调参最少覆盖月份，允许 2～12 | 下一轮盘后复盘读取 |
+| `DASHBOARD_EXIT_FEEDBACK_COOLDOWN_SAMPLES` | `10` | 两次评估检查点之间要求的新增退出/再入样本，允许 5～100 | 下一轮盘后复盘读取 |
 
 旧部署若只配置了 `DASHBOARD_B1_SCHEDULE_TIMES`，Dashboard 会继续读取原值；新旧键同时存在时以 `DASHBOARD_PRACTICE_SCHEDULE_TIMES` 为准。设置页只展示新键，下一次保存该时间列表时会写入新键并删除本地 `dashboard.env` 中的旧键。
 
@@ -181,9 +246,11 @@ Dashboard 内置的 B1 调度器在每个计划时间先使用实时指数、行
 
 每轮 B1 定时或手动决策都会先刷新全部已有持仓，并按各持仓保存的 `strategy_mark` 检查原策略退出规则；当前激活策略只控制新候选和 BUY。候选为零或日内亏损预算触发时，SELL/HOLD 检查仍会继续，日内亏损预算只暂停新开仓。
 
+开启持仓快周期后，Dashboard 在 A 股可成交时段按配置间隔只加载当前持仓，使用最新有效题材/市场上下文和持仓实时行情重新运行完整扫描所用的同一组评分器，再进入相同的盘面总结、模型决策、退出优先和成交复核链路。快周期不会发现新代码；其中 BUY 只表示对决策开始及执行时都仍持有的股票加仓，首次建仓和同轮卖出后回补会在执行层失败关闭。行情或日 K 不完整的持仓仍可进入正常 SELL/HOLD 检查，但不会获得快周期 BUY 资格。完整扫描与快周期共享账户决策锁，重叠时快周期跳过，不等待或并发写账户。
+
 本地自动退出也由独立 Cron Scheduler 进程在专用时间点调用。结构止损、板块潮汐退潮、策略时间窗、2R 和 2ATR 等仍是离散检查，不是实时逐笔监控；要覆盖完整生命周期，Dashboard 和 Cron Scheduler 两个进程都必须运行。
 
-牛牛严格前向证据从 `2026-08-04` 起累计。Cron Scheduler 每次启动都会立即运行 `--protocol-only`，不打开或要求交易数据库；工作日 09:05 默认再复检一次，因此正常启动或 09:05 后、09:25 前的迟启动都能在首轮计划决策前冻结/校验 `cron/state/niuone_forward_protocol.json`。起始日前的预检同时冻结不含股票代码的零持仓账户基线；基线缺失、带仓或迟于起始日时，账户收益不可归因。预检只重试一次，确定性指纹不一致不会用 5 分钟重试阻塞其他定时任务。模拟成交除保留最近 200 条 JSON 展示日志外，还会把完整成交 payload 幂等写入 `niuniu.db`；首次 BUY 的主线/排名/行业/成交跳空快照以及信号生成时间、计划槽、计划/补跑/手动来源、direct/deferred 模式和定仓边界，加仓和部分退出因此不会因展示日志裁剪而丢失。协议 v18 还为每轮决策保存完整展示机会集、规范化策略标识、是否进入决策池、模型请求/最大许可股数及结构化过滤/拒单原因；交易仍只使用显式 `trade_items`，不会因审计字段扩大候选池。延迟成交记录继承原计划槽机会集；盘后报告按计划槽去重并按五阶段输出 observed→eligible→model BUY→executed BUY 漏斗、定仓利用率及一致性异常。完整空候选池有效，字段残缺、重复代码/排名或资格与过滤原因矛盾的证据无效。Cron Scheduler 默认在实际 A 股运行日 15:15 通过 `--snapshot-equity` 只刷新行情并保存收盘后账户权益，15:20 再只读合并 SQLite 历史和最近 JSON，原子更新私有文件 `cron/output/niuone_forward_evaluation.json`；JSON 状态层独有行只作恢复覆盖，不能代替耐久 payload 或权益点。v18 还要求牛牛首次 BUY 初始化持仓阶段路径，后续每次主线扫描追加或扩展阶段段落，实际 SELL 冻结退出阶段；完成生命周期若缺少任一实际运行日的阶段观察，或入口、路径、退出时间/阶段不一致，同样保持 `data_quality_blocked`。
+当前牛牛严格前向队列从 `2026-09-08` 起累计。Cron Scheduler 每次启动都会立即运行 `--protocol-only`，不打开或要求交易数据库；工作日 09:05 默认再复检一次，因此正常启动或 09:05 后、09:25 前的迟启动都能在首轮计划决策前冻结/校验 `cron/state/niuone_forward_protocol.json`。起始日前的预检同时冻结不含股票代码的零持仓账户基线；基线缺失、带仓或迟于起始日时，账户收益不可归因。预检只重试一次，确定性指纹不一致不会用 5 分钟重试阻塞其他定时任务。模拟成交除保留最近 200 条 JSON 展示日志外，还会把完整成交 payload 幂等写入 `niuniu.db`；首次 BUY 的主线/排名/行业/成交跳空快照以及信号生成时间、计划槽、计划/补跑/手动/持仓快周期来源、direct/deferred 模式和定仓边界，加仓和部分退出因此不会因展示日志裁剪而丢失。协议 v18 还为每轮决策保存完整展示机会集、规范化策略标识、是否进入决策池、模型请求/最大许可股数及结构化过滤/拒单原因；交易仍只使用显式 `trade_items`，不会因审计字段扩大候选池。延迟成交记录继承原计划槽机会集；盘后报告按计划槽或非计划运行来源与信号时点去重，并按五阶段输出 observed→eligible→model BUY→executed BUY 漏斗、定仓利用率及一致性异常。完整空候选池有效，字段残缺、重复代码/排名或资格与过滤原因矛盾的证据无效。Cron Scheduler 默认在实际 A 股运行日 15:15 通过 `--snapshot-equity` 只刷新行情并保存收盘后账户权益，15:20 再只读合并 SQLite 历史和最近 JSON，原子更新私有文件 `cron/output/niuone_forward_evaluation.json`；JSON 状态层独有行只作恢复覆盖，不能代替耐久 payload 或权益点。v18 还要求牛牛首次 BUY 初始化持仓阶段路径，后续每次主线扫描追加或扩展阶段段落，实际 SELL 冻结退出阶段；完成生命周期若缺少任一实际运行日的阶段观察，或入口、路径、退出时间/阶段不一致，同样保持 `data_quality_blocked`。
 
 协议锁冻结队列起始日、门槛、影子候选、牛牛评分/选择/退出/执行、调度和耐久成交/决策存储相关源码，以及非密钥运行配置的 SHA-256 指纹；运行配置包括预检/盘后 Cron、耐久数据库/恢复状态和两份运行审计状态的有效路径，只保存逐项摘要，不把路径、Prompt、模型地址等原文写入报告。`--as-of` 只控制报告截止日，锁的冻结时间和起始日前重冻资格始终取实际墙钟日期，不能在队列开始后用回填日期覆盖旧锁。后续指纹不一致时，服务保留原锁、盘前任务返回非零状态，盘后报告标记为 `protocol_mismatch` 并禁止晋级，即使交易数或时间门槛已经满足也不例外。Scheduler 在 `niuone_cron_scheduler.json` 有界保留 400 日任务终态，每个任务每日最多 10 次；Dashboard 在 `b1_schedule_state.json` 有界保留 400 日 Practice 槽终态。Practice 槽只有选股与买卖决策链成功且完整决策证据已写入 SQLite 才记为 `ok`；模型或落盘失败记 `error`，只有缓存而无法证明决策已执行记 `skipped`。自动退出的成交或系统决策落盘失败同样使独立任务失败。
 
@@ -224,6 +291,46 @@ v29 把多概念归因前置到题材聚合：`f103` 只提供候选标签，当
 v30 使用 20 日市场中性化收益波形增强多概念归因：目标股票与排除自身后的题材中位超额收益逐日相关，并按该股票全部 `f103` 候选中的相对排名收缩。牛牛所有扫描模式均跳过消息预检和大模型调用；消息配置只保留给其他明确使用消息预检的模块。题材上下文/专用缓存升级为 v11/v9，严格前向/管理员回测升级为 `niuone-strict-forward-v30`/`niuone-backtest-v31`，旧结果不得混算。
 
 v31 修复多概念股票在龙头环节被归因权重重复降级：15% 权重线继续过滤普通弱分支，但单股归因分最高且不低于 60 的首要题材可保留龙头资格；随后结构龙头按原始强度、今日龙头按当日涨幅排序，不再乘以归因权重。管理员回测按真实次日开盘校验结构资格，5bp 模拟滑点只影响成交价和风险定仓。题材广度、资金、集中度、生命周期、价格形态和全部风险门槛不变。题材上下文/专用缓存升级为 v12/v10，严格前向/管理员回测升级为 `niuone-strict-forward-v31`/`niuone-backtest-v32`；部署前归档旧锁、报告和回测结果，不得混算。
+
+v32 要求牛牛领涨、转强和启动同时满足全市场成交额分位 ≥60、动作所选题材内成交额分位 ≥50；成交额缺失时失败关闭。牛牛试仓不受硬门限制，但会保留活跃度不足提示。成交额在个股强势分中的权重同步提高到 15%，5 日相对强度降到 20%，不直接按市值或换手率加分。候选卡展示资金活跃度及两个成交额分位，首次建仓和候选机会集持久化相同证据。题材上下文/专用缓存为 v13/v11，候选证据 schema 为 v2，严格前向/管理员回测为 `niuone-strict-forward-v32`/`niuone-backtest-v33`；部署前归档旧锁、报告和回测结果。
+
+v33 仅本地化面向用户的内部枚举。提示词改用中文阶段、角色和主线模式名；持久化前只转换明确处于中文策略上下文的独立小写枚举，并覆盖二次取舍的嵌套放弃理由。大小写专名、纯英文技术表达、错误文本、缩写和标识符保持原样，策略评分、资格、仓位和风控不变。展示映射加入严格前向源码指纹，协议升级为 `niuone-strict-forward-v33`，默认新队列从 `2026-08-13` 开始；部署前归档 v32 锁和报告，不能混算两套证据。
+
+管理员回测 v34 将信号期后的最终平仓日计入权益曲线及风险指标，并改进长耗时回放的当前交易日计时和剩余时间估算。牛牛协议升级为 `niuone-backtest-v34`，预设文字策略协议同步升级为 `prompt-backtest-v2`；旧结果会失效并要求重跑。策略规则、成交精度和资金计算不变。
+
+v34 取消牛牛上午/下午、单轮和单日新开仓数量限制，固定最多持有 5 只。满仓时按注册战法确定性、当前信号分、主线阶段/分数和强势龙头身份计算优先级；仅当新候选严格高于全部满足 T+1 的最低优先级牛牛持仓时，执行层才生成整仓 SELL 并在其后处理 BUY。严格前向/管理员回测协议升级为 `niuone-strict-forward-v34`/`niuone-backtest-v35`，默认新队列从 `2026-08-19` 开始；上线前必须归档旧协议锁、报告和回测结果。
+
+v35 为同一股票、同一战法增加评分阶梯加仓：成交层以持仓期实际 BUY 的最高评分为基准，只有后续 BUY 评分严格创新高才允许加仓，并在持仓与耐久成交中记录前后分数、最高分和买入次数。试仓当日禁加、亏损不补，成熟路径仍受主升、强势领涨和 2%～12% 浮盈窗口限制；阶段升级、减仓后的波段回补及所有风险预算不变。严格前向/管理员回测协议升级为 `niuone-strict-forward-v35`/`niuone-backtest-v36`；默认队列仍为尚未开始的 `2026-08-19`。
+
+v36 使盘面总结/评价不再影响牛牛开仓数量。盘面上下文中的动态持仓数、单轮新仓数或暂停买入字段仅继续约束非牛牛策略；牛牛在模型提示、超限二次取舍和成交复核中统一只受最多 5 只持仓及满仓优先级换仓约束。盘面仍可收紧单笔/组合/主题风险预算、总仓和现金，候选自身确认的复合市场硬停止仍禁止开仓，日内亏损预算也保持独立有效。严格前向协议升级为 `niuone-strict-forward-v36`；管理员回测已使用相同容量语义，协议保持 `niuone-backtest-v36`，默认队列日期仍为 `2026-08-19`。
+
+v37 不再让消息面预检失败影响买卖权重。失败、超时、未检查、待判断或不可用记录仅保留于预检状态与界面排障，不进入决策消息证据；候选摘要将其统一映射为中性、权重 0，禁止因此降分、降优先级、缩仓或作为不开仓/HOLD/SELL 理由。仅已完成的有效利好、利空或中性结果可参与决策。提示词属于冻结证据链，严格前向协议升级为 `niuone-strict-forward-v37`；管理员回测保持 `niuone-backtest-v36`，默认队列日期仍为 `2026-08-19`。
+
+v38 解除牛牛试仓每日 2 个候选和同板块/同题材 2 只持仓的固定数量限制。筛选、模型提示、成交复核和管理员回测均允许更多合格标的，但最多 5 只持仓、单票、主题风险、主题敞口、组合风险、总仓、现金、涨停和 T+1 继续硬执行；板块潮汐同一行业 2 只规则不变。严格前向/管理员回测协议升级为 `niuone-strict-forward-v38`/`niuone-backtest-v37`，默认新队列日期为 `2026-08-21`；部署前归档旧锁、报告和回测结果。
+
+v39 修正共享盘面提示中的午盘数量歧义：`max_open_positions`、午盘持仓数和午后保留名额只适用于非牛牛策略，模型不得据此将未满 5 只的牛牛账户判为满仓或 HOLD。严格前向协议升级为 `niuone-strict-forward-v39`，管理员回测仍为 `niuone-backtest-v37`，默认新队列日期为 `2026-08-24`；部署前归档 v38 锁和报告，修复前后的决策证据不得混算。
+
+v40 将牛牛试仓绝对上限提高到 10%，轮动试仓单笔权益风险与单主题风险同步提高到 1%，避免单主题旧上限把实际订单继续裁回 0.60%。满足跨日主升、强势领涨且浮盈处于 2%～12% 的持仓，由本地生命周期规则确定性生成 10%/20% 分级加仓，不再依赖模型主动返回 ADD；模型明确 SELL 时退出优先，执行层继续复核单票、主题、组合、总仓、现金与 T+1 边界。严格前向/管理员回测协议升级为 `niuone-strict-forward-v40`/`niuone-backtest-v38`，默认队列日期保持 `2026-08-24`；部署前归档 v39 锁、报告及旧回测结果。
+
+v41 增加默认关闭的持仓快周期。开启后仅把当前持仓作为增量评分范围，复用完整周期的当前策略评分器、统一盘面总结、模型决策、SELL 优先及同一成交风控；快周期 BUY 只允许对执行时仍存在的仓位加仓，不能发现、首次买入或卖后回补新仓。运行来源以 `holding_fast` 耐久归因，开关和 60～900 秒间隔进入协议指纹。严格前向协议升级为 `niuone-strict-forward-v41`，管理员日线回测仍为 `niuone-backtest-v38`，因为它不模拟分钟触发时点；默认新队列从 `2026-08-27` 开始，部署前须归档 v40 锁和报告。
+
+v42 将牛牛持仓只数上限统一到设置中的 `DASHBOARD_MAX_OPEN_POSITIONS`。Practice 的模型提示、剩余槽位、满仓优先级换仓和成交复核均使用同一启动配置；管理员回测在任务提交时冻结该值，严格前向协议也记录该数值并由运行配置指纹保护。`DASHBOARD_MORNING_MAX_OPEN_POSITIONS` 和盘面评价的动态数量仍只约束非牛牛策略；其他风险、敞口、现金和 T+1 规则不变。严格前向/管理员回测升级为 `niuone-strict-forward-v42`/`niuone-backtest-v39`，默认队列仍从 `2026-08-27` 开始；部署前归档 v41 锁、报告和旧回测结果。
+
+v43 把非结构性卖出统一成“先减 50%、跨交易日确认再清余仓”的软退出状态机，4～5 分评分首日否决；结构止损、主线失活和市场硬停止不延迟。满仓换仓要求至少 3 分优先级优势。盘后快照从本地日 K 更新 SQLite 的 1/3/5/10 日卖后观察与换仓相对收益，缺少卖出日基准 K 线时保留可诊断的待补状态；5 日软退出影子观察只允许完整扫描在价格、量能和原题材逻辑全部恢复后重开。严格前向/管理员回测升级为 `niuone-strict-forward-v43`/`niuone-backtest-v40`，新队列从 `2026-08-28` 开始；部署前归档 v42 锁、报告和旧回测结果。
+
+v44 把 5 日复盘接入默认关闭的受约束自动调参。配置的样本数和月份门满足后，每批新增样本最多调整一个预声明档位；仅软退出、换仓优势和卖后再入确认可变，硬止损和全部组合风险冻结。每笔成交绑定版本，SQLite 原子激活参数，版本表现显著恶化时自动回退。严格前向升级为 `niuone-strict-forward-v44`，管理员回测保持固定默认参数的 `niuone-backtest-v40`，新队列从 `2026-08-31` 开始。
+v45 将自动反馈升级为 v2。完成复盘不可被短行情窗口或临时失败降级；卖出收益使用真实成交价，换仓只评估实际 BUY，再入放行与拦截直接形成 5 日影子样本。调参只使用最近 120 个有效样本，同股同日成交按簇去重、按成交资金加权，并要求 90% 置信区间越过最小经济效果；hold 只推进评估冷却检查点，不创建参数版本。加载账户时以 SQLite 活动版本对账，指纹同时覆盖算法、配置、前版与提案。结构止损、T+1、仓位及全部组合风险继续冻结；严格前向升级为 `niuone-strict-forward-v45`，队列仍从 `2026-08-31` 开始。
+v46 将受约束的 5 日卖后自动调参改为默认开启；没有显式配置的新部署会在下一轮盘后复盘进入学习或评估，已有部署仍可设置 `DASHBOARD_EXIT_FEEDBACK_AUTO_TUNE_ENABLED=0` 关闭。样本门槛、有界网格、自动回滚以及全部冻结风控保持不变；严格前向升级为 `niuone-strict-forward-v46`，队列仍从 `2026-08-31` 开始。
+v47 修复首次盘后复盘前 Dashboard 隐藏反馈状态的问题。模拟交易页现在始终显示“卖后 5 日复盘”；默认开启但尚未生成检查点时显示“样本积累中/等待首次盘后复盘”，显式关闭时显示“未启用”。旧账户快照不能覆盖当前运行配置，严格前向升级为 `niuone-strict-forward-v47`。
+v48 修复持仓快周期把压缩主线缓存当作完整评分上下文的问题。快周期合并最新分钟题材/市场状态和同日完整扫描个股画像；跨日、缺画像或评分异常继续失败关闭，异常仅保存类型计数。加仓与全部风控门槛不变，严格前向升级为 `niuone-strict-forward-v48`，新队列从 `2026-09-03` 开始。
+
+v49 为牛牛试仓首次或清仓后重新开仓增加成交涨幅门：相对有效前收盘价必须严格小于 3%，报价无效同样等待；不接受扫描价格或涨幅替代，后续回落可重新评估。已有持仓加仓、其他入口和退出风控保持原规则。生产成交与默认管理员回测共用纯函数，日线回测用信号日收盘价和含滑点的次日执行价；显式研究跳空参数仍单独标识其研究口径。严格前向/管理员回测升级为 `niuone-strict-forward-v49`/`niuone-backtest-v41`，新队列从 `2026-09-08` 开始。部署前归档旧锁、报告和回测结果；保留真实持仓与成交，带仓基线不能用于新版本账户收益归因。该门针对近期亏损分组提出，仍需后续样本验证，不能把同样本筛选视为胜率提升证明。
+
+v50 统一牛牛试仓、启动、领涨、转强及所有加仓的个股活跃度资格：当日实际累计换手率至少 3%、全市场成交额分位至少 60、动作所选题材内成交额分位至少 50，必需数据无效即暂停买入；取消试仓豁免和旧候选的可选绕过。成交前重新读取报价复核换手率，持仓快周期使用最新换手率与最近完整扫描的成交额排名。早盘未达 3% 时继续等待，不以预计全天换手替代，也不把高换手直接视作买点。首次建仓耐久证据新增 `entry_turnover_pct`；保留 v49 的试仓首次建仓涨幅小于 3% 规则，这两个百分比含义不同。日线回测按信号日已发生的换手率筛选，绝不读取次日全天换手率；次日开盘成交因此只是盘中规则的近似，历史换手缺失会拒绝入选。严格前向/管理员回测升级为 `niuone-strict-forward-v50`/`niuone-backtest-v42`；尚未开始的队列仍从 `2026-09-08` 起算。部署前归档旧协议锁、报告与回测结果，保留账户、持仓和成交历史。3% 是本次采用的活跃度偏好门槛，需通过新队列验证收益、回撤和机会数量，不能据此承诺胜率提升。
+
+v51 统一 Dashboard 策略表现与严格前向评估的完整交易计算：由 `trading/lifecycles.py` 按可核验的零仓到零仓合并加仓和分批卖出，按首次入口归因，扣除全部买卖费用；未清仓、孤立卖出或数量链不完整的生命周期不计入分母，盈亏平衡计入分母但不计获胜。Dashboard 优先读取 SQLite 完整耐久账本并合并近期状态，数据库不可读时将胜率标为不可用；单次卖出另称“盈利卖出占比”。决策槽统计只覆盖当前队列日期，缺失槽按模型失败、payload 缺失、候选证据无效或无耐久记录分类，不把失败/中间退出记录补成成功决策。严格前向升级为 `niuone-strict-forward-v51`，管理员回测保持 `niuone-backtest-v42`；未开始的队列仍从 `2026-09-08` 起算，部署前归档 v50 锁与报告，保留账户历史。试仓价格门的预先固定影子对照规则见 [试仓追涨前向对照](strategies/PROBE_CHASE_FORWARD.md)。
+
+牛牛持仓达到该上限后，每轮筛选出的可买入新候选都会写入 Practice 操作日志，并明确标记为仅记录候选、未买入或计划换仓。该记录属于决策审计证据，不计作成交或下单失败；实际换仓仍必须通过优先级、T+1 与完整成交预检。
 
 排查“策略没有触发”时依次检查：
 
@@ -267,7 +374,42 @@ curl -s -o /dev/null -w 'HTTP:%{http_code} TOTAL:%{time_total}\n' 'http://127.0.
 
 预期均返回 `HTTP:200`。
 
-## 5. 本机长期运行
+## 5. 长期运行
+
+### 5.1 Docker 部署
+
+以下命令应从首次部署所用的工程目录执行。如果正式数据保存在 `niuone-data`，后续启动、重启和升级必须继续使用同一个 Compose 项目。不要用 `./run.sh` 或 `run.bat` 启动同端口原生实例；原生 `.local-data/` 与 Docker volume 不会自动同步。
+
+```bash
+# 电脑或容器引擎重启后；也用于应用 Compose、环境变量或端口变更
+docker compose up -d
+
+# 仅重启当前容器，不应用配置或镜像变更
+docker compose restart
+
+# 源码更新后
+./scripts/docker-build.sh
+docker compose up -d --no-build
+
+# Docker Hub 镜像更新后
+docker compose pull
+docker compose up -d --no-build
+
+# 状态与健康检查
+docker compose ls
+docker compose ps
+docker compose port dashboard 8787
+curl -s -o /dev/null -w 'healthz=%{http_code}\n' http://127.0.0.1:8787/healthz
+curl -s -o /dev/null -w 'readyz=%{http_code}\n' http://127.0.0.1:8787/readyz
+```
+
+`dashboard` 应为 `healthy`，`healthz` 应返回 `200`；首次初始化期间 `readyz` 可暂时返回 `503`，数据就绪后应变为 `200`。
+
+Compose 项目名可能来自当前目录名、`-p` 或 `COMPOSE_PROJECT_NAME`，并会参与物理卷名的生成。部署后必须保持项目名稳定；改变项目名或改从另一份工程目录启动，可能创建新的空卷。开发和冒烟测试应使用独立项目名、端口和数据卷，不要复用正式 Compose 项目。
+
+`docker compose down` 会保留命名卷；`docker compose down -v` 和 `docker volume rm` 会删除真实运行数据，禁止用于普通重启、升级或排障。完整生命周期、跨平台端口检查和卷诊断见[独立运行说明](STANDALONE.md#docker-服务启动重启与数据卷)。
+
+### 5.2 原生部署
 
 通过一键启动入口注册并启动当前平台的长期运行服务：
 
@@ -346,11 +488,7 @@ curl -s "http://127.0.0.1:8787/api/messages?limit=1" | python3 -m json.tool | he
 
 ```bash
 ./run-niuone-cron-scheduler.sh
-./run-x-watchlist-daemon.sh
-./scripts/run_us_rating_report.sh
 ```
-
-X 关注列表作者通过设置页里的“推文监控作者”维护，填写 handle 时不需要 `@`。
 
 ## 8. 回滚
 
@@ -405,7 +543,37 @@ curl -s "http://127.0.0.1:8787/api/messages?limit=5" | python3 -m json.tool | he
 
 当前消息流以 `push_history.db` 为主要来源。任务脚本需要正常写入该数据库后，页面才会出现对应消息。
 
-盘面监控、X 监控和美股机构评级的新记录只写入该数据库，不再生成 Markdown 文件。升级前已有的 `.md` 历史文件会原样保留，但页面不会读取它们，也不会自动删除。
+盘面监控的新记录只写入该数据库，不再生成 Markdown 文件。升级前已有的 `.md` 历史文件会原样保留，但页面不会读取它们，也不会自动删除。
+
+### 页面显示较旧的模拟账户或交易日历
+
+先确认浏览器连接的端口、Compose 项目和数据源。Docker 使用逻辑卷 `niuone-data`，原生入口使用工程目录中的 `.local-data/`，两者不会自动同步。
+
+所有平台先运行：
+
+```bash
+docker compose ls
+docker compose ps
+docker compose port dashboard 8787
+docker volume ls --filter label=com.docker.compose.volume=niuone-data
+```
+
+macOS / Linux 检查端口占用：
+
+```bash
+lsof -nP -iTCP:8787 -sTCP:LISTEN
+```
+
+Windows PowerShell 检查端口占用：
+
+```powershell
+Get-NetTCPConnection -LocalPort 8787 -State Listen |
+    Select-Object LocalAddress, LocalPort, OwningProcess
+Get-Process -Id (Get-NetTCPConnection -LocalPort 8787 -State Listen |
+    Select-Object -First 1 -ExpandProperty OwningProcess)
+```
+
+Docker 部署的 `dashboard` 应为 `healthy`，并由 Docker 发布目标端口。若端口由工程目录中的 Python 进程监听，停止该原生实例后，从原部署目录、使用原 Compose 项目名执行 `docker compose up -d`。如果 `docker compose ls` 或卷列表中出现多个相似项目，先确认哪一套包含权威历史；不要用不完整副本覆盖 volume，也不要为了排障执行 `docker compose down -v`。
 
 ### 任务没有自动更新
 
@@ -413,11 +581,10 @@ curl -s "http://127.0.0.1:8787/api/messages?limit=5" | python3 -m json.tool | he
 
 ```bash
 launchctl print gui/$(id -u)/ai.niuone.cron-scheduler | sed -n '1,100p'
-launchctl print gui/$(id -u)/ai.niuone.x-watchlist | sed -n '1,100p'
 tail -n 200 .local-data/runtime/logs/*.log
 ```
 
-同时确认模型密钥、任务时间和推文监控作者已经配置。
+同时确认模型密钥和任务时间已经配置。
 
 ### 修改前端后页面空白
 
@@ -446,3 +613,10 @@ git status --ignored --short
 3. 看板保持公开访问，设置页与管理 API 必须始终通过管理员认证。
 4. 真实数据库、本地凭据、日志、模型配置只留在 `.local-data/`。
 5. 消息类新任务应直接写入 `push_history.db`，不要生成独立 Markdown 历史文件。
+
+
+v52 部署：验证通过后升级至 `niuone-strict-forward-v52`。在 2026-09-08 队列首次采样前，将 v51 协议锁与报告归档到私有备份目录，再冻结 v52；不清空账户、成交账本或试仓对照结果。若队列已开始，不得复用开始日期覆盖原锁，须另开队列。保存并比对现金、持仓数量和成交尾部指纹，重建 dashboard/scheduler 后检查 healthz、readyz 和协议完整性。管理员日线回测保持 v42。规则见 [模型卖出证据](strategies/README.md#v52模型卖出须有硬退出证据)。
+
+v53 部署：通过验证后，私有归档旧协议锁、报告及牛牛回测结果，把新队列起始日设为 2026-09-09，再重建 dashboard/scheduler，核对 healthz、readyz 与新协议锁。旧队列已采样，不得沿用其日期覆盖锁。归档、配置调整和重启期间保留账户、耐久成交和追涨影子结果；带仓基线继续阻断新版本组合归因。回测客户端与服务端同步为 v43，严格前向为 v53。见 [试仓题材归因](strategies/README.md#v53试仓必须具备有效题材归因)。
+
+v54 部署：共享模型限流、分钟级 429 退避和 180 秒决策有效期纳入协议指纹；硬退出仍独立运行。原始结构线与成本保护线分开保存，成本确认和两组入场变体仅做离线对照。验证通过后私有归档 v53 锁与报告，新队列从 2026-09-10 开始；不重写账户与成交。重建 dashboard/scheduler 并检查 healthz、readyz 和 v54 协议一致性。管理员日线回测维持 v43。行为边界和研究方法见 [模型可靠性与风险对照](strategies/model-reliability-risk-study.md)。

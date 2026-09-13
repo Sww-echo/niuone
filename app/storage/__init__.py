@@ -2,11 +2,13 @@
 
 from .history_records import content_hash, message_dedupe_key, stable_id, x_row_is_better
 from .market_reports import extract_decision_guidance, store_market_report
+from .prompt_strategies import PromptStrategyStore
 
 __all__ = [
     "content_hash",
     "extract_decision_guidance",
     "message_dedupe_key",
+    "PromptStrategyStore",
     "stable_id",
     "store_market_report",
     "x_row_is_better",

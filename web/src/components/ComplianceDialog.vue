@@ -1,10 +1,33 @@
 <script setup>
 import { onBeforeMount, onBeforeUnmount, ref } from 'vue'
 
-const visible = ref(true)
+const COMPLIANCE_ACKNOWLEDGED_KEY = 'niuone:compliance-acknowledged-v1'
+let acknowledgedInCurrentApp = false
+
+function wasAcknowledged() {
+  if (acknowledgedInCurrentApp) return true
+  try {
+    acknowledgedInCurrentApp = window.sessionStorage.getItem(COMPLIANCE_ACKNOWLEDGED_KEY) === '1'
+  } catch (error) {
+    console.warn('Compliance acknowledgement is unavailable', error)
+  }
+  return acknowledgedInCurrentApp
+}
+
+function rememberAcknowledgement() {
+  acknowledgedInCurrentApp = true
+  try {
+    window.sessionStorage.setItem(COMPLIANCE_ACKNOWLEDGED_KEY, '1')
+  } catch (error) {
+    console.warn('Compliance acknowledgement could not be saved', error)
+  }
+}
+
+const visible = ref(!wasAcknowledged())
 
 function closeDialog() {
   if (!visible.value) return
+  rememberAcknowledgement()
   visible.value = false
   document.body.classList.remove('compliance-dialog-open')
   window.dispatchEvent(new CustomEvent('niuone:compliance-closed'))
@@ -15,6 +38,7 @@ function handleKeydown(event) {
 }
 
 onBeforeMount(() => {
+  if (!visible.value) return
   document.body.classList.add('compliance-dialog-open')
   document.addEventListener('keydown', handleKeydown)
 })

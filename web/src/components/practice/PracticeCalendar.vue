@@ -6,6 +6,7 @@ import {
   compactPracticeDailyPoints,
   currentChinaDateKey,
   normalizePracticeEquityPoints,
+  practiceCalendarDateState,
   normalizePracticeTradeMarkers,
   practiceCalendarHistoryCoversDate,
   practiceCalendarHistoryPoints,
@@ -31,7 +32,11 @@ const initialCash = computed(() => Number(props.practice.initial_cash || 1_000_0
 const history = computed(() => practiceCalendarHistoryPoints(props.practice))
 const dailyHistory = computed(() => normalizePracticeEquityPoints(props.practice.daily_equity_history || []))
 const rows = computed(() => buildPracticeCalendarRows(history.value, dailyHistory.value, initialCash.value))
-const latestMonth = computed(() => rows.value.at(-1)?.date.slice(0, 7) || currentChinaDateKey().slice(0, 7))
+const currentDate = computed(() => String(
+  props.practice.current_date || props.practice.trading_calendar?.date || currentChinaDateKey(),
+).slice(0, 10))
+const currentMonth = computed(() => currentDate.value.slice(0, 7))
+const latestMonth = computed(() => currentMonth.value || rows.value.at(-1)?.date.slice(0, 7) || currentChinaDateKey().slice(0, 7))
 const monthParts = computed(() => {
   const match = String(month.value || latestMonth.value).match(/^(\d{4})-(\d{2})$/)
   return match
@@ -48,6 +53,7 @@ const monthPct = computed(() => monthBase.value ? monthPnl.value / monthBase.val
 const winDays = computed(() => monthRows.value.filter(row => Number(row.pnl) > 0).length)
 const lossDays = computed(() => monthRows.value.filter(row => Number(row.pnl) < 0).length)
 const flatDays = computed(() => Math.max(0, monthRows.value.length - winDays.value - lossDays.value))
+const canNextMonth = computed(() => String(month.value || latestMonth.value) < currentMonth.value)
 const cells = computed(() => {
   const { year, month: monthNumber } = monthParts.value
   const firstWeekday = (new Date(year, monthNumber - 1, 1).getDay() + 6) % 7
@@ -57,13 +63,14 @@ const cells = computed(() => {
     const date = `${month.value}-${String(day).padStart(2, '0')}`
     const row = rowByDate.value.get(date) || null
     const dayOfWeek = new Date(year, monthNumber - 1, day).getDay()
+    const dateState = practiceCalendarDateState(date, currentDate.value)
     result.push({
       key: date,
       date,
       day,
       row,
       weekend: dayOfWeek === 0 || dayOfWeek === 6,
-      today: date === currentChinaDateKey(),
+      ...dateState,
     })
   }
   return result
@@ -136,7 +143,9 @@ function valueClass(value) {
 function shiftMonth(delta) {
   const { year, month: monthNumber } = monthParts.value
   const next = new Date(year, monthNumber - 1 + delta, 1)
-  month.value = `${next.getFullYear()}-${String(next.getMonth() + 1).padStart(2, '0')}`
+  const nextMonth = `${next.getFullYear()}-${String(next.getMonth() + 1).padStart(2, '0')}`
+  if (nextMonth > currentMonth.value) return
+  month.value = nextMonth
   selectedDate.value = ''
 }
 
@@ -191,7 +200,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', handleKeydown))
       <div class="practice-calendar-card" role="dialog" aria-label="交易日历">
         <div class="practice-calendar-head">
           <div><div class="practice-calendar-title">交易日历 · {{ monthParts.year }}年{{ String(monthParts.month).padStart(2, '0') }}月</div><div class="practice-calendar-sub">{{ monthRows.length ? `有记录 ${monthRows.length} 天 · 最近 ${monthRows.at(-1).date}` : '本月暂无收益记录' }}</div></div>
-          <div class="practice-calendar-actions"><button type="button" class="practice-calendar-icon-btn" title="上个月" aria-label="上个月" @click="shiftMonth(-1)">‹</button><button type="button" class="practice-calendar-icon-btn" title="下个月" aria-label="下个月" @click="shiftMonth(1)">›</button><button type="button" class="practice-calendar-icon-btn" title="关闭" aria-label="关闭" @click="close">x</button></div>
+          <div class="practice-calendar-actions"><button type="button" class="practice-calendar-icon-btn" title="上个月" aria-label="上个月" @click="shiftMonth(-1)">‹</button><button type="button" class="practice-calendar-icon-btn" title="下个月" aria-label="下个月" :disabled="!canNextMonth" @click="shiftMonth(1)">›</button><button type="button" class="practice-calendar-icon-btn" title="关闭" aria-label="关闭" @click="close">x</button></div>
         </div>
         <div class="practice-calendar-summary">
           <div class="practice-calendar-stat"><div class="practice-calendar-stat-label">本月收益</div><div class="practice-calendar-stat-value" :class="valueClass(monthPnl)">{{ signedPracticeAmount(monthPnl) }} / {{ signedPracticeNumber(monthPct) }}</div></div>
@@ -201,8 +210,8 @@ onBeforeUnmount(() => window.removeEventListener('keydown', handleKeydown))
         <div class="practice-calendar-grid-wrap">
           <div class="practice-calendar-weekdays"><div v-for="(day, index) in ['一','二','三','四','五','六','日']" :key="day" class="practice-calendar-weekday" :class="{ weekend: index >= 5 }">{{ day }}</div></div>
           <div class="practice-calendar-grid">
-            <div v-for="cell in cells" :key="cell.key" class="practice-calendar-day" :class="cell.blank ? 'blank' : [{ weekend: cell.weekend && !cell.row, selected: cell.date === selectedDate, 'has-result': cell.row }, cell.row ? valueClass(cell.row.pnl) : '']" :aria-hidden="cell.blank ? 'true' : undefined" :aria-label="cell.row ? `${cell.date} ${signedPracticeNumber(cell.row.pnlPct)} / ${signedPracticeAmount(cell.row.pnl)}` : cell.date" @click="cell.row && selectDate(cell.date)">
-              <template v-if="!cell.blank"><div class="practice-calendar-date"><span>{{ cell.day }}</span><span v-if="cell.today && (!cell.weekend || cell.row)" class="practice-calendar-today">今</span></div><div v-if="cell.row" class="practice-calendar-values"><div class="practice-calendar-rate" :class="valueClass(cell.row.pnl)">{{ signedPracticeNumber(cell.row.pnlPct) }}</div><div class="practice-calendar-amount" :class="valueClass(cell.row.pnl)">{{ signedPracticeAmount(cell.row.pnl) }}</div></div><div v-else class="practice-calendar-no-data">--</div><span v-if="cell.today && cell.weekend && !cell.row" class="practice-calendar-today weekend-today">今</span></template>
+            <div v-for="cell in cells" :key="cell.key" class="practice-calendar-day" :class="cell.blank ? 'blank' : [{ weekend: cell.weekend && !cell.row, future: cell.future, selected: cell.date === selectedDate, 'has-result': cell.row }, cell.row ? valueClass(cell.row.pnl) : '']" :aria-hidden="cell.blank ? 'true' : undefined" :aria-label="cell.row ? `${cell.date} ${signedPracticeNumber(cell.row.pnlPct)} / ${signedPracticeAmount(cell.row.pnl)}` : cell.date" @click="cell.row && selectDate(cell.date)">
+              <template v-if="!cell.blank"><div class="practice-calendar-date"><span>{{ cell.day }}</span><span v-if="cell.today && (!cell.weekend || cell.row)" class="practice-calendar-today">今</span></div><div v-if="cell.row" class="practice-calendar-values"><div class="practice-calendar-rate" :class="valueClass(cell.row.pnl)">{{ signedPracticeNumber(cell.row.pnlPct) }}</div><div class="practice-calendar-amount" :class="valueClass(cell.row.pnl)">{{ signedPracticeAmount(cell.row.pnl) }}</div></div><div v-else-if="!cell.future" class="practice-calendar-no-data">--</div><span v-if="cell.today && cell.weekend && !cell.row" class="practice-calendar-today weekend-today">今</span></template>
             </div>
           </div>
         </div>

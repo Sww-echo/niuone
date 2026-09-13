@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("dashboard", "cron-scheduler", "x-watchlist")]
+    [ValidateSet("dashboard", "cron-scheduler")]
     [string]$Name,
     [Parameter(Mandatory = $true)][string]$Root,
     [Parameter(Mandatory = $true)][string]$Python,
@@ -32,10 +32,6 @@ try {
         }
         "cron-scheduler" {
             $Script = Join-Path $Root "app\entrypoints\niuone_cron_scheduler.py"
-            & $Python $Script *>> $LogPath
-        }
-        "x-watchlist" {
-            $Script = Join-Path $Root "app\entrypoints\x_watchlist_daemon.py"
             & $Python $Script *>> $LogPath
         }
     }

@@ -73,6 +73,69 @@ class IwencaiClientTests(unittest.TestCase):
         self.assertEqual(payload["limit"], "20")
         self.assertEqual(payload["is_cache"], "1")
 
+    def test_event_query_uses_event_skill_identity(self):
+        calls = []
+
+        def opener(request, timeout):
+            calls.append((request, timeout))
+            return FakeResponse({"datas": [], "code_count": 0})
+
+        IwencaiClient(
+            self.config(max_retries=0),
+            opener=opener,
+            semaphore=threading.BoundedSemaphore(1),
+        ).query("平安银行最近3日监管函", skill_id="hithink-event-query")
+
+        headers = {name.lower(): value for name, value in calls[0][0].header_items()}
+        self.assertEqual(headers["x-claw-skill-id"], "hithink-event-query")
+
+    def test_comprehensive_search_uses_official_channel_contract(self):
+        calls = []
+
+        def opener(request, timeout):
+            calls.append((request, timeout))
+            return FakeResponse({
+                "status_code": 0,
+                "data": [{"title": "平安银行公告"}],
+            })
+
+        result = IwencaiClient(
+            self.config(max_retries=0),
+            opener=opener,
+            semaphore=threading.BoundedSemaphore(1),
+        ).comprehensive_search(
+            "平安银行最近3日公司公告",
+            channel="announcement",
+            size=12,
+        )
+
+        self.assertEqual(result["data"][0]["title"], "平安银行公告")
+        request, timeout = calls[0]
+        headers = {name.lower(): value for name, value in request.header_items()}
+        payload = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(
+            request.full_url,
+            "https://openapi.iwencai.com/v1/comprehensive/search",
+        )
+        self.assertEqual(timeout, 8)
+        self.assertEqual(headers["x-claw-skill-id"], "announcement-search")
+        self.assertEqual(payload["channels"], ["announcement"])
+        self.assertEqual(payload["app_id"], "AIME_SKILL")
+        self.assertEqual(payload["size"], 12)
+
+    def test_comprehensive_search_rejects_failed_gateway_status(self):
+        def opener(_request, timeout):
+            del timeout
+            return FakeResponse({"status_code": 1001, "data": []})
+
+        with self.assertRaises(IwencaiResponseError) as caught:
+            IwencaiClient(
+                self.config(max_retries=0),
+                opener=opener,
+                semaphore=threading.BoundedSemaphore(1),
+            ).comprehensive_search("平安银行新闻", channel="news")
+        self.assertEqual(caught.exception.code, "upstream_error")
+
     def test_retry_uses_retry_call_type_and_new_trace_id(self):
         headers = []
         sleeps = []

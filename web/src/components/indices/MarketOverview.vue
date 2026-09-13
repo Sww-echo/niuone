@@ -24,7 +24,18 @@ const hasHotRankings = computed(() => (
 const hotSearchRows = computed(() => (props.hotStocks.items || []).slice(0, 12))
 const hasHotStocks = computed(() => hasHotRankings.value || hotSearchRows.value.length)
 const hasMoneyFlow = computed(() => props.moneyFlow.inflow?.length && props.moneyFlow.outflow?.length)
-const moneyFlowPreviousDayLabel = computed(() => previousDayMarketLabel(props.moneyFlow.generated_at))
+const moneyFlowPreviousDayLabel = computed(() => {
+  const date = String(
+    props.moneyFlow.display_date || props.moneyFlow.generated_at || '',
+  ).slice(5, 10)
+  if (props.moneyFlow.displaying_previous_trading_day) {
+    return date ? `上一交易日资金（${date}）` : '上一交易日资金'
+  }
+  if (props.moneyFlow.displaying_historical_data) {
+    return date ? `历史资金（${date}）` : '历史资金'
+  }
+  return previousDayMarketLabel(props.moneyFlow.generated_at)
+})
 const hasMarketFlow = computed(() => {
   if (props.marketFlow.total_inflow_yi == null) return false
   return Boolean(

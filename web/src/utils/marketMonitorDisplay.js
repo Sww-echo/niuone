@@ -1,3 +1,13 @@
+const MARKET_EMOJI_PATTERN = /(?:\p{Extended_Pictographic}|\p{Regional_Indicator}|\uFE0F|\u200D|\u20E3)/gu
+
+function normalizeMarketLine(line) {
+  return String(line || '')
+    .replace(/\*\*/g, '')
+    .replace(/`/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
 function truncateText(text, maxLength = 180) {
   const normalized = String(text || '').replace(/\s+/g, ' ').trim()
   return normalized.length > maxLength
@@ -6,9 +16,11 @@ function truncateText(text, maxLength = 180) {
 }
 
 export function cleanMarketLine(line) {
-  return String(line || '')
-    .replace(/\*\*/g, '')
-    .replace(/`/g, '')
+  return normalizeMarketLine(line)
+    .replace(MARKET_EMOJI_PATTERN, '')
+    .replace(/\s+([，。；：！？、])/g, '$1')
+    .replace(/([（【])\s+/g, '$1')
+    .replace(/\s+([）】])/g, '$1')
     .replace(/\s+/g, ' ')
     .trim()
 }
@@ -61,9 +73,10 @@ function marketSectionLines(lines, headingText, limit = 3) {
   if (start < 0) return []
   const result = []
   for (const raw of lines.slice(start + 1)) {
+    const normalized = normalizeMarketLine(raw)
+    if (/\*\*.+\*\*/.test(raw) || /^[📊🔥💰⚡📈💡⚠️🌡️📌👀ℹ️]/u.test(normalized)) break
     const line = cleanMarketLine(raw)
     if (!line) continue
-    if (/\*\*.+\*\*/.test(raw) || /^[📊🔥💰⚡📈💡⚠️🌡️📌👀ℹ️]/u.test(line)) break
     result.push(line)
     if (result.length >= limit) break
   }
@@ -73,6 +86,7 @@ function marketSectionLines(lines, headingText, limit = 3) {
 export function summarizeMarketRecord(record) {
   const raw = String(record?.content || '')
   const lines = raw.split('\n').map(line => line.trim()).filter(Boolean)
+  const normalizedLines = lines.map(normalizeMarketLine).filter(Boolean)
   const cleanLines = lines.map(cleanMarketLine).filter(Boolean)
   const titleLine = cleanLines[0] || '盘面监控'
   const title = titleLine
@@ -81,19 +95,20 @@ export function summarizeMarketRecord(record) {
     .trim() || '盘面监控'
   const timeLine = cleanLines.find(line => /\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}/.test(line)) || ''
   const timeMatch = timeLine.match(/\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}/)
-  const mood = cleanLines.find(line => line.startsWith('💬')) || ''
+  const moodIndex = normalizedLines.findIndex(line => line.startsWith('💬'))
+  const mood = moodIndex >= 0 ? cleanMarketLine(normalizedLines[moodIndex]) : ''
   const overview = cleanLines.find(line => /^样本\s/.test(line) || /^涨停池\s/.test(line)) || ''
   const volume = cleanLines.find(line => /成交额\s/.test(line)) || ''
   const chips = []
   for (const line of [overview, volume, ...marketSectionLines(lines, '热门板块', 3)]) {
-    const text = truncateText(line.replace(/^💬\s*/, ''), 34)
+    const text = truncateText(line, 34)
     if (text) chips.push(text)
   }
   return {
     title,
     type: marketReportType(record, raw),
     time: timeMatch ? timeMatch[0] : (record?.time || ''),
-    preview: truncateText((mood || overview || titleLine).replace(/^💬\s*/, ''), 150),
+    preview: truncateText(mood || overview || titleLine, 150),
     chips: chips.slice(0, 5),
   }
 }
@@ -116,10 +131,10 @@ function marketSectionTone(title, icon) {
 }
 
 function marketHeadingInfo(raw) {
-  const clean = cleanMarketLine(raw)
-  if (!clean) return null
-  const leading = marketLeadingIcon(clean)
-  const titleSource = leading.rest || clean
+  const normalized = normalizeMarketLine(raw)
+  if (!normalized) return null
+  const leading = marketLeadingIcon(normalized)
+  const titleSource = cleanMarketLine(leading.rest || normalized)
   const titleParts = titleSource.split(/[·|]/).map(value => value.trim()).filter(Boolean)
   const title = (titleParts[0] || titleSource).replace(/[:：]$/, '').trim()
   const markdownHeading = /\*\*.+\*\*/.test(String(raw || ''))
@@ -128,7 +143,6 @@ function marketHeadingInfo(raw) {
   return {
     title: title || '盘面小节',
     meta: titleParts.slice(1).join(' · '),
-    icon: leading.icon || '•',
     tone: marketSectionTone(title, leading.icon),
   }
 }
@@ -149,10 +163,10 @@ export function parseMarketDetail(content) {
       current = { ...heading, items: [] }
       continue
     }
-    const clean = cleanMarketLine(raw)
-    if (!clean) continue
-    if (current) current.items.push(clean)
-    else intro.push(clean)
+    const normalized = normalizeMarketLine(raw)
+    if (!normalized) continue
+    if (current) current.items.push(normalized)
+    else intro.push(normalized)
   }
   pushCurrent()
   return { intro, sections }
@@ -161,8 +175,8 @@ export function parseMarketDetail(content) {
 export function marketMoodLine(sections) {
   for (const section of sections || []) {
     for (const line of section.items || []) {
-      const clean = cleanMarketLine(line)
-      if (/^💬/.test(clean)) return clean.replace(/^💬\s*/, '').trim()
+      const normalized = normalizeMarketLine(line)
+      if (/^💬/.test(normalized)) return cleanMarketLine(normalized)
     }
   }
   return ''
@@ -206,15 +220,19 @@ function isMarketMetricLine(line) {
 
 export function marketSectionDisplayItems(section) {
   const overview = /市场概况|竞价情绪/.test(section?.title || '')
-  return (section?.items || []).filter(line => {
-    const clean = cleanMarketLine(line)
-    if (/^💬/.test(clean)) return false
-    if (overview && isMarketMetricLine(clean)) return false
-    return true
-  })
+  return (section?.items || [])
+    .filter(line => {
+      const normalized = normalizeMarketLine(line)
+      if (/^💬/.test(normalized)) return false
+      if (overview && isMarketMetricLine(normalized)) return false
+      return true
+    })
+    .map(cleanMarketLine)
+    .filter(Boolean)
 }
 
 export function marketDetailLine(text, sectionTone = '') {
+  const normalized = normalizeMarketLine(text)
   const clean = cleanMarketLine(text).replace(/^·\s*/, '').trim()
   if (!clean) return null
   const flow = clean.match(/^(流入|流出)[:：]\s*(.+)$/)
@@ -227,7 +245,7 @@ export function marketDetailLine(text, sectionTone = '') {
   }
   return {
     kind: 'item',
-    note: /^数据暂不可用|^数据为|^ℹ️|^ℹ/.test(clean),
+    note: /^数据暂不可用|^数据为/.test(clean) || /^ℹ️|^ℹ/.test(normalized),
     risk: sectionTone === 'risk',
     tip: sectionTone === 'tip',
     segments: marketSignedTextSegments(clean, {

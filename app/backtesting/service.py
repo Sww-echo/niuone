@@ -1,6 +1,7 @@
 """Compose historical data clients with selection-signal backtesting."""
 from __future__ import annotations
 
+import os
 import re
 import time
 from collections.abc import Callable, Iterable, Mapping
@@ -13,7 +14,9 @@ from typing import Any
 from .historical_data import (
     HistoricalDataError,
     HistoricalDataResult,
+    HistoricalDataSummary,
     HistoricalFetchConfig,
+    HistoricalSeries,
     SourceFetcher,
     fetch_historical_data,
     normalize_a_share_symbol,
@@ -26,6 +29,7 @@ from .selection import (
     SelectionBacktestResult,
     SelectionFunction,
     SelectionStrategy,
+    _OwnedImmutableMapping,
     build_selection_replay_tape,
     run_selection_backtest,
 )
@@ -34,6 +38,7 @@ from .replay_cache import ReplayTapeCache, build_replay_cache_key
 
 IndustryMapLoader = Callable[[set[str]], Mapping[str, str]]
 ThemeMapLoader = Callable[[set[str]], Mapping[str, Iterable[str]]]
+ClassificationSnapshotLoader = Callable[[set[str]], Any]
 BacktestProgress = Callable[[int, str, str], None]
 AnnotationProgress = Callable[[int, int, str], None]
 
@@ -41,6 +46,8 @@ AnnotationProgress = Callable[[int, int, str], None]
 NIUONE_REPLAY_SCORED_FIELDS = (
     "atr",
     "atr20",
+    "best_decision_score",
+    "decision_score",
     "execution_buffer_pct",
     "gap_buffer_pct",
     "industry",
@@ -138,32 +145,99 @@ class _ClassificationMap(dict):
         self.stale = stale
 
 
-def _current_eastmoney_snapshot(symbols: Iterable[str]):
+class CurrentClassificationError(RuntimeError):
+    """Raised when no complete current classification snapshot is available."""
+
+
+def load_current_classification_snapshot(
+    symbols: Iterable[str],
+    *,
+    env: Mapping[str, str] | None = None,
+    eastmoney_loader: Callable[..., Any] | None = None,
+    iwencai_loader: Callable[..., Any] | None = None,
+):
+    """Prefer Eastmoney, then use configured iWencai only when no snapshot exists."""
+
     codes = {_code(symbol) for symbol in symbols}
     codes.discard("")
     if not codes:
         return None
     try:
         from app.core.paths import get_dashboard_home
-        from app.market_data.eastmoney_boards import load_eastmoney_board_snapshot
+        from app.market_data.eastmoney_boards import (
+            EastmoneyBoardError,
+            load_eastmoney_board_snapshot,
+        )
+        from app.market_data.iwencai_boards import (
+            IwencaiBoardError,
+            fetch_iwencai_board_snapshot,
+            load_iwencai_board_snapshot,
+        )
+        from app.market_data.iwencai_client import (
+            IwencaiConfig,
+            IwencaiConfigurationError,
+            IwencaiError,
+        )
     except ImportError:  # pragma: no cover - legacy top-level import path
         from core.paths import get_dashboard_home
-        from market_data.eastmoney_boards import load_eastmoney_board_snapshot
+        from market_data.eastmoney_boards import (
+            EastmoneyBoardError,
+            load_eastmoney_board_snapshot,
+        )
+        from market_data.iwencai_boards import (
+            IwencaiBoardError,
+            fetch_iwencai_board_snapshot,
+            load_iwencai_board_snapshot,
+        )
+        from market_data.iwencai_client import (
+            IwencaiConfig,
+            IwencaiConfigurationError,
+            IwencaiError,
+        )
     project_root = Path(__file__).resolve().parents[2]
-    cache_path = (
-        get_dashboard_home(project_root)
-        / "cron" / "output" / "eastmoney_stock_boards.json"
-    )
-    return load_eastmoney_board_snapshot(cache_path=cache_path)
+    output_dir = get_dashboard_home(project_root) / "cron" / "output"
+    active_eastmoney_loader = eastmoney_loader or load_eastmoney_board_snapshot
+    eastmoney_error: Exception | None = None
+    try:
+        return active_eastmoney_loader(
+            cache_path=output_dir / "eastmoney_stock_boards.json"
+        )
+    except (EastmoneyBoardError, OSError) as exc:
+        eastmoney_error = exc
+
+    values = os.environ if env is None else env
+    try:
+        iwencai_config = IwencaiConfig.from_env(values)
+    except IwencaiConfigurationError as exc:
+        raise CurrentClassificationError(
+            "板块分类数据不可用：东方财富获取失败，问财备用源配置无效"
+        ) from exc
+    if not iwencai_config.enabled or not iwencai_config.api_key:
+        raise CurrentClassificationError(
+            "板块分类数据不可用：东方财富获取失败且没有可用旧快照；"
+            "可在设置中启用并配置问财数据源作为首次部署备用源"
+        ) from eastmoney_error
+    try:
+        cache_path = output_dir / "iwencai_stock_boards.json"
+        if iwencai_loader is not None:
+            return iwencai_loader(cache_path=cache_path)
+        return load_iwencai_board_snapshot(
+            cache_path=cache_path,
+            fetcher=lambda: fetch_iwencai_board_snapshot(config=iwencai_config),
+        )
+    except (IwencaiBoardError, IwencaiError, OSError) as exc:
+        raise CurrentClassificationError(
+            "板块分类数据不可用：东方财富和问财备用源均获取失败"
+        ) from exc
 
 
 def load_current_industry_map(symbols: Iterable[str]) -> dict[str, str]:
-    """Return current Eastmoney ``f100`` industries for one bounded universe."""
+    """Return a validated current industry map for one bounded universe."""
     codes = {_code(symbol) for symbol in symbols}
     codes.discard("")
     if not codes:
         return {}
-    snapshot = _current_eastmoney_snapshot(codes)
+    snapshot = load_current_classification_snapshot(codes)
     if snapshot is None:
         return {}
     return _ClassificationMap(
@@ -175,12 +249,12 @@ def load_current_industry_map(symbols: Iterable[str]) -> dict[str, str]:
 
 
 def load_current_theme_map(symbols: Iterable[str]) -> Mapping[str, Iterable[str]]:
-    """Return current Eastmoney concepts, falling back only to Eastmoney industry."""
+    """Return validated current concepts, falling back only to source industry."""
     codes = {_code(symbol) for symbol in symbols}
     codes.discard("")
     if not codes:
         return {}
-    snapshot = _current_eastmoney_snapshot(codes)
+    snapshot = load_current_classification_snapshot(codes)
     if snapshot is None:
         return {}
     return _ClassificationMap(
@@ -223,9 +297,9 @@ class IndustryAnnotationQuality:
         }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class HistoricalSelectionBacktestRun:
-    data: HistoricalDataResult
+    data: HistoricalDataResult | HistoricalDataSummary
     selection: SelectionBacktestResult
     warnings: tuple[str, ...] = ()
     industry_quality: IndustryAnnotationQuality | None = None
@@ -244,7 +318,8 @@ class HistoricalSelectionBacktestRun:
 
 
 def _annotated_bars(
-    data: HistoricalDataResult,
+    series_by_symbol: dict[str, HistoricalSeries],
+    failures: Mapping[str, str],
     symbols: tuple[str, ...],
     *,
     industry_by_symbol: Mapping[str, str] | None,
@@ -252,21 +327,36 @@ def _annotated_bars(
     theme_by_symbol: Mapping[str, Iterable[str]] | None,
     theme_loader: ThemeMapLoader | None,
     name_by_symbol: Mapping[str, str] | None,
+    classification_loader: ClassificationSnapshotLoader | None = None,
     progress_callback: AnnotationProgress | None = None,
 ) -> tuple[
-    Mapping[str, tuple[HistoricalBar, ...]],
+    Mapping[str, Mapping[str, HistoricalBar]],
     list[str],
     IndustryAnnotationQuality,
 ]:
+    """Annotate bars while consuming raw series to cap conversion peak memory."""
+
     warnings: list[str] = []
-    total = len(data.bars_by_symbol)
+    total = len(series_by_symbol)
     if progress_callback is not None:
         progress_callback(0, total, "")
     static_industries = _normalized_metadata_map(industry_by_symbol)
     static_themes = _normalized_theme_map(theme_by_symbol)
     classification_source = ""
     classification_summary: dict[str, Any] = {}
-    if industry_loader is not None:
+    if classification_loader is not None:
+        snapshot = classification_loader({_code(symbol) for symbol in symbols})
+        if snapshot is not None:
+            static_industries.update(
+                _normalized_metadata_map(snapshot.industry_map(symbols))
+            )
+            static_themes.update(_normalized_theme_map(snapshot.theme_map(symbols)))
+            classification_source = str(getattr(snapshot, "source", "") or "")
+            classification_summary.update({
+                "as_of_date": str(getattr(snapshot, "as_of_date", "") or ""),
+                "stale": bool(getattr(snapshot, "stale", False)),
+            })
+    elif industry_loader is not None:
         loaded = industry_loader({_code(symbol) for symbol in symbols})
         static_industries.update(_normalized_metadata_map(loaded))
         classification_source = str(getattr(loaded, "source", "") or "")
@@ -274,7 +364,7 @@ def _annotated_bars(
             "as_of_date": str(getattr(loaded, "as_of_date", "") or ""),
             "stale": bool(getattr(loaded, "stale", False)),
         })
-    if theme_loader is not None:
+    if classification_loader is None and theme_loader is not None:
         loaded_themes = theme_loader({_code(symbol) for symbol in symbols})
         static_themes.update(_normalized_theme_map(loaded_themes))
         classification_source = str(
@@ -292,48 +382,62 @@ def _annotated_bars(
             ),
         })
     names = _normalized_metadata_map(name_by_symbol)
-    bars_by_symbol: dict[str, tuple[HistoricalBar, ...]] = {}
+    bars_by_symbol: dict[str, Mapping[str, HistoricalBar]] = {}
     total_bar_count = 0
     matched_bar_count = 0
     covered_symbols: set[str] = set()
-    for completed, (symbol, rows) in enumerate(data.bars_by_symbol.items(), start=1):
-        annotated: list[HistoricalBar] = []
+    fallback_symbols: list[str] = []
+    for completed, symbol in enumerate(tuple(series_by_symbol), start=1):
+        series = series_by_symbol.pop(symbol)
+        rows = series.bars
+        if series.attempts:
+            fallback_symbols.append(symbol)
+        industry = str(
+            static_industries.get(symbol)
+            or static_industries.get(symbol[-6:])
+            or ""
+        ).strip()
+        themes = tuple(
+            static_themes.get(symbol)
+            or static_themes.get(symbol[-6:])
+            or ()
+        )
+        if not themes and industry:
+            themes = (industry,)
+        if themes or industry:
+            industry = industry or themes[0]
+            matched_bar_count += len(rows)
+            covered_symbols.add(symbol)
+        name = str(names.get(symbol) or names.get(symbol[-6:]) or "")
+        extras: dict[str, Any] = {
+            "data_source": series.source,
+            "adjustment": series.adjustment,
+        }
+        if themes:
+            extras["themes"] = themes
+        shared_extras = _OwnedImmutableMapping(extras)
+        annotated: dict[str, HistoricalBar] = {}
         for raw in rows:
             total_bar_count += 1
-            row = dict(raw)
-            industry = str(
-                static_industries.get(symbol)
-                or static_industries.get(symbol[-6:])
-                or ""
-            ).strip()
-            themes = tuple(
-                static_themes.get(symbol)
-                or static_themes.get(symbol[-6:])
-                or ()
+            bar = HistoricalBar(
+                symbol=symbol,
+                date=str(raw.get("date") or ""),
+                open=raw.get("open"),
+                high=raw.get("high"),
+                low=raw.get("low"),
+                close=raw.get("close"),
+                volume=raw.get("volume") or 0.0,
+                amount=raw.get("amount"),
+                turnover=raw.get("turnover"),
+                previous_close=raw.get("previous_close"),
+                name=name,
+                industry=industry,
+                extras=shared_extras,
             )
-            if not themes and industry:
-                themes = (industry,)
-            if themes or industry:
-                row["themes"] = list(themes)
-                row["industry"] = industry or themes[0]
-                matched_bar_count += 1
-                covered_symbols.add(symbol)
-            else:
-                # Raw rows do not own classification metadata. Missing current
-                # Eastmoney coverage must remain visibly unclassified.
-                row.pop("industry", None)
-                row.pop("sector", None)
-                row.pop("themes", None)
-            name = names.get(symbol) or names.get(symbol[-6:])
-            if name:
-                row["name"] = name
-            annotated.append(HistoricalBar.from_value(symbol, row))
-        bars_by_symbol[symbol] = tuple(annotated)
+            annotated[bar.date] = bar
+        bars_by_symbol[symbol] = _OwnedImmutableMapping(annotated)
         if progress_callback is not None:
             progress_callback(completed, total, symbol)
-    fallback_symbols = [
-        symbol for symbol, series in data.series.items() if series.attempts
-    ]
     if fallback_symbols:
         displayed = ", ".join(fallback_symbols[:10])
         remaining = len(fallback_symbols) - 10
@@ -342,21 +446,37 @@ def _annotated_bars(
             "fallback source used after earlier source failures for "
             f"{len(fallback_symbols)} symbols: {displayed}{suffix}"
         )
-    if data.failures:
+    if failures:
         warnings.append(
             "partial universe fetched because HistoricalFetchConfig.strict=False: "
-            + ", ".join(data.failures)
+            + ", ".join(failures)
         )
     missing_bar_count = max(0, total_bar_count - matched_bar_count)
     snapshot_summary: Mapping[str, Any] | None = classification_summary or None
     source = classification_source
+    if source == "iwencai_current_industry_concept":
+        warnings.append(
+            "current classification fallback used: iwencai_current_industry_concept"
+        )
+    if classification_summary.get("stale"):
+        warnings.append(
+            "stale current classification snapshot used: "
+            f"{classification_summary.get('as_of_date') or 'unknown date'}"
+        )
+    mode = "missing"
+    if static_industries or static_themes:
+        mode = (
+            "iwencai_current"
+            if source == "iwencai_current_industry_concept"
+            else "eastmoney_current"
+        )
     quality = IndustryAnnotationQuality(
-        mode="eastmoney_current" if static_industries or static_themes else "missing",
+        mode=mode,
         total_bar_count=total_bar_count,
         matched_bar_count=matched_bar_count,
         missing_bar_count=missing_bar_count,
         covered_symbol_count=len(covered_symbols),
-        requested_symbol_count=len(data.bars_by_symbol),
+        requested_symbol_count=total,
         source=source,
         snapshot_summary=snapshot_summary,
     )
@@ -377,6 +497,7 @@ def run_historical_selection_backtest(
     minimum_coverage_ratio: float = 0.0,
     source_fetchers: Mapping[str, SourceFetcher] | None = None,
     industry_by_symbol: Mapping[str, str] | None = None,
+    classification_loader: ClassificationSnapshotLoader | None = None,
     industry_loader: IndustryMapLoader | None = None,
     theme_by_symbol: Mapping[str, Iterable[str]] | None = None,
     theme_loader: ThemeMapLoader | None = None,
@@ -384,8 +505,14 @@ def run_historical_selection_backtest(
     progress_callback: BacktestProgress | None = None,
     replay_cache: ReplayTapeCache | None = None,
     replay_cache_identity: Mapping[str, Any] | None = None,
+    retain_historical_data: bool = True,
 ) -> HistoricalSelectionBacktestRun:
-    """Download warmup/forward buffers and evaluate selected stocks."""
+    """Download warmup/forward buffers and evaluate selected stocks.
+
+    Complete historical rows remain available in the returned public result by
+    default. Long-lived worker callers may opt into compact fetch metadata after
+    the rows have entered the replay engine.
+    """
     try:
         start = datetime.strptime(str(signal_start_date)[:10], "%Y-%m-%d").date()
         end = datetime.strptime(str(signal_end_date)[:10], "%Y-%m-%d").date()
@@ -435,6 +562,19 @@ def run_historical_selection_backtest(
             f"{len(data.series)}/{len(normalized_symbols)} "
             f"({coverage_ratio:.1%} < {float(minimum_coverage_ratio):.1%})"
         )
+    data_summary = data.summary()
+    result_data: HistoricalDataResult | HistoricalDataSummary = (
+        data if retain_historical_data else data_summary
+    )
+    raw_series = dict(data.series)
+    data_failures = data.failures
+    fetched_symbols = tuple(raw_series)
+    # The mutable series map is consumed one symbol at a time below. Dropping the
+    # aggregate result first lets each raw row batch become collectible as soon as
+    # its compact HistoricalBar objects have been created.
+    if not retain_historical_data:
+        del data
+
     def annotation_progress(completed: int, total: int, _symbol: str) -> None:
         if progress_callback is None:
             return
@@ -448,19 +588,21 @@ def run_historical_selection_backtest(
         )
 
     bars_by_symbol, warnings, industry_quality = _annotated_bars(
-        data,
-        tuple(data.bars_by_symbol),
+        raw_series,
+        data_failures,
+        fetched_symbols,
         industry_by_symbol=industry_by_symbol,
+        classification_loader=classification_loader,
         industry_loader=industry_loader,
         theme_by_symbol=theme_by_symbol,
         theme_loader=theme_loader,
         name_by_symbol=name_by_symbol,
         progress_callback=annotation_progress,
     )
-    if len(data.series) < len(normalized_symbols):
+    if len(data_summary.series) < len(normalized_symbols):
         warnings.append(
             "historical universe coverage: "
-            f"{len(data.series)}/{len(normalized_symbols)} ({coverage_ratio:.1%})"
+            f"{len(data_summary.series)}/{len(normalized_symbols)} ({coverage_ratio:.1%})"
         )
     resolved_selection = replace(
         selection_config or SelectionBacktestConfig(),
@@ -521,7 +663,7 @@ def run_historical_selection_backtest(
             sources=identity.get("sources") or (),
             adjustment=str(identity.get("adjustment") or ""),
             stock_pool=identity.get("stock_pool") or (),
-            source_by_symbol=data.source_by_symbol,
+            source_by_symbol=data_summary.source_by_symbol,
         )
         tape = replay_cache.load(cache_key)
         cache_hit = tape is not None
@@ -647,7 +789,7 @@ def run_historical_selection_backtest(
     if progress_callback is not None:
         progress_callback(100, "completed", "回测完成")
     return HistoricalSelectionBacktestRun(
-        data=data,
+        data=result_data,
         selection=selection,
         warnings=tuple(warnings),
         industry_quality=industry_quality,
@@ -658,9 +800,12 @@ def run_historical_selection_backtest(
 __all__ = [
     "HistoricalSelectionBacktestRun",
     "BacktestProgress",
+    "ClassificationSnapshotLoader",
+    "CurrentClassificationError",
     "IndustryMapLoader",
     "ThemeMapLoader",
     "IndustryAnnotationQuality",
+    "load_current_classification_snapshot",
     "load_current_industry_map",
     "load_current_theme_map",
     "run_historical_selection_backtest",

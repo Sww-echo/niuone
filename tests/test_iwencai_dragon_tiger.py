@@ -21,15 +21,20 @@ from app.dashboard.apis.iwencai_service import (
     write_dragon_tiger_snapshot,
 )
 from app.market_data.iwencai_client import IwencaiRequestError
+from app.market_data.news_precheck import IWENCAI_NEWS_SOURCE_VERSION
 
 
 ENABLED_ENV = {
     "IWENCAI_ENABLED": "1",
+    "IWENCAI_NEWS_PRECHECK_ENABLED": "1",
     "IWENCAI_BASE_URL": "https://openapi.iwencai.com",
     "IWENCAI_API_KEY": "test-secret",
     "IWENCAI_TIMEOUT_SECONDS": "20",
     "IWENCAI_MAX_RETRIES": "1",
     "IWENCAI_MAX_CONCURRENCY": "2",
+    "DASHBOARD_DECISION_MODEL": "decision-test-model",
+    "DASHBOARD_DECISION_BASE_URL": "https://model.example/v1",
+    "DASHBOARD_DECISION_API_KEY": "decision-secret",
 }
 
 
@@ -49,6 +54,41 @@ class FakeClient:
 
 
 class IwencaiDragonTigerTests(unittest.TestCase):
+    def test_core_payload_is_published_before_seat_enrichment(self):
+        observed = []
+
+        def result_for(query, **_kwargs):
+            if "所属行业" in query:
+                return {
+                    "code_count": 1,
+                    "datas": [{"股票代码": "000001.SZ", "所属行业": "银行"}],
+                }
+            if query.endswith("龙虎榜营业部"):
+                self.assertEqual(len(observed), 1)
+                raise IwencaiRequestError("seat_timeout", "temporary")
+            return {
+                "code_count": 1,
+                "datas": [{
+                    "股票代码": "000001.SZ",
+                    "股票简称": "平安银行",
+                    "榜单类型": "单日榜",
+                }],
+            }
+
+        payload = fetch_dragon_tiger(
+            "2026-07-16",
+            env=ENABLED_ENV,
+            client=FakeClient(result_for),
+            on_core_payload=lambda core: observed.append(dict(core)),
+        )
+
+        self.assertEqual(observed[0]["items"][0]["code"], "000001.SZ")
+        self.assertEqual(observed[0]["items"][0]["sector"], "银行")
+        self.assertTrue(observed[0]["seat_enrichment_pending"])
+        self.assertFalse(observed[0]["seat_data_complete"])
+        self.assertFalse(payload["seat_enrichment_pending"])
+        self.assertEqual(payload["seat_error"], "seat_timeout")
+
     def test_marks_only_stocks_present_on_adjacent_trading_day(self):
         previous = {
             "date": "2026-07-15",
@@ -161,12 +201,7 @@ class IwencaiDragonTigerTests(unittest.TestCase):
                     "consecutive_list_days": 1,
                 }],
             },
-            env={
-                "DASHBOARD_NEWS_BASE_URL": "https://news.example/v1",
-                "DASHBOARD_NEWS_API_KEY": "news-secret",
-                "DASHBOARD_NEWS_MODEL": "search-model",
-                "DASHBOARD_NEWS_API_MODE": "responses",
-            },
+            env=ENABLED_ENV,
             fetcher=fake_fetcher,
         )
 
@@ -174,10 +209,9 @@ class IwencaiDragonTigerTests(unittest.TestCase):
             [item["code"] for item in captured["candidates"]],
             ["000001.SZ", "000002.SZ"],
         )
-        self.assertEqual(captured["config"].base_url, "https://news.example/v1")
-        self.assertEqual(captured["config"].api_key, "news-secret")
-        self.assertEqual(captured["config"].model, "search-model")
-        self.assertEqual(captured["config"].api_mode, "responses")
+        self.assertEqual(captured["config"].base_url, "https://openapi.iwencai.com")
+        self.assertEqual(captured["config"].api_key, "test-secret")
+        self.assertEqual(captured["config"].model, "decision-test-model")
         self.assertEqual(captured["kwargs"]["max_candidates"], 2)
         self.assertEqual(payload["continuous_news_checked_count"], 2)
         self.assertEqual(payload["continuous_news_pending_count"], 0)
@@ -195,11 +229,14 @@ class IwencaiDragonTigerTests(unittest.TestCase):
         )
         self.assertEqual(payload["limit_up_news_pending_codes"], [])
         self.assertTrue(payload["limit_up_news_complete"])
-        self.assertEqual(payload["items"][0]["news_precheck"]["provider"], "消息面预检模型")
+        self.assertEqual(
+            payload["items"][0]["news_precheck"]["provider"],
+            "同花顺问财 + decision-test-model",
+        )
         self.assertEqual(payload["items"][0]["news_precheck"]["summary"], "重大合同落地（利好）")
         self.assertEqual(payload["items"][1]["news_precheck"]["tone_label"], "中性")
         self.assertNotIn("news_precheck", payload["items"][2])
-        self.assertNotIn("news-secret", str(payload))
+        self.assertNotIn("test-secret", str(payload))
 
     def test_news_precheck_does_not_fall_back_to_grok_configuration(self):
         payload = enrich_consecutive_dragon_tiger_news(
@@ -222,10 +259,49 @@ class IwencaiDragonTigerTests(unittest.TestCase):
         )
 
         self.assertFalse(payload["continuous_news_configured"])
-        self.assertEqual(payload["continuous_news_error"], "news_precheck_not_configured")
+        self.assertNotIn("continuous_news_error", payload)
+        self.assertNotIn("news_precheck", payload["items"][0])
+
+    def test_news_precheck_supports_pure_iwencai_source(self):
+        captured = {}
+
+        def fake_fetcher(candidates, config, **_kwargs):
+            captured["config"] = config
+            return [{
+                "code": candidates[0]["code"],
+                "name": candidates[0]["name"],
+                "checked": True,
+                "available": True,
+                "tone": "positive",
+                "tone_label": "利好",
+                "summary": "重大合同落地（利好）",
+                "error": "",
+            }]
+
+        payload = enrich_consecutive_dragon_tiger_news(
+            {
+                "date": "2026-07-16",
+                "items": [{
+                    "code": "000001.SZ",
+                    "name": "平安银行",
+                    "limit_up_streak": 2,
+                }],
+            },
+            env={
+                **ENABLED_ENV,
+                "IWENCAI_NEWS_PRECHECK_ENABLED": "1",
+                "DASHBOARD_NEWS_MODEL": "must-not-be-used",
+                "DASHBOARD_NEWS_API_KEY": "must-not-be-used",
+            },
+            fetcher=fake_fetcher,
+        )
+
+        self.assertEqual(captured["config"].source_mode, "iwencai")
+        self.assertEqual(captured["config"].api_key, "test-secret")
+        self.assertEqual(payload["continuous_news_source"], "iwencai")
         self.assertEqual(
-            payload["items"][0]["news_precheck"]["error"],
-            "news_precheck_not_configured",
+            payload["items"][0]["news_precheck"]["provider"],
+            "同花顺问财 + decision-test-model",
         )
 
     def test_news_precheck_reuses_same_day_success_without_duplicate_request(self):
@@ -235,7 +311,9 @@ class IwencaiDragonTigerTests(unittest.TestCase):
             "tone": "neutral",
             "tone_label": "中性",
             "summary": "暂无新增重大消息（中性）",
-            "provider": "消息面预检模型",
+            "provider": "同花顺问财",
+            "source_mode": "iwencai",
+            "source_version": IWENCAI_NEWS_SOURCE_VERSION,
         }
         payload = enrich_consecutive_dragon_tiger_news(
             {
@@ -248,11 +326,11 @@ class IwencaiDragonTigerTests(unittest.TestCase):
                     "consecutive_list_days": 2,
                 }],
             },
-            env={},
+            env=ENABLED_ENV,
             previous_snapshot={
                 "date": "2026-07-16",
                 "continuous_news_configured": True,
-                "continuous_news_model": "search-model",
+                "continuous_news_model": "iwencai",
                 "items": [{
                     "code": "000001.SZ",
                     "name": "平安银行",
@@ -263,11 +341,11 @@ class IwencaiDragonTigerTests(unittest.TestCase):
         )
 
         self.assertTrue(payload["continuous_news_configured"])
-        self.assertEqual(payload["continuous_news_model"], "search-model")
+        self.assertEqual(payload["continuous_news_model"], "iwencai")
         self.assertEqual(payload["continuous_news_available_count"], 1)
         self.assertTrue(payload["items"][0]["news_precheck"]["cached"])
 
-    def test_news_precheck_repairs_cached_unclassified_summary_without_request(self):
+    def test_news_precheck_does_not_repair_cached_tone_without_model_request(self):
         payload = enrich_consecutive_dragon_tiger_news(
             {
                 "date": "2026-07-24",
@@ -283,18 +361,21 @@ class IwencaiDragonTigerTests(unittest.TestCase):
                         "tone_label": "未识别",
                         "summary": "股东增持构成重大利好，无其他利空或中性消息。",
                         "error": "unclassified_response",
+                        "provider": "同花顺问财",
+                        "source_mode": "iwencai",
+                        "source_version": IWENCAI_NEWS_SOURCE_VERSION,
                     },
                 }],
             },
-            env={},
+            env=ENABLED_ENV,
             fetcher=lambda *_args, **_kwargs: self.fail("不应重复调用消息面预检模型"),
         )
 
         record = payload["items"][0]["news_precheck"]
-        self.assertTrue(record["available"])
-        self.assertEqual(record["tone_label"], "利好")
-        self.assertTrue(record["repaired_locally"])
-        self.assertEqual(payload["limit_up_news_available_count"], 1)
+        self.assertFalse(record["available"])
+        self.assertEqual(record["tone_label"], "未识别")
+        self.assertNotIn("repaired_locally", record)
+        self.assertEqual(payload["limit_up_news_available_count"], 0)
 
     def test_news_precheck_queries_every_unchecked_stock_with_bounded_concurrency(self):
         captured = {}
@@ -329,10 +410,8 @@ class IwencaiDragonTigerTests(unittest.TestCase):
                 "items": stocks,
             },
             env={
-                "DASHBOARD_NEWS_BASE_URL": "https://news.example/v1",
-                "DASHBOARD_NEWS_API_KEY": "news-secret",
-                "DASHBOARD_NEWS_MODEL": "search-model",
-                "DASHBOARD_NEWS_CONCURRENCY": "5",
+                **ENABLED_ENV,
+                "IWENCAI_MAX_CONCURRENCY": "4",
                 "IWENCAI_DRAGON_TIGER_CRON": "5 17 * * 1-5",
             },
             fetcher=fake_fetcher,
@@ -341,7 +420,7 @@ class IwencaiDragonTigerTests(unittest.TestCase):
 
         self.assertEqual(len(captured["codes"]), 7)
         self.assertEqual(captured["max_candidates"], 7)
-        self.assertEqual(captured["concurrency"], 5)
+        self.assertEqual(captured["concurrency"], 4)
         self.assertEqual(payload["continuous_news_checked_count"], 7)
         self.assertEqual(payload["continuous_news_pending_count"], 0)
         self.assertTrue(payload["continuous_news_complete"])
@@ -363,7 +442,9 @@ class IwencaiDragonTigerTests(unittest.TestCase):
             "tone_label": "不可用",
             "summary": "",
             "error": "request_RuntimeError",
-            "provider": "消息面预检模型",
+            "provider": "同花顺问财",
+            "source_mode": "iwencai",
+            "source_version": IWENCAI_NEWS_SOURCE_VERSION,
         }
 
         def fake_fetcher(candidates, _config, **kwargs):
@@ -398,11 +479,7 @@ class IwencaiDragonTigerTests(unittest.TestCase):
                     "consecutive_list_days": 2,
                 }],
             },
-            env={
-                "DASHBOARD_NEWS_BASE_URL": "https://news.example/v1",
-                "DASHBOARD_NEWS_API_KEY": "news-secret",
-                "DASHBOARD_NEWS_MODEL": "search-model",
-            },
+            env=ENABLED_ENV,
             previous_snapshot={
                 "date": "2026-07-16",
                 "continuous_news_started_at": "2026-07-16T18:47:00+08:00",
@@ -451,9 +528,7 @@ class IwencaiDragonTigerTests(unittest.TestCase):
                 }],
             },
             env={
-                "DASHBOARD_NEWS_BASE_URL": "https://news.example/v1",
-                "DASHBOARD_NEWS_API_KEY": "news-secret",
-                "DASHBOARD_NEWS_MODEL": "search-model",
+                **ENABLED_ENV,
                 "IWENCAI_DRAGON_TIGER_CRON": "*/10 17-20 * * 1-5",
                 "NIUONE_CRON_RUN_KEY": "6a72470cc5e1:202607161740",
             },
@@ -475,7 +550,7 @@ class IwencaiDragonTigerTests(unittest.TestCase):
             "2026-07-16T17:40:00+08:00",
         )
 
-    def test_news_precheck_records_pending_stocks_when_model_is_not_configured(self):
+    def test_news_precheck_switch_off_skips_pending_state(self):
         payload = enrich_consecutive_dragon_tiger_news(
             {
                 "date": "2026-07-16",
@@ -493,13 +568,10 @@ class IwencaiDragonTigerTests(unittest.TestCase):
         )
 
         self.assertEqual(payload["continuous_news_checked_codes"], [])
-        self.assertEqual(payload["continuous_news_pending_codes"], ["000001.SZ"])
-        self.assertEqual(payload["continuous_news_pending_count"], 1)
-        self.assertFalse(payload["continuous_news_complete"])
-        self.assertEqual(
-            payload["continuous_news_started_at"],
-            "2026-07-16T18:00:00+08:00",
-        )
+        self.assertEqual(payload["continuous_news_pending_codes"], [])
+        self.assertEqual(payload["continuous_news_pending_count"], 0)
+        self.assertTrue(payload["continuous_news_complete"])
+        self.assertNotIn("continuous_news_started_at", payload)
 
     def test_normalizes_dynamic_fields_sorts_and_marks_count_mismatch(self):
         client = FakeClient({
@@ -971,6 +1043,32 @@ class IwencaiDragonTigerTests(unittest.TestCase):
                 )
             )
             self.assertEqual(path.read_bytes(), original)
+
+    def test_core_snapshot_keeps_explicit_seat_incomplete_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "iwencai_dragon_tiger_latest.json"
+            core = {
+                "enabled": True,
+                "available": True,
+                "source": "同花顺问财",
+                "date": "2026-07-16",
+                "seat_query": "2026年7月16日龙虎榜营业部",
+                "seat_data_complete": False,
+                "seat_enrichment_pending": True,
+                "snapshot_stage": "core",
+                "items": [{
+                    "code": "000001.SZ",
+                    "name": "平安银行",
+                    "seats": [],
+                }],
+            }
+
+            self.assertTrue(write_dragon_tiger_snapshot(path, core))
+            loaded = read_dragon_tiger_snapshot(path, trade_date="2026-07-16")
+
+            self.assertIsNotNone(loaded)
+            self.assertFalse(loaded["seat_data_complete"])
+            self.assertTrue(loaded["seat_enrichment_pending"])
 
     def test_daily_archive_uses_exact_date_and_preserves_same_day_seat_rows(self):
         with tempfile.TemporaryDirectory() as tmp:

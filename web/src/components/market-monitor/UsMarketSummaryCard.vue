@@ -16,9 +16,10 @@ const tone = computed(() => {
 const isLoading = computed(() => props.summaryData?.loading && !props.summaryData?.generated_at)
 const toneLabel = computed(() => isLoading.value ? '加载中' : (props.summaryData?.tone_label || '中性'))
 const summary = computed(() => {
-  if (isLoading.value) return loadingSummary
-  return props.summaryData?.summary
+  if (isLoading.value) return cleanMarketLine(loadingSummary)
+  return cleanMarketLine(props.summaryData?.summary
     || (props.summaryData?.error ? '隔夜美股盘面暂不可用，今日先按 A 股自身信号执行。' : '等待隔夜美股盘面总结。')
+  )
 })
 const subtitle = computed(() => {
   if (isLoading.value) return '正在加载昨晚美股盘面...'
@@ -26,7 +27,12 @@ const subtitle = computed(() => {
   const rule = props.summaryData?.date_rule || '周一显示上周五美股盘面；其他日期显示前一美股交易日。'
   return `目标美股交易日 ${target} · ${rule}`
 })
-const metrics = computed(() => (props.summaryData?.metrics || []).slice(0, 8))
+const metrics = computed(() => (props.summaryData?.metrics || []).slice(0, 8).map(metric => ({
+  ...metric,
+  label: cleanMarketLine(metric?.label || ''),
+  value: cleanMarketLine(metric?.value || ''),
+  change_pct_text: cleanMarketLine(metric?.change_pct_text || ''),
+})))
 const mappingItems = computed(() => (props.summaryData?.sector_mappings || []).slice(0, 5).map(mapping => {
   const mapped = Array.isArray(mapping.a_share_mapping)
     ? mapping.a_share_mapping.slice(0, 4).join(' / ')
@@ -50,10 +56,10 @@ const guidanceItems = computed(() => {
   })
 })
 const mappingSection = computed(() => ({
-  title: 'A股板块映射', icon: '🧭', tone: 'overview', wide: true, items: mappingItems.value,
+  title: 'A股板块映射', tone: 'overview', wide: true, items: mappingItems.value,
 }))
 const guidanceSection = computed(() => ({
-  title: '今日执行', icon: '💡', tone: 'tip', wide: true, items: guidanceItems.value,
+  title: '今日执行', tone: 'tip', wide: true, items: guidanceItems.value,
 }))
 function percentageTone(metric) {
   const number = Number(metric?.change_pct)

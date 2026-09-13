@@ -41,7 +41,12 @@ class IwencaiConnectivityTests(unittest.TestCase):
         self.assertEqual(metadata["group_slug"], "iwencai")
         self.assertEqual(
             metadata["field_names"],
-            ["IWENCAI_BASE_URL", "IWENCAI_API_KEY", "IWENCAI_TIMEOUT_SECONDS"],
+            [
+                "IWENCAI_NEWS_PRECHECK_ENABLED",
+                "IWENCAI_BASE_URL",
+                "IWENCAI_API_KEY",
+                "IWENCAI_TIMEOUT_SECONDS",
+            ],
         )
 
     def test_success_sends_one_small_read_only_query(self):
@@ -79,6 +84,48 @@ class IwencaiConnectivityTests(unittest.TestCase):
             "is_cache": "1",
             "expand_index": "false",
         })
+        self.assertEqual(result["tested_skills"], ["hithink-market-query"])
+
+    def test_enabled_news_precheck_validates_all_three_message_skills(self):
+        calls = []
+
+        def opener(request, timeout=0):
+            calls.append(request)
+            if request.full_url.endswith("/v1/comprehensive/search"):
+                return _Response({"status_code": 0, "data": []})
+            return _Response({"datas": []})
+
+        result = run_iwencai_connection_test(
+            {
+                "IWENCAI_NEWS_PRECHECK_ENABLED": "1",
+                "IWENCAI_BASE_URL": "https://iwencai.example",
+                "IWENCAI_API_KEY": "private-key",
+            },
+            opener=opener,
+            monotonic=lambda: 20.0,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(
+            result["tested_skills"],
+            [
+                "hithink-market-query",
+                "announcement-search",
+                "news-search",
+                "hithink-event-query",
+            ],
+        )
+        self.assertEqual(
+            [request.get_header("X-claw-skill-id") for request in calls],
+            [
+                "hithink-market-query",
+                "announcement-search",
+                "news-search",
+                "hithink-event-query",
+            ],
+        )
+        self.assertIn("3 个消息面技能", result["message"])
 
     def test_missing_key_and_invalid_base_url_are_reported_without_network(self):
         calls = []
@@ -124,6 +171,7 @@ class IwencaiConnectivityTests(unittest.TestCase):
         )
 
         self.assertEqual(denied["error_code"], "http_error")
+        self.assertEqual(denied["failed_skill"], "hithink-market-query")
         self.assertIn("HTTP 401", denied["error"])
         self.assertNotIn("private-key", json.dumps(denied, ensure_ascii=False))
         self.assertEqual(invalid["error_code"], "upstream_error")

@@ -29,8 +29,7 @@ $PowerShellExe = (Get-Process -Id $PID).Path
 $Identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $Tasks = @(
     @{ TaskName = "NiuOne Dashboard"; ServiceName = "dashboard" },
-    @{ TaskName = "NiuOne Cron Scheduler"; ServiceName = "cron-scheduler" },
-    @{ TaskName = "NiuOne X Watchlist"; ServiceName = "x-watchlist" }
+    @{ TaskName = "NiuOne Cron Scheduler"; ServiceName = "cron-scheduler" }
 )
 
 function Quote-TaskArgument {

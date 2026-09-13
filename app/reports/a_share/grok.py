@@ -1,4 +1,4 @@
-"""Pure prompt, parsing, and rendering logic for Grok-assisted A-share reports."""
+"""Pure prompt, parsing, and rendering logic for model-assisted A-share reports."""
 from __future__ import annotations
 
 import json
@@ -73,7 +73,7 @@ def strip_json_fence(content: str) -> str:
 def parse_content(content: str) -> dict[str, Any]:
     payload = json.loads(strip_json_fence(content))
     if not isinstance(payload, dict):
-        raise ValueError("A-share Grok summary JSON must be an object")
+        raise ValueError("A-share model summary JSON must be an object")
     tone = str(payload.get("tone") or "neutral").strip()
     if tone not in {"offensive", "balanced", "neutral", "cautious", "defensive"}:
         tone = "neutral"
@@ -116,7 +116,7 @@ def remove_original_guidance(local_report: str) -> str:
 
 
 def render_report(local_report: str, parsed: dict[str, Any], *, title: str, model: str) -> str:
-    summary = parsed.get("summary") or "Grok 已参与盘面复核，但未返回摘要。"
+    summary = parsed.get("summary") or "模型已参与盘面复核，但未返回摘要。"
     tone_label = parsed.get("tone_label") or "中性"
     guidance = [str(item).strip().lstrip("·- ").strip() for item in parsed.get("guidance_lines") or [] if str(item).strip()]
     focus = [str(item).strip().lstrip("·- ").strip() for item in parsed.get("focus_lines") or [] if str(item).strip()]

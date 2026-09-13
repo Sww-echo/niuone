@@ -5,10 +5,10 @@
 评估多战法（趋势/突破策略 + Z哥），每只票输出多战法分数
 + 最优战法标签，供实战页面模型决策时参考。
 
-数据源（全部绕过Eastmoney代理封锁）：
+数据源（主链路优先绕过 Eastmoney 代理封锁）：
   1. akshare.stock_info_a_code_name() — 代码池
   2. 腾讯 qt.gtimg.cn 批量行情 — 实时报价
-  3. 腾讯 web.ifzq.gtimg.cn fqkline — 日K数据
+  3. 腾讯双入口 fqkline，东方财富备用 — 前复权日K数据
 
 用法：
   cd /path/to/NiuOne/app
@@ -63,7 +63,7 @@ from market_data.eastmoney_boards import (
 from market_data.tencent_kline_cache import (
     DEFAULT_KLINE_COUNT,
     DEFAULT_PREWARM_WORKERS,
-    fetch_tencent_daily_klines,
+    fetch_a_share_daily_klines,
     kline_cache_path,
     load_kline_series_map,
     merge_live_quote,
@@ -88,6 +88,8 @@ from screening.niuone_mainline_cache import (
     write_niuone_mainline_cache,
     write_niuone_mainline_summary_cache,
 )
+from storage.prompt_strategies import PromptStrategyStore
+from strategies.prompt_runtime import score_prompt_selection
 from strategies.registry import (
     ACTIVE_STRATEGY_ENV,
     DISPLAY_STRATEGY_ORDER,
@@ -96,6 +98,7 @@ from strategies.registry import (
     STRATEGY_DEFINITIONS,
     STRATEGY_META,
     STRATEGY_SCORE_PROFILES,
+    STRATEGY_SUITE_PRESET_TEXT,
     active_strategy_suite,
     enabled_persona_strategy_ids,
     enabled_strategy_ids,
@@ -156,7 +159,6 @@ from strategies.selection import (
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 TENCENT_QUOTE = "https://qt.gtimg.cn/q="
-TENCENT_KLINE = "https://ifzq.gtimg.cn/appstock/app/fqkline/get"
 TENCENT_QUOTE_TIMEOUT_SECONDS = 10
 TENCENT_QUOTE_MAX_ATTEMPTS = 3
 TENCENT_QUOTE_BACKOFF_SECONDS = 0.5
@@ -174,6 +176,8 @@ STOCK_INDUSTRY_CACHE = B1_OUTPUT_DIR / "stock_industry_cache.json"
 EASTMONEY_BOARD_CACHE = B1_OUTPUT_DIR / "eastmoney_stock_boards.json"
 B1_HISTORY_DIR = B1_OUTPUT_DIR / "b1_history"
 MULTI_STRATEGY_HISTORY = B1_OUTPUT_DIR / "multi_strategy_history"
+SCAN_HISTORY_RETENTION_DATES = 1
+SCAN_HISTORY_MAX_FILES_PER_DATE = 12
 DISPLAY_CANDIDATE_LIMIT = 16
 DISPLAY_HEAD_LIMIT = 8
 TRADE_CANDIDATE_LIMIT = 8
@@ -182,6 +186,8 @@ NIUONE_MAINLINE_ONLY_FLAG = "--niuone-mainline-only"
 KLINE_PREWARM_ONLY_FLAG = "--prewarm-kline-cache"
 HIGH_LIQUIDITY_MIN_AMOUNT = 8e8
 MAX_TRADE_ANALYSIS_COUNT = 500
+PRESET_TEXT_CANDIDATE_LIMIT_ENV = "DASHBOARD_PRESET_STRATEGY_CANDIDATE_LIMIT"
+DEFAULT_PRESET_TEXT_CANDIDATE_LIMIT = 60
 STOCK_INDUSTRY_BULK_CACHE_MIN_COVERAGE = 0.85
 _STOCK_INDUSTRY_MEMORY_CACHE: dict[str, str] | None = None
 _MARGIN_DETAIL_CACHE: dict[tuple[str, str], Any] = {}
@@ -351,6 +357,17 @@ def active_strategy_meta() -> dict[str, dict[str, Any]]:
 
 def active_strategy_score_profiles() -> dict[str, dict[str, Any]]:
     return enabled_strategy_score_profiles(enabled_persona_strategy_setting(), strategy_source_setting(), active_strategy_setting())
+
+
+def preset_text_candidate_limit() -> int:
+    try:
+        value = int(
+            dashboard_env_value(PRESET_TEXT_CANDIDATE_LIMIT_ENV)
+            or DEFAULT_PRESET_TEXT_CANDIDATE_LIMIT
+        )
+    except (TypeError, ValueError):
+        value = DEFAULT_PRESET_TEXT_CANDIDATE_LIMIT
+    return max(10, min(100, value))
 
 
 def configured_stock_universe() -> tuple[str, ...]:
@@ -686,8 +703,8 @@ def build_index_risk_snapshot(
 
 
 def tencent_klines(symbol, count=120):
-    """Backward-compatible Tencent loader now owned by market_data."""
-    return fetch_tencent_daily_klines(symbol, count)
+    """Backward-compatible loader backed by the shared multi-source client."""
+    return fetch_a_share_daily_klines(symbol, count)
 
 
 # ========== Multi-Strategy Analysis ==========
@@ -702,22 +719,30 @@ def prepare_strategy_rows(
     historical_rows: list[dict[str, Any]] | None = None,
     kline_loader: Callable[[str, int], list[dict[str, Any]]] | None = None,
     fetched_callback: Callable[[str, list[dict[str, Any]]], None] | None = None,
+    kline_count: int = DEFAULT_KLINE_COUNT,
+    enrich_legacy_indicators: bool = True,
+    minimum_rows: int = 30,
 ) -> list[dict[str, Any]] | None:
-    """Fetch and enrich a stock once so cross-sectional suites can reuse it."""
+    """Fetch a stock once and optionally prepare legacy-suite indicators."""
     rows = [dict(row) for row in historical_rows] if historical_rows else []
     if not rows:
         try:
-            rows = (kline_loader or tencent_klines)(tencent_key, DEFAULT_KLINE_COUNT)
+            rows = (kline_loader or tencent_klines)(
+                tencent_key,
+                max(1, min(501, int(kline_count or DEFAULT_KLINE_COUNT))),
+            )
         except Exception:
             return None
         if rows and fetched_callback is not None:
             fetched_callback(tencent_key, rows)
-    rows = merge_live_quote(rows, quote)
-    if len(rows) < 30:
+    rows = merge_live_quote(rows, quote, limit=kline_count)
+    if len(rows) < max(1, int(minimum_rows or 1)):
         return None
 
-    # Enrich once (BBI, J, EMA20, EMA50, change_pct)
-    enrich_rows(rows)
+    # Frozen prompt strategies materialize only their compiled dependencies later.
+    # Other suites still share the established legacy enrichment pass.
+    if enrich_legacy_indicators:
+        enrich_rows(rows)
     if rows:
         rows[-1]["symbol_code"] = symbol
         rows[-1]["stock_name"] = name or (quote or {}).get("name", "")
@@ -743,6 +768,9 @@ def analyze_all_strategies(
     fetched_callback: Callable[[str, list[dict[str, Any]]], None] | None = None,
     context: dict[str, Any] | None = None,
     scorers: dict[str, Callable[..., dict[str, Any] | None]] | None = None,
+    kline_count: int = DEFAULT_KLINE_COUNT,
+    enrich_legacy_indicators: bool = True,
+    minimum_rows: int = 30,
 ):
     """Run all active strategies, optionally in one shared cross-sectional context."""
     prepared = rows or prepare_strategy_rows(
@@ -753,6 +781,9 @@ def analyze_all_strategies(
         industry=industry,
         historical_rows=historical_rows,
         fetched_callback=fetched_callback,
+        kline_count=kline_count,
+        enrich_legacy_indicators=enrich_legacy_indicators,
+        minimum_rows=minimum_rows,
     )
     if not prepared:
         return None
@@ -991,14 +1022,29 @@ def fetch_sector_tide_news_precheck(
         active_config = config or NewsPrecheckConfig.from_mapping({
             name: dashboard_env_value(name) or ""
             for name in (
-                "DASHBOARD_NEWS_BASE_URL",
-                "DASHBOARD_NEWS_API_KEY",
-                "DASHBOARD_NEWS_MODEL",
-                "DASHBOARD_NEWS_API_MODE",
-                "DASHBOARD_NEWS_TIMEOUT",
-                "DASHBOARD_NEWS_MAX_RETRIES",
-                "DASHBOARD_NEWS_CONCURRENCY",
-                "DASHBOARD_NEWS_MAX_TOKENS",
+                "IWENCAI_NEWS_PRECHECK_ENABLED",
+                "IWENCAI_ENABLED",
+                "IWENCAI_BASE_URL",
+                "IWENCAI_API_KEY",
+                "IWENCAI_TIMEOUT_SECONDS",
+                "IWENCAI_MAX_RETRIES",
+                "IWENCAI_MAX_CONCURRENCY",
+                "DASHBOARD_DECISION_MODEL",
+                "DASHBOARD_DECISION_BASE_URL",
+                "DASHBOARD_DECISION_API_KEY",
+                "DASHBOARD_DECISION_STREAM_MODE",
+                "DASHBOARD_DECISION_REASONING_EFFORT",
+                "DASHBOARD_DECISION_TIMEOUT",
+                "DASHBOARD_DECISION_MAX_TOKENS",
+                "A_SHARE_MODEL_SUMMARY_MODEL",
+                "A_SHARE_MODEL_SUMMARY_BASE_URL",
+                "A_SHARE_MODEL_SUMMARY_API_KEY",
+                "A_SHARE_MODEL_SUMMARY_STREAM_MODE",
+                "A_SHARE_MODEL_SUMMARY_REASONING_EFFORT",
+                "A_SHARE_MODEL_SUMMARY_MAX_TOKENS",
+                "CROSSDESK_BASE_URL",
+                "CROSSDESK_API_KEY",
+                "DASHBOARD_CONFIG",
             )
         })
     except ValueError as exc:
@@ -1504,13 +1550,131 @@ def annotate_candidate_industries(
 # ========== Main ==========
 
 
+def _valid_archive_date(value: str) -> bool:
+    try:
+        parsed = datetime.strptime(str(value), "%Y-%m-%d")
+    except ValueError:
+        return False
+    return parsed.strftime("%Y-%m-%d") == value
+
+
+def _archive_date_directories(root: Path) -> list[Path]:
+    if root.is_symlink() or not root.is_dir():
+        return []
+    return sorted(
+        path
+        for path in root.iterdir()
+        if not path.is_symlink()
+        and path.is_dir()
+        and _valid_archive_date(path.name)
+    )
+
+
+def _archive_json_files(date_dir: Path) -> list[Path]:
+    archives: list[Path] = []
+    for path in date_dir.iterdir():
+        if path.is_symlink() or not path.is_file() or path.suffix != ".json":
+            continue
+        try:
+            timestamp = datetime.strptime(path.stem, "%Y-%m-%d_%H-%M-%S")
+        except ValueError:
+            continue
+        if timestamp.strftime("%Y-%m-%d") != date_dir.name:
+            continue
+        archives.append(path)
+    return sorted(archives, key=lambda path: path.name)
+
+
+def cleanup_scan_history(
+    active_date: str,
+    *,
+    legacy_history_dir: Path | None = None,
+    primary_history_dir: Path | None = None,
+    retention_dates: int = SCAN_HISTORY_RETENTION_DATES,
+    max_files_per_date: int = SCAN_HISTORY_MAX_FILES_PER_DATE,
+) -> dict[str, int]:
+    """Retire legacy B1 archives and bound the primary scan history.
+
+    Only timestamped JSON files inside validated date directories are eligible
+    for deletion. Unknown files, nested directories, and symbolic links are
+    deliberately preserved.
+    """
+    if not _valid_archive_date(active_date):
+        raise ValueError("active scan archive date must use YYYY-MM-DD")
+    if retention_dates < 1:
+        raise ValueError("scan history must retain at least one archive date")
+    if max_files_per_date < 1:
+        raise ValueError("scan history must retain at least one file per date")
+
+    legacy_root = Path(legacy_history_dir or B1_HISTORY_DIR)
+    primary_root = Path(primary_history_dir or MULTI_STRATEGY_HISTORY)
+    removed_legacy = 0
+    removed_primary = 0
+    failures: list[str] = []
+
+    def remove_archives(paths: list[Path], *, legacy: bool) -> None:
+        nonlocal removed_legacy, removed_primary
+        for path in paths:
+            try:
+                path.unlink()
+            except OSError as exc:
+                failures.append(type(exc).__name__)
+            else:
+                if legacy:
+                    removed_legacy += 1
+                else:
+                    removed_primary += 1
+
+    for date_dir in _archive_date_directories(legacy_root):
+        remove_archives(_archive_json_files(date_dir), legacy=True)
+        try:
+            date_dir.rmdir()
+        except OSError:
+            pass
+    try:
+        legacy_root.rmdir()
+    except OSError:
+        pass
+
+    primary_dates = _archive_date_directories(primary_root)
+    retained_names = {
+        path.name for path in primary_dates[-retention_dates:]
+    }
+    retained_names.add(active_date)
+    for date_dir in primary_dates:
+        archives = _archive_json_files(date_dir)
+        if date_dir.name not in retained_names:
+            remove_archives(archives, legacy=False)
+            try:
+                date_dir.rmdir()
+            except OSError:
+                pass
+            continue
+        remove_archives(
+            archives[:-max_files_per_date],
+            legacy=False,
+        )
+
+    if failures:
+        error_types = ",".join(sorted(set(failures)))
+        print(
+            "[WARN] scan history cleanup incomplete: "
+            f"failures={len(failures)} error_types={error_types}",
+            file=sys.stderr,
+        )
+    return {
+        "legacy_removed": removed_legacy,
+        "primary_removed": removed_primary,
+    }
+
+
 def write_outputs(
     payload: Mapping[str, Any],
     generated_at: str,
     *,
     json_str: str | None = None,
 ) -> None:
-    """Write B1 cache (backward compat), multi-strategy cache, and archives."""
+    """Write latest caches and one bounded multi-strategy history."""
     B1_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     serialized = json_str or json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -1524,17 +1688,16 @@ def write_outputs(
     tmp_b1.write_text(serialized + "\n", encoding="utf-8")
     tmp_b1.replace(B1_CACHE_FILE)
 
-    # Archive
+    # Primary archive. The former B1 history was an identical compatibility
+    # copy and is removed by the bounded cleanup below.
     safe_ts = str(generated_at).replace(":", "-").replace(" ", "_")
     date_part = safe_ts.split("_")[0]
-
-    for archive_dir in [B1_HISTORY_DIR, MULTI_STRATEGY_HISTORY]:
-        d = archive_dir / date_part
-        d.mkdir(parents=True, exist_ok=True)
-        f = d / f"{safe_ts}.json"
-        ft = f.with_suffix(f.suffix + ".new")
-        ft.write_text(serialized + "\n", encoding="utf-8")
-        ft.replace(f)
+    d = MULTI_STRATEGY_HISTORY / date_part
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / f"{safe_ts}.json"
+    ft = f.with_suffix(f.suffix + ".new")
+    ft.write_text(serialized + "\n", encoding="utf-8")
+    ft.replace(f)
 
     # The Dashboard polls this bounded read model instead of the full scan.
     write_practice_candidates_cache(
@@ -1542,6 +1705,14 @@ def write_outputs(
         payload,
         source_path=MULTI_STRATEGY_CACHE,
     )
+    try:
+        cleanup_scan_history(date_part)
+    except (OSError, ValueError) as exc:
+        print(
+            "[WARN] scan history cleanup failed: "
+            f"error_type={type(exc).__name__}",
+            file=sys.stderr,
+        )
 
 
 def prewarm_full_market_klines(
@@ -1639,6 +1810,62 @@ def main():
     sector_tide_enabled = bool(SECTOR_TIDE_STRATEGY_IDS.intersection(scorers))
     niuone_enabled = bool(NIUONE_STRATEGY_IDS.intersection(scorers))
     zettaranc_enabled = bool(ZETTARANC_STRATEGY_IDS.intersection(scorers))
+    preset_text_enabled = STRATEGY_SUITE_PRESET_TEXT in scorers
+    prompt_strategy_version: dict[str, Any] | None = None
+    prompt_strategy_store: PromptStrategyStore | None = None
+    prompt_runtime_data_context: dict[str, Any] = {}
+    prompt_selection_minimum_bars = DEFAULT_KLINE_COUNT
+    if preset_text_enabled:
+        prompt_strategy_store = PromptStrategyStore()
+        prompt_strategy_version = prompt_strategy_store.active_version()
+        if prompt_strategy_version is not None:
+            scorers = dict(scorers)
+            scorers[STRATEGY_SUITE_PRESET_TEXT] = (
+                lambda rows, version=prompt_strategy_version: score_prompt_selection(
+                    rows,
+                    version,
+                    data_context=prompt_runtime_data_context,
+                )
+            )
+            prompt_selection_minimum_bars = max(
+                1,
+                min(
+                    500,
+                    int(
+                        ((prompt_strategy_version.get("execution_plan") or {}).get(
+                            "stage_requirements"
+                        ) or {}).get("selection", {}).get(
+                            "minimum_bars",
+                            DEFAULT_KLINE_COUNT,
+                        )
+                    ),
+                ),
+            )
+            print(
+                "  Frozen prompt strategy: "
+                f"version={prompt_strategy_version.get('version_id')} "
+                f"plan={str(prompt_strategy_version.get('plan_sha256') or '')[:12]}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "  No activated prompt-strategy version; using legacy neutral candidate mode",
+                file=sys.stderr,
+            )
+    prompt_only_runtime = (
+        prompt_strategy_version is not None
+        and set(scorers) == {STRATEGY_SUITE_PRESET_TEXT}
+    )
+    prompt_selection_kline_count = prompt_selection_minimum_bars
+    if prompt_strategy_version is not None and str(
+        (((prompt_strategy_version.get("execution_plan") or {}).get("strategy") or {}).get(
+            "data_contract"
+        ) or {}).get("bar_status") or "closed"
+    ) == "closed":
+        prompt_selection_kline_count = min(
+            501,
+            prompt_selection_minimum_bars + 1,
+        )
     if niuone_mainline_only:
         print("  Independent theme-strength research mode; trading suite is ignored", file=sys.stderr)
     configured_universe = configured_stock_universe()
@@ -1720,16 +1947,20 @@ def main():
     except Exception:
         pass
 
-    if niuone_enabled:
+    if niuone_enabled or preset_text_enabled:
         to_analyze = filter_niuone_reference_candidates(
             candidates,
             tencent_keys,
             quotes,
         )
-        context_candidates = [
-            (code, name, quotes.get(tencent_keys.get(code, ""), {}))
-            for code, name in reference_candidates
-        ]
+        context_candidates = (
+            [
+                (code, name, quotes.get(tencent_keys.get(code, ""), {}))
+                for code, name in reference_candidates
+            ]
+            if niuone_enabled
+            else to_analyze
+        )
     else:
         liquid = filter_high_liquidity_candidates(candidates, tencent_keys, quotes)
         to_analyze = liquid[:MAX_TRADE_ANALYSIS_COUNT]
@@ -1739,6 +1970,12 @@ def main():
             f"  牛牛 full-market deep analysis: {len(context_candidates)} stocks "
             f"(no turnover/change filter); configured trade pool has "
             f"{len(to_analyze)} stocks with usable quotes",
+            file=sys.stderr,
+        )
+    elif preset_text_enabled:
+        print(
+            f"  Preset-text neutral deep analysis: {len(to_analyze)} stocks "
+            f"with usable quotes; no built-in strategy entry threshold is applied",
             file=sys.stderr,
         )
     else:
@@ -1787,6 +2024,11 @@ def main():
     scan_as_of_date, scan_previous_trading_day = resolve_quote_trading_dates(
         reference_quotes if niuone_enabled else quotes
     )
+    prompt_runtime_data_context.update({
+        "expected_closed_date": scan_previous_trading_day,
+        "expected_live_date": scan_as_of_date,
+        "evaluated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    })
     if kline_cache_enabled:
         accepted_cache_dates = {
             value
@@ -1798,8 +2040,16 @@ def main():
                 needed_kline_symbols,
                 path=kline_cache_path(),
                 accepted_last_dates=accepted_cache_dates,
-                min_rows=30,
-                count=DEFAULT_KLINE_COUNT,
+                min_rows=(
+                    prompt_selection_minimum_bars
+                    if prompt_strategy_version is not None
+                    else 30
+                ),
+                count=(
+                    prompt_selection_kline_count
+                    if prompt_strategy_version is not None
+                    else DEFAULT_KLINE_COUNT
+                ),
             )
         except Exception as exc:
             print(
@@ -1864,7 +2114,15 @@ def main():
         if not pending:
             return 0
         try:
-            stored = store_kline_series(pending, path=kline_cache_path())
+            stored = store_kline_series(
+                pending,
+                path=kline_cache_path(),
+                limit=(
+                    prompt_selection_kline_count
+                    if prompt_strategy_version is not None
+                    else DEFAULT_KLINE_COUNT
+                ),
+            )
             print(f"  Daily K-line SQLite cache filled from fallback: {stored}", file=sys.stderr)
             return stored
         except Exception as exc:
@@ -1948,6 +2206,17 @@ def main():
                 industry=industry,
                 historical_rows=historical_rows,
                 fetched_callback=remember_fetched_klines,
+                kline_count=(
+                    prompt_selection_kline_count
+                    if prompt_strategy_version is not None
+                    else DEFAULT_KLINE_COUNT
+                ),
+                enrich_legacy_indicators=not prompt_only_runtime,
+                minimum_rows=(
+                    prompt_selection_minimum_bars
+                    if prompt_strategy_version is not None
+                    else 30
+                ),
             )
             return item, rows
 
@@ -2110,6 +2379,17 @@ def main():
                 fetched_callback=remember_fetched_klines,
                 context=strategy_context,
                 scorers=scorers,
+                kline_count=(
+                    prompt_selection_kline_count
+                    if prompt_strategy_version is not None
+                    else DEFAULT_KLINE_COUNT
+                ),
+                enrich_legacy_indicators=not prompt_only_runtime,
+                minimum_rows=(
+                    prompt_selection_minimum_bars
+                    if prompt_strategy_version is not None
+                    else 30
+                ),
             )
         except Exception as exc:
             print(
@@ -2208,6 +2488,14 @@ def main():
             "j_recovering": best.get("j_recovering", False),
             "j_oversold": best.get("j_oversold", False),
             "risk_flags": best.get("risk_flags", []),
+            "return_5d_pct": best.get("return_5d_pct"),
+            "return_20d_pct": best.get("return_20d_pct"),
+            "distance_ema20_pct": best.get("distance_ema20_pct"),
+            "distance_bbi_pct": best.get("distance_bbi_pct"),
+            "distance_high_20d_pct": best.get("distance_high_20d_pct"),
+            "volume_ratio_5d": best.get("volume_ratio_5d"),
+            "volatility_20d_pct": best.get("volatility_20d_pct"),
+            "above_ema20": best.get("above_ema20"),
             "change_pct": q.get("change_pct"),
             # multi-strategy fields
             "best_strategy": best_strategy,
@@ -2221,6 +2509,14 @@ def main():
             "time_stop": best.get("time_stop"),
             "actionable": best.get("actionable"),
             "hard_blockers": best.get("hard_blockers", []),
+            "prompt_strategy_version_id": best.get("prompt_strategy_version_id"),
+            "prompt_plan_sha256": best.get("prompt_plan_sha256"),
+            "prompt_rule_status": best.get("prompt_rule_status"),
+            "prompt_rule_evaluation": best.get("prompt_rule_evaluation"),
+            "prompt_rule_audit": best.get("prompt_rule_audit"),
+            "prompt_feature_metadata": best.get("prompt_feature_metadata"),
+            "prompt_feature_errors": best.get("prompt_feature_errors"),
+            "prompt_facts": best.get("prompt_facts"),
             "market_regime": best.get("market_regime"),
             "market_score": best.get("market_score"),
             "market_hard_stop": best.get("market_hard_stop"),
@@ -2277,6 +2573,25 @@ def main():
             "stock_leader_tier": best.get("stock_leader_tier"),
             "stock_strong": best.get("stock_strong"),
             "stock_strong_score": best.get("stock_strong_score"),
+            "stock_activity_gate_required": best.get(
+                "stock_activity_gate_required"
+            ),
+            "stock_activity_data_available": best.get(
+                "stock_activity_data_available"
+            ),
+            "stock_market_amount_percentile": best.get(
+                "stock_market_amount_percentile"
+            ),
+            "stock_theme_amount_percentile": best.get(
+                "stock_theme_amount_percentile"
+            ),
+            "stock_volume_participation_percentile": best.get(
+                "stock_volume_participation_percentile"
+            ),
+            "stock_activity_score": best.get("stock_activity_score"),
+            "stock_activity_confirmed": best.get(
+                "stock_activity_confirmed"
+            ),
             "stock_reversal_leader_rank": best.get("stock_reversal_leader_rank"),
             "stock_reversal_leader_tier": best.get("stock_reversal_leader_tier"),
             "stock_reversal_strong": best.get("stock_reversal_strong"),
@@ -2406,6 +2721,17 @@ def main():
         return (s, above, -dist)
 
     results.sort(key=sort_key, reverse=True)
+    if prompt_strategy_version is not None and prompt_strategy_store is not None:
+        prompt_audits = [
+            item["prompt_rule_audit"]
+            for item in results
+            if isinstance(item.get("prompt_rule_audit"), dict)
+        ]
+        if prompt_audits:
+            prompt_strategy_store.record_evaluations_batch(
+                str(prompt_strategy_version.get("version_id") or ""),
+                prompt_audits,
+            )
     if sector_tide_enabled and sector_tide_context is not None:
         report_scan_progress("news_precheck", stage_label="正在检查候选股消息面", total=SECTOR_TIDE_NEWS_PRECHECK_LIMIT)
         news_shortlist = [
@@ -2452,7 +2778,19 @@ def main():
             file=sys.stderr,
         )
     display_candidates = select_display_candidates(results)
-    trade_candidates = select_trade_candidates(results)
+    trade_candidates = select_trade_candidates(
+        results,
+        limit=(
+            int(
+                ((prompt_strategy_version.get("execution_plan") or {}).get("strategy") or {}).get(
+                    "candidate_limit",
+                    preset_text_candidate_limit(),
+                )
+            )
+            if prompt_strategy_version is not None
+            else preset_text_candidate_limit() if preset_text_enabled else None
+        ),
+    )
     annotate_candidate_industries(display_candidates, trade_candidates)
 
     print(f"  Analyzed: {len(results)} stocks", file=sys.stderr)
@@ -2504,6 +2842,13 @@ def main():
         "strategy_score_profiles": active_strategy_score_profiles(),
         "market_snapshot": market_snapshot,
     }
+    if prompt_strategy_version is not None:
+        output["prompt_strategy"] = {
+            "version_id": prompt_strategy_version.get("version_id"),
+            "revision": prompt_strategy_version.get("revision"),
+            "plan_sha256": prompt_strategy_version.get("plan_sha256"),
+            "engine_version": prompt_strategy_version.get("engine_version"),
+        }
     if sector_tide_context is not None:
         output["sector_tide_context"] = sector_tide_context
     if niuone_context is not None:

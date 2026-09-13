@@ -28,8 +28,21 @@ const modelTests = computed(() => (
 ))
 const iwencaiTest = computed(() => {
   const test = props.config.iwencai_test || {}
-  return test.group_slug === props.slug ? test : null
+  if (test.group_slug === props.slug) return test
+  return null
 })
+const reasoningCapabilities = computed(() => (
+  Array.isArray(props.config.reasoning_effort_capabilities)
+    ? props.config.reasoning_effort_capabilities
+    : []
+))
+
+function effortMappings(capability) {
+  const mappings = capability.mappings || {}
+  return Object.entries(mappings)
+    .map(([source, target]) => `${source} → ${target}`)
+    .join('，') || '无'
+}
 </script>
 
 <template>
@@ -37,7 +50,7 @@ const iwencaiTest = computed(() => {
     <div class="model-test-panel-head">
       <div>
         <div class="model-test-panel-title">模型连通性测试</div>
-        <div class="model-test-panel-note">测试页面当前填写值，不会自动保存；API Key 留空时安全复用已保存密钥。</div>
+        <div class="model-test-panel-note">测试页面当前填写值（包括流式模式和思考强度），不会自动保存；成功仅表示网关接受当前请求配置。API Key 留空时安全复用已保存密钥。</div>
       </div>
     </div>
     <div class="model-test-list">
@@ -67,6 +80,34 @@ const iwencaiTest = computed(() => {
         </div>
       </div>
     </div>
+    <details v-if="reasoningCapabilities.length" class="reasoning-effort-reference">
+      <summary>查看常见模型思考强度表</summary>
+      <div class="reasoning-effort-table-wrap">
+        <table class="reasoning-effort-table">
+          <thead>
+            <tr>
+              <th>模型</th>
+              <th>允许填写</th>
+              <th>兼容映射</th>
+              <th>默认</th>
+              <th>说明</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="capability in reasoningCapabilities" :key="capability.key">
+              <td>
+                <a :href="capability.source_url" target="_blank" rel="noopener noreferrer">{{ capability.models }}</a>
+              </td>
+              <td><code>{{ capability.accepted_efforts.join(', ') || '仅可留空' }}</code></td>
+              <td>{{ effortMappings(capability) }}</td>
+              <td><code>{{ capability.default_effort || '未注明' }}</code></td>
+              <td>{{ capability.note || '—' }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="model-test-panel-note">表格核对日期：{{ reasoningCapabilities[0]?.verified_on }}。表外模型按自定义网关处理，不做固定白名单限制。</div>
+    </details>
   </section>
 
   <section v-if="iwencaiTest" class="model-test-panel" aria-label="问财接口连通性测试">
@@ -80,7 +121,7 @@ const iwencaiTest = computed(() => {
       <div class="model-test-row">
         <div class="model-test-copy">
           <div class="model-test-label">{{ iwencaiTest.label || '问财接口' }}</div>
-          <div class="model-test-description">{{ iwencaiTest.description || '验证问财网关地址和 API Key。' }}</div>
+          <div class="model-test-description">{{ iwencaiTest.description || '验证问财行情接口；开启预检时同时验证三个消息面技能。' }}</div>
         </div>
         <div class="model-test-action">
           <button

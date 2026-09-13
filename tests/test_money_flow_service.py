@@ -202,13 +202,64 @@ class MoneyFlowServiceTests(unittest.TestCase):
         self.assertEqual([row["name"] for row in payload["outflow"][:2]], ["负10", "负9"])
         self.assertNotIn("零", {row["name"] for row in payload["inflow"] + payload["outflow"]})
 
-    def test_download_json_retries_once_with_bounded_curl_runner(self):
+    def test_compute_retries_transient_zero_main_net_snapshot(self):
+        zero_rows = [
+            eastmoney_row(f"ZERO{i}", f"零行业{i}", 0)
+            for i in range(20)
+        ]
+        valid_rows = [
+            *(eastmoney_row(f"P{i}", f"正{i}", i * 100_000_000) for i in range(1, 11)),
+            *(eastmoney_row(f"N{i}", f"负{i}", -i * 100_000_000) for i in range(1, 11)),
+        ]
+        snapshots = [zero_rows, valid_rows]
+        calls = []
+        sleeps = []
+
+        def fake_fetch_page(page):
+            calls.append(page)
+            return snapshots.pop(0), 20
+
+        with patch.object(money_flow_service, "_fetch_page", side_effect=fake_fetch_page):
+            payload = money_flow_service._compute(sleep=sleeps.append)
+
+        self.assertEqual(calls, [1, 1])
+        self.assertEqual(sleeps, [money_flow_service.SNAPSHOT_RETRY_DELAYS_SECONDS[0]])
+        self.assertEqual(payload["count"], 20)
+        self.assertEqual(len(payload["inflow"]), 10)
+        self.assertEqual(len(payload["outflow"]), 10)
+
+    def test_compute_stops_retrying_persistently_incomplete_snapshots(self):
+        zero_rows = [
+            eastmoney_row(f"ZERO{i}", f"零行业{i}", 0)
+            for i in range(20)
+        ]
+        calls = []
+        sleeps = []
+
+        def fake_fetch_page(page):
+            calls.append(page)
+            return zero_rows, 20
+
+        with patch.object(money_flow_service, "_fetch_page", side_effect=fake_fetch_page):
+            with self.assertRaisesRegex(RuntimeError, "returned only 0 usable rows"):
+                money_flow_service._compute(sleep=sleeps.append)
+
+        self.assertEqual(
+            len(calls),
+            len(money_flow_service.SNAPSHOT_RETRY_DELAYS_SECONDS) + 1,
+        )
+        self.assertEqual(
+            sleeps,
+            list(money_flow_service.SNAPSHOT_RETRY_DELAYS_SECONDS),
+        )
+
+    def test_download_json_retries_with_bounded_curl_runner(self):
         calls = []
         sleeps = []
 
         def fake_runner(command, **kwargs):
             calls.append((command, kwargs))
-            if len(calls) == 1:
+            if len(calls) < 3:
                 return SimpleNamespace(returncode=28, stdout=b"", stderr=b"timeout")
             return SimpleNamespace(
                 returncode=0,
@@ -224,11 +275,43 @@ class MoneyFlowServiceTests(unittest.TestCase):
         )
 
         self.assertEqual(payload["data"]["total"], 1)
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(sleeps, [0.25])
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(
+            sleeps,
+            list(money_flow_service.REQUEST_RETRY_DELAYS_SECONDS),
+        )
         self.assertEqual(calls[0][1]["timeout"], money_flow_service.REQUEST_TIMEOUT_SECONDS + 2)
         self.assertIn("--connect-timeout", calls[0][0])
         self.assertIn("--max-time", calls[0][0])
+
+    def test_download_json_retries_semantically_incomplete_payload(self):
+        calls = []
+        sleeps = []
+
+        def fake_runner(command, **kwargs):
+            calls.append((command, kwargs))
+            data = (
+                None
+                if len(calls) == 1
+                else {"total": 1, "diff": [{"f12": "BK0001"}]}
+            )
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"data": data}).encode("utf-8"),
+                stderr=b"",
+            )
+
+        payload = money_flow_service._download_json(
+            "https://example.test/data",
+            runner=fake_runner,
+            sleep=sleeps.append,
+            curl_path="/usr/bin/curl",
+            validate_payload=money_flow_service._validate_page_payload,
+        )
+
+        self.assertEqual(payload["data"]["total"], 1)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(sleeps, [money_flow_service.REQUEST_RETRY_DELAYS_SECONDS[0]])
 
     def test_new_cache_name_does_not_reuse_legacy_total_flow_file(self):
         self.assertEqual(money_flow_service.CACHE_TTL, 60)

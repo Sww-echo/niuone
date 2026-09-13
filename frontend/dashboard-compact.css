@@ -1,0 +1,184 @@
+/* Compact desktop density shared by the standard light and dark themes. */
+@media (min-width:721px) {
+  html:not([data-theme="tongdaxin"]) main {
+    padding:6px max(clamp(9px,1.8vw,24px),calc((100vw - 1440px) / 2)) 18px;
+    font-size:12px;
+  }
+
+  html:not([data-theme="tongdaxin"]) :is(.feed,.indices-page,.industry-flow-page,.mainline-page) { gap:6px; }
+  html:not([data-theme="tongdaxin"]) :is(.card,.sector-cloud) {
+    border-radius:8px;
+    padding:9px;
+    box-shadow:none;
+  }
+  html:not([data-theme="tongdaxin"]) .sector-cloud { margin-bottom:6px !important; }
+  html:not([data-theme="tongdaxin"]) :is(.loading,.empty) { padding:12px 8px !important; font-size:12px !important; }
+
+  html:not([data-theme="tongdaxin"]) :is(
+    .practice-account-head,
+    .mainline-heading,
+    .indices-part-head,
+    .industry-flow-heading,
+    .dragon-tiger-head,
+    .rating-table-title
+  ) {
+    min-height:34px;
+    align-items:center;
+  }
+  html:not([data-theme="tongdaxin"]) :is(
+    .practice-account-head h3,
+    .mainline-heading h2,
+    .indices-part-title,
+    .industry-flow-heading h2,
+    .dragon-tiger-head h2,
+    .rating-table-title
+  ) { font-size:14px; line-height:1.25; }
+  html:not([data-theme="tongdaxin"]) :is(
+    .mainline-heading p,
+    .industry-flow-heading p,
+    .dragon-tiger-sub,
+    .rating-table-title small
+  ) { margin-top:2px; font-size:10px; line-height:1.35; }
+
+  html:not([data-theme="tongdaxin"]) :is(
+    .practice-manual-cycle-btn,
+    .practice-market-summary-btn,
+    .practice-market-summary-view-btn,
+    .practice-calendar-open-btn,
+    .practice-rule-btn,
+    .mainline-actions button,
+    .market-day-btn,
+    .dragon-tiger-date-controls button
+  ) { min-height:26px; padding:3px 7px; font-size:11px; }
+
+  /* Simulated trading */
+  html:not([data-theme="tongdaxin"]) .practice-account-head { gap:7px; }
+  html:not([data-theme="tongdaxin"]) .practice-account-actions { gap:5px; }
+  html:not([data-theme="tongdaxin"]) .practice-data-readiness { margin:5px 0; padding:7px 9px; font-size:11px; }
+  html:not([data-theme="tongdaxin"]) .practice-data-readiness p { margin-top:4px; }
+  html:not([data-theme="tongdaxin"]) .practice-data-progress { height:3px; margin-top:5px; }
+  html:not([data-theme="tongdaxin"]) .practice-stats { gap:5px !important; margin:6px 0 !important; }
+  html:not([data-theme="tongdaxin"]) .practice-stats .inline-field { min-height:46px; padding:6px 8px; border-radius:8px; }
+  html:not([data-theme="tongdaxin"]) .inline-label { margin-bottom:1px; font-size:10px; }
+  html:not([data-theme="tongdaxin"]) .inline-value { font-size:13px; line-height:1.3; }
+  html:not([data-theme="tongdaxin"]) .practice-chart-card { margin:6px 0; padding:8px 9px 6px; border-radius:10px; box-shadow:none; }
+  html:not([data-theme="tongdaxin"]) .practice-chart-head { gap:7px; margin-bottom:4px; }
+  html:not([data-theme="tongdaxin"]) .practice-chart-title-row { gap:5px; }
+  html:not([data-theme="tongdaxin"]) .practice-chart-title { font-size:12px; }
+  html:not([data-theme="tongdaxin"]) .practice-chart-sub { margin-top:1px; font-size:9px; }
+  html:not([data-theme="tongdaxin"]) .practice-chart-kpis { gap:4px; }
+  html:not([data-theme="tongdaxin"]) .practice-kpi { min-width:70px; padding:4px 6px; border-radius:8px; }
+  html:not([data-theme="tongdaxin"]) .practice-kpi-value { font-size:12px; }
+  html:not([data-theme="tongdaxin"]) .practice-mode-control { padding:1px; }
+  html:not([data-theme="tongdaxin"]) .practice-mode-btn { min-height:20px; padding:3px 6px; }
+  html:not([data-theme="tongdaxin"]) .practice-chart-wrap { height:150px; }
+  html:not([data-theme="tongdaxin"]) .practice-positions-section { margin-top:6px; }
+  html:not([data-theme="tongdaxin"]) .practice-position-bar { gap:7px; margin-bottom:4px; padding:1px; }
+  html:not([data-theme="tongdaxin"]) .practice-position-context,
+  html:not([data-theme="tongdaxin"]) .practice-position-toolbar { gap:5px; }
+  html:not([data-theme="tongdaxin"]) .practice-position-heading-copy h4 { font-size:12px; }
+  html:not([data-theme="tongdaxin"]) :is(.position-card-list,.position-brief-grid) { gap:4px; margin-bottom:6px; }
+  html:not([data-theme="tongdaxin"]) :is(.position-card,.position-brief-card) { padding:7px 8px; border-radius:8px; }
+  html:not([data-theme="tongdaxin"]) .position-card > div:first-child { margin-bottom:4px !important; }
+  html:not([data-theme="tongdaxin"]) .position-card > div:first-child > span:first-child { font-size:13px !important; }
+  html:not([data-theme="tongdaxin"]) .position-metrics { grid-template-columns:repeat(8,minmax(76px,1fr)); gap:4px 7px; }
+  html:not([data-theme="tongdaxin"]) .position-label { font-size:9px; }
+  html:not([data-theme="tongdaxin"]) .position-value { margin-top:1px; font-size:11px; }
+  html:not([data-theme="tongdaxin"]) .position-reason-block { margin-top:4px; gap:3px; font-size:10px; line-height:1.35; }
+  html:not([data-theme="tongdaxin"]) .practice-log-panel { margin-top:6px; border-radius:8px; box-shadow:none; }
+  html:not([data-theme="tongdaxin"]) .practice-log-head { padding:6px 8px; }
+  html:not([data-theme="tongdaxin"]) .practice-log-scroll { max-height:180px; gap:3px; padding:4px; }
+  html:not([data-theme="tongdaxin"]) .practice-log-row { padding:5px 7px; border-radius:7px; }
+
+  /* Indices, market breadth, and capital flow */
+  html:not([data-theme="tongdaxin"]) .indices-switch { width:100%; gap:2px; padding:2px; border-radius:9px; }
+  html:not([data-theme="tongdaxin"]) .indices-switch-btn { min-height:28px; padding:5px 9px; border-radius:7px; font-size:12px; }
+  html:not([data-theme="tongdaxin"]) .indices-part { gap:5px; }
+  html:not([data-theme="tongdaxin"]) .indices-part-title-row { gap:6px; }
+  html:not([data-theme="tongdaxin"]) .indices-part-meta { font-size:10px; }
+  html:not([data-theme="tongdaxin"]) .indices-market-stack { gap:7px; }
+  html:not([data-theme="tongdaxin"]) .market-strip { gap:6px; margin-bottom:6px; padding-bottom:2px; }
+  html:not([data-theme="tongdaxin"]) .index-card { min-width:126px; padding:7px 9px; border-radius:9px; box-shadow:none; }
+  html:not([data-theme="tongdaxin"]) .index-price { margin-top:2px; font-size:17px; }
+  html:not([data-theme="tongdaxin"]) .index-change { font-size:11px; }
+  html:not([data-theme="tongdaxin"]) .sparkline { height:30px; margin-top:3px; }
+  html:not([data-theme="tongdaxin"]) .market-breadth-card { margin-top:5px; padding:8px 9px 7px; border-radius:9px; box-shadow:none; }
+  html:not([data-theme="tongdaxin"]) .market-breadth-head { gap:7px; }
+  html:not([data-theme="tongdaxin"]) .market-breadth-head h3 { font-size:13px; }
+  html:not([data-theme="tongdaxin"]) .market-breadth-controls { padding:2px; }
+  html:not([data-theme="tongdaxin"]) .market-breadth-toggle { min-height:23px; padding:3px 6px; }
+  html:not([data-theme="tongdaxin"]) .industry-flow-page { gap:6px; }
+  html:not([data-theme="tongdaxin"]) :is(.industry-flow-hero,.industry-flow-details) { border-radius:8px; box-shadow:none; }
+  html:not([data-theme="tongdaxin"]) .industry-flow-heading { gap:10px; padding:8px 10px; }
+  html:not([data-theme="tongdaxin"]) .industry-flow-eyebrow { margin-bottom:2px; font-size:9px; }
+  html:not([data-theme="tongdaxin"]) .industry-flow-kpis { gap:5px; padding:7px 10px; }
+  html:not([data-theme="tongdaxin"]) .industry-flow-kpi { gap:3px; padding:6px 8px; }
+  html:not([data-theme="tongdaxin"]) .industry-flow-kpi b { font-size:14px; }
+  html:not([data-theme="tongdaxin"]) .industry-flow-kpi.balance b { font-size:12px; }
+  html:not([data-theme="tongdaxin"]) .industry-flow-toolbar { gap:7px; padding:6px 10px 2px; }
+  html:not([data-theme="tongdaxin"]) .flow-bars-stage { margin:2px 8px 0; padding:2px 2px 5px; }
+  html:not([data-theme="tongdaxin"]) .industry-flow-progress { padding:6px 10px 8px; }
+
+  /* Mainline rankings */
+  html:not([data-theme="tongdaxin"]) .mainline-hero { padding:8px; border-radius:8px; box-shadow:none; }
+  html:not([data-theme="tongdaxin"]) .mainline-heading { gap:8px; }
+  html:not([data-theme="tongdaxin"]) .mainline-heading h2 { margin-bottom:2px; }
+  html:not([data-theme="tongdaxin"]) .mainline-actions { gap:5px; }
+  html:not([data-theme="tongdaxin"]) .mainline-summary-grid { gap:5px; margin-top:7px; }
+  html:not([data-theme="tongdaxin"]) .mainline-summary-card { padding:7px 8px; border-radius:8px; }
+  html:not([data-theme="tongdaxin"]) .mainline-summary-card > span { font-size:10px; }
+  html:not([data-theme="tongdaxin"]) .mainline-summary-card strong { margin:3px 0 2px; font-size:14px; }
+  html:not([data-theme="tongdaxin"]) .mainline-summary-card small { font-size:9px; }
+  html:not([data-theme="tongdaxin"]) .mainline-section { margin-top:7px; }
+  html:not([data-theme="tongdaxin"]) .theme-rankings { gap:6px; }
+  html:not([data-theme="tongdaxin"]) .theme-ranking-panel { border-radius:8px; box-shadow:none; }
+  html:not([data-theme="tongdaxin"]) .theme-ranking-head { padding:6px 8px; }
+  html:not([data-theme="tongdaxin"]) .theme-ranking-head h4 { font-size:12px; }
+  html:not([data-theme="tongdaxin"]) .theme-row { height:60px; gap:3px 8px; padding:5px 8px; }
+
+  /* Monitoring feeds */
+  html:not([data-theme="tongdaxin"]) .market-monitor-grid { gap:5px; }
+  html:not([data-theme="tongdaxin"]) :is(.market-monitor-card,.us-market-summary-card) { border-radius:9px; box-shadow:none; }
+  html:not([data-theme="tongdaxin"]) :is(.market-card-head,.us-market-head) { gap:7px; padding:8px 10px; }
+  html:not([data-theme="tongdaxin"]) :is(.market-card-title,.us-market-title) { font-size:12px; }
+  html:not([data-theme="tongdaxin"]) :is(.market-card-preview,.us-market-preview) { margin-top:3px; font-size:11px; line-height:1.4; }
+  html:not([data-theme="tongdaxin"]) .market-chip-row { gap:3px; margin-top:5px; }
+  html:not([data-theme="tongdaxin"]) .market-chip { padding:2px 6px; font-size:9px; }
+  html:not([data-theme="tongdaxin"]) .market-card-detail { padding:0 10px 9px; }
+  html:not([data-theme="tongdaxin"]) .market-detail-box { gap:6px; padding-top:7px; }
+  html:not([data-theme="tongdaxin"]) .market-detail-overview { gap:0; padding:0; }
+  html:not([data-theme="tongdaxin"]) .market-section-list { gap:6px; }
+  html:not([data-theme="tongdaxin"]) .market-section-head { padding:5px 8px; }
+  html:not([data-theme="tongdaxin"]) .market-section-body { padding:3px 8px 5px; }
+  html:not([data-theme="tongdaxin"]) .market-detail-line { font-size:11px; line-height:1.4; }
+  html:not([data-theme="tongdaxin"]) .market-day-pager { gap:7px; margin-top:6px; padding:7px 9px; }
+  html:not([data-theme="tongdaxin"]) .market-day-title { font-size:12px; }
+  html:not([data-theme="tongdaxin"]) .market-day-sub { margin-top:1px; font-size:10px; }
+
+  /* Dragon Tiger and US rating tables */
+  html:not([data-theme="tongdaxin"]) .dragon-tiger-panel { max-width:none; margin:0; padding:0; }
+  html:not([data-theme="tongdaxin"]) .dragon-tiger-head { gap:8px; padding:7px 9px; }
+  html:not([data-theme="tongdaxin"]) .dragon-tiger-head-actions { display:flex; align-items:center; gap:5px; }
+  html:not([data-theme="tongdaxin"]) .dragon-tiger-date-controls input { min-height:25px; padding:3px 6px; }
+  html:not([data-theme="tongdaxin"]) .dragon-tiger-status { padding:3px 6px; }
+  html:not([data-theme="tongdaxin"]) .dragon-tiger-list-head,
+  html:not([data-theme="tongdaxin"]) .dragon-tiger-item > summary { min-height:32px; gap:7px; padding:6px 28px 6px 9px; }
+  html:not([data-theme="tongdaxin"]) .dragon-tiger-item > summary::after { right:10px; font-size:16px; }
+  html:not([data-theme="tongdaxin"]) .dragon-tiger-detail { padding:7px 9px; }
+  html:not([data-theme="tongdaxin"]) .dragon-tiger-detail-meta { margin-bottom:6px; }
+  html:not([data-theme="tongdaxin"]) .dragon-tiger-detail-meta > span { padding:6px 8px; }
+  html:not([data-theme="tongdaxin"]) .dragon-tiger-unavailable { margin:6px; padding:12px; }
+
+  html:not([data-theme="tongdaxin"]) .rating-card { padding:0; }
+  html:not([data-theme="tongdaxin"]) .rating-table-wrap { border-radius:9px; }
+  html:not([data-theme="tongdaxin"]) .rating-table-title { gap:8px; padding:7px 9px; }
+  html:not([data-theme="tongdaxin"]) .rating-table { font-size:13px; }
+  html:not([data-theme="tongdaxin"]) .rating-table td,
+  html:not([data-theme="tongdaxin"]) .rating-table th { padding:6px 9px; }
+  html:not([data-theme="tongdaxin"]) .rating-table th { font-size:11px; }
+  html:not([data-theme="tongdaxin"]) .rating-table .ticker { font-size:14px; }
+  html:not([data-theme="tongdaxin"]) .rating-action-inline { font-size:10px; }
+  html:not([data-theme="tongdaxin"]) .rating-inline-detail { gap:7px; padding:9px 10px; }
+  html:not([data-theme="tongdaxin"]) .rating-inline-grid { gap:6px; }
+  html:not([data-theme="tongdaxin"]) .rating-inline-grid .inline-field { padding:7px 8px; border-radius:8px; }
+}

@@ -15,8 +15,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "app"
+COMPAT = APP / "compat"
 if str(APP) not in sys.path:
     sys.path.insert(0, str(APP))
+if str(COMPAT) not in sys.path:
+    sys.path.insert(0, str(COMPAT))
 
 import notifications  # noqa: E402
 
@@ -40,6 +43,7 @@ def sample_trades() -> list[dict]:
             "price": 10.123,
             "amount": 1012.3,
             "fee": 0.11,
+            "order_position_pct": 1.01,
             "position_after_trade_pct": 3.21,
             "buy_strategy": "trend_pullback",
             "reason": "趋势回踩确认",
@@ -53,8 +57,11 @@ def sample_trades() -> list[dict]:
             "price": 12.5,
             "amount": 2500,
             "fee": 1.27,
+            "order_position_pct": 2.5,
             "pnl": 215.5,
             "pnl_pct": 9.43,
+            "cumulative_realized_pnl": 215.5,
+            "realized_return_pct": 4.72,
             "exit_rule": "time_stop",
             "reason": "尾盘时间止损检查",
         },
@@ -176,17 +183,72 @@ class NotificationTests(unittest.TestCase):
         calls = {call["channel"]: call for call in transport.calls}
         self.assertTrue(all(call["timeout"] == 7 for call in transport.calls))
 
-        message = calls["feishu"]["payload"]["content"]["text"]
-        self.assertIn("牛牛1号模拟成交（2笔）", message)
-        self.assertIn("模拟成交，非实盘", message)
-        self.assertIn("买入 平安银行(000001)", message)
-        self.assertIn("卖出 浦发银行(600000)", message)
-        self.assertIn("盈亏 ¥215.50 / 9.43%", message)
-        self.assertEqual(calls["dingtalk"]["payload"]["text"]["content"], message)
-        self.assertEqual(calls["wecom"]["payload"]["text"]["content"], message)
-        self.assertEqual(calls["telegram"]["payload"]["text"], message)
+        notification = notifications._trade_notification(sample_trades())
+        self.assertIsNotNone(notification)
+        plain_text = notification.plain_text()
+        self.assertIn("成交信息（2笔）", plain_text)
+        self.assertNotIn("牛牛1号", plain_text)
+        self.assertNotIn("模拟成交", plain_text)
+        self.assertNotIn("非实盘", plain_text)
+        self.assertIn("1. 买入｜平安银行（000001）", plain_text)
+        self.assertIn("成交：100 股 × ¥10.123", plain_text)
+        self.assertIn("金额：¥1,012.30\n本笔成交仓位：1.01%", plain_text)
+        self.assertNotIn("费用", plain_text)
+        self.assertNotIn("成交后仓位", plain_text)
+        self.assertIn("2. 卖出｜浦发银行（600000）", plain_text)
+        self.assertIn("已实现盈亏 / 收益率：+¥215.50（+4.72%）", plain_text)
 
         feishu_payload = calls["feishu"]["payload"]
+        self.assertEqual(feishu_payload["msg_type"], "interactive")
+        self.assertEqual(
+            feishu_payload["card"]["header"]["title"]["content"],
+            "成交信息（2笔）",
+        )
+        feishu_elements = feishu_payload["card"]["elements"]
+        self.assertEqual(
+            [element["tag"] for element in feishu_elements],
+            ["div", "div", "div", "hr", "div", "div", "div"],
+        )
+        self.assertEqual(
+            feishu_elements[0]["text"]["content"],
+            "**1. 平安银行（000001）**　<font color='red'>买入</font>",
+        )
+        buy_fields = feishu_elements[1]["fields"]
+        self.assertEqual(
+            [field["is_short"] for field in buy_fields],
+            [True, True, True, True],
+        )
+        self.assertEqual(buy_fields[0]["text"]["content"], "**成交数量**\n100 股")
+        self.assertEqual(buy_fields[1]["text"]["content"], "**成交价格**\n¥10.123")
+        self.assertEqual(buy_fields[2]["text"]["content"], "**成交金额**\n¥1,012.30")
+        self.assertEqual(buy_fields[3]["text"]["content"], "**本笔成交仓位**\n1.01%")
+        self.assertEqual(
+            feishu_elements[2]["text"]["content"],
+            "**时间**　2026-07-11 10:00:01\n"
+            "**策略**　trend\\_pullback\n"
+            "**理由**　趋势回踩确认",
+        )
+
+        dingtalk_payload = calls["dingtalk"]["payload"]
+        self.assertEqual(dingtalk_payload["msgtype"], "markdown")
+        self.assertEqual(dingtalk_payload["markdown"]["title"], "成交信息（2笔）")
+        dingtalk_markdown = dingtalk_payload["markdown"]["text"]
+        self.assertIn("### 成交信息（2笔）", dingtalk_markdown)
+        self.assertIn("**已实现盈亏 / 收益率**　+¥215.50（+4.72%）", dingtalk_markdown)
+        self.assertNotIn("费用", dingtalk_markdown)
+        self.assertNotIn("\n- **", dingtalk_markdown)
+
+        wecom_payload = calls["wecom"]["payload"]
+        self.assertEqual(wecom_payload, {
+            "msgtype": "markdown",
+            "markdown": {"content": dingtalk_markdown},
+        })
+
+        telegram_payload = calls["telegram"]["payload"]
+        self.assertEqual(telegram_payload["parse_mode"], "HTML")
+        self.assertIn("<b>成交信息（2笔）</b>", telegram_payload["text"])
+        self.assertIn("<b>成交</b>　100 股 × ¥10.123", telegram_payload["text"])
+
         feishu_timestamp = str(int(FIXED_TIME))
         feishu_key = f"{feishu_timestamp}\nfeishu-signing-secret".encode()
         expected_feishu_sign = base64.b64encode(
@@ -277,6 +339,32 @@ class NotificationTests(unittest.TestCase):
         self.assertEqual(results, [notifications.DeliveryResult("wecom", True, "")])
         self.assertEqual([call["channel"] for call in transport.calls], ["wecom"])
 
+    def test_sell_only_batch_is_sent_to_every_enabled_channel(self):
+        transport = RecordingTransport()
+
+        results = notifications.notify_trade_executions(
+            [sample_trades()[1]],
+            all_channels_env(signed=False),
+            transport=transport,
+        )
+
+        self.assertEqual(
+            [result.channel for result in results],
+            ["feishu", "dingtalk", "wecom", "telegram"],
+        )
+        self.assertTrue(all(result.ok for result in results), results)
+        calls = {call["channel"]: call for call in transport.calls}
+        feishu_json = json.dumps(calls["feishu"]["payload"], ensure_ascii=False)
+        self.assertIn("**1. 浦发银行（600000）**", feishu_json)
+        self.assertIn("<font color='green'>卖出</font>", feishu_json)
+        self.assertIn("+¥215.50（+4.72%）", feishu_json)
+        dingtalk_text = calls["dingtalk"]["payload"]["markdown"]["text"]
+        self.assertIn("卖出｜浦发银行（600000）", dingtalk_text)
+        self.assertIn("**卖出仓位（占总资产）**　**2.50%**", dingtalk_text)
+        self.assertIn("**已实现盈亏 / 收益率**　+¥215.50（+4.72%）", dingtalk_text)
+        self.assertIn("卖出｜浦发银行（600000）", calls["wecom"]["payload"]["markdown"]["content"])
+        self.assertIn("卖出｜浦发银行（600000）", calls["telegram"]["payload"]["text"])
+
     def test_dispatch_to_channel_ignores_switches_and_sends_only_selected_channel_once(self):
         env = all_channels_env()
         env[notifications.GLOBAL_ENABLED_ENV] = "0"
@@ -293,6 +381,11 @@ class NotificationTests(unittest.TestCase):
 
         self.assertEqual(result, notifications.DeliveryResult("dingtalk", True, ""))
         self.assertEqual([call["channel"] for call in transport.calls], ["dingtalk"])
+        self.assertEqual(transport.calls[0]["payload"]["msgtype"], "text")
+        self.assertEqual(
+            transport.calls[0]["payload"]["text"]["content"],
+            "通知测试\n这是一条测试消息",
+        )
 
     def test_dispatch_to_channel_rejects_unknown_channel_without_request(self):
         transport = RecordingTransport()
@@ -532,15 +625,213 @@ class NotificationTests(unittest.TestCase):
         transport = RecordingTransport()
 
         results = notifications.notify_trade_executions(
-            [trade],
+            [trade] * 30,
             single_channel_env("wecom"),
             transport=transport,
         )
 
         self.assertTrue(results[0].ok)
+        self.assertEqual(transport.calls[0]["payload"]["msgtype"], "text")
         text = transport.calls[0]["payload"]["text"]["content"]
         self.assertLessEqual(len(text.encode("utf-8")), notifications.MAX_MESSAGE_BYTES)
         text.encode("utf-8").decode("utf-8")
+
+    def test_feishu_card_keeps_complete_trade_reason_beyond_shared_rich_text_limit(self):
+        trade = sample_trades()[1]
+        reason = "卖出理由需要保留完整上下文，包含趋势、板块、止损和仓位依据。" * 20
+        trade["reason"] = reason
+        transport = RecordingTransport()
+
+        results = notifications.notify_trade_executions(
+            [trade],
+            single_channel_env("feishu"),
+            transport=transport,
+        )
+
+        self.assertTrue(results[0].ok)
+        payload = transport.calls[0]["payload"]
+        self.assertEqual(payload["msg_type"], "interactive")
+        details = payload["card"]["elements"][2]["text"]["content"]
+        self.assertIn(f"**理由**　{reason}", details)
+        self.assertNotIn("…", details)
+        self.assertNotIn("内容已截断", details)
+
+    def test_feishu_splits_large_trade_batches_without_cutting_sections(self):
+        trade = sample_trades()[1]
+        reason = "完整卖出依据" * 150
+        trade["reason"] = reason
+        transport = RecordingTransport()
+
+        results = notifications.notify_trade_executions(
+            [dict(trade) for _ in range(20)],
+            single_channel_env("feishu"),
+            transport=transport,
+        )
+
+        self.assertTrue(results[0].ok)
+        self.assertGreater(len(transport.calls), 1)
+        heading_count = 0
+        reason_count = 0
+        for call in transport.calls:
+            payload = call["payload"]
+            self.assertEqual(payload["msg_type"], "interactive")
+            self.assertLessEqual(
+                len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")),
+                28 * 1024,
+            )
+            for element in payload["card"]["elements"]:
+                content = element.get("text", {}).get("content", "")
+                heading_count += content.count("<font color='green'>卖出</font>")
+                reason_count += content.count(f"**理由**　{reason}")
+        self.assertEqual(heading_count, 20)
+        self.assertEqual(reason_count, 20)
+
+    def test_rich_trade_content_escapes_provider_markup(self):
+        trade = sample_trades()[0]
+        trade["name"] = "<b>测试</b>"
+        trade["buy_strategy"] = "trend_pullback_*"
+        trade["reason"] = "[伪链接](https://example.invalid) > 非引用"
+        transport = RecordingTransport()
+
+        results = notifications.notify_trade_executions(
+            [trade],
+            all_channels_env(signed=False),
+            transport=transport,
+        )
+
+        self.assertTrue(all(result.ok for result in results), results)
+        calls = {call["channel"]: call for call in transport.calls}
+        feishu_json = json.dumps(calls["feishu"]["payload"], ensure_ascii=False)
+        self.assertIn("&lt;b&gt;测试&lt;/b&gt;", feishu_json)
+        self.assertNotIn("<b>测试</b>", feishu_json)
+        markdown = calls["dingtalk"]["payload"]["markdown"]["text"]
+        self.assertIn("&lt;b&gt;测试&lt;/b&gt;", markdown)
+        self.assertIn(r"trend\_pullback\_\*", markdown)
+        self.assertIn(r"\[伪链接\](https://example.invalid) &gt; 非引用", markdown)
+        telegram_html = calls["telegram"]["payload"]["text"]
+        self.assertIn("&lt;b&gt;测试&lt;/b&gt;", telegram_html)
+        self.assertNotIn("<b>测试</b>", telegram_html)
+
+    def test_only_order_position_above_ten_percent_is_highlighted(self):
+        for order_position_pct, expected_red in ((10.0, False), (10.01, True)):
+            with self.subTest(order_position_pct=order_position_pct):
+                trade = sample_trades()[0]
+                trade["order_position_pct"] = order_position_pct
+                trade["position_after_trade_pct"] = 20.0
+                transport = RecordingTransport()
+
+                results = notifications.notify_trade_executions(
+                    [trade],
+                    single_channel_env("feishu"),
+                    transport=transport,
+                )
+
+                self.assertTrue(results[0].ok)
+                fields = transport.calls[0]["payload"]["card"]["elements"][1]["fields"]
+                order_position_field = next(
+                    field for field in fields
+                    if "本笔成交仓位" in field["text"]["content"]
+                )
+                self.assertFalse(any(
+                    "成交后仓位" in field["text"]["content"]
+                    for field in fields
+                ))
+                content = order_position_field["text"]["content"]
+                if expected_red:
+                    self.assertEqual(
+                        content,
+                        "<font color='red'>**本笔成交仓位**\n10.01%</font>",
+                    )
+                    notification = notifications._trade_notification([trade])
+                    self.assertIn("**本笔成交仓位**　**10.01%**", notification.markdown_text())
+                    self.assertIn("<b>本笔成交仓位　10.01%</b>", notification.html_text())
+                else:
+                    self.assertEqual(content, "**本笔成交仓位**\n10.00%")
+
+    def test_sell_ratio_and_full_exit_are_emphasized_in_every_channel(self):
+        for after, label, ratio in (
+            (200, "卖出50.00%持仓", "50.00%"),
+            (0, "清仓 · 卖出100%持仓", "100%"),
+        ):
+            with self.subTest(after=after):
+                trade = {
+                    **sample_trades()[1], "position_before_qty": 200 + after,
+                    "position_after_qty": after, "position_fully_closed": after == 0,
+                }
+                transport = RecordingTransport()
+                results = notifications.notify_trade_executions(
+                    [trade], all_channels_env(signed=False), transport=transport,
+                )
+                self.assertTrue(all(result.ok for result in results))
+                calls = {call["channel"]: call["payload"] for call in transport.calls}
+                feishu = calls["feishu"]["card"]["elements"]
+                self.assertIn(f"<font color='green'>**{label}**</font>", feishu[0]["text"]["content"])
+                notification = notifications._trade_notification([trade])
+                self.assertIn(f"{label}｜", notification.plain_text())
+                self.assertIn(f"卖出比例（占该股持仓）：{ratio}", notification.plain_text())
+                self.assertIn(f"卖后持股：{after:,} 股", notification.plain_text())
+                for markdown in (calls["dingtalk"]["markdown"]["text"], calls["wecom"]["markdown"]["content"]):
+                    self.assertIn(label, markdown)
+                    self.assertIn(f"**卖出比例（占该股持仓）**　**{ratio}**", markdown)
+                    self.assertIn("**卖出仓位（占总资产）**　**2.50%**", markdown)
+                self.assertIn(f"<b>卖出比例（占该股持仓）　{ratio}</b>", calls["telegram"]["text"])
+                self.assertIn("已实现盈亏 / 收益率", notification.plain_text())
+
+    def test_sell_status_uses_share_counts_and_never_rounded_equity_percent(self):
+        cases = (
+            ({"position_before_qty": 400}, "卖出50.00%持仓"),
+            ({"position_after_qty": 200}, "卖出50.00%持仓"),
+            ({"position_fully_closed": True}, "清仓 · 卖出100%持仓"),
+            ({"position_before_qty": 200, "position_after_qty": 0}, "清仓 · 卖出100%持仓"),
+            ({"position_after_trade_pct": 0}, "卖出｜"),
+            ({"position_before_qty": 400, "position_after_qty": 0}, "卖出｜"),
+            ({"position_before_qty": 100}, "卖出｜"),
+            ({"position_before_qty": "nan"}, "卖出｜"),
+            ({"position_after_qty": -1}, "卖出｜"),
+            ({"position_after_qty": 200, "position_fully_closed": True}, "卖出｜"),
+            ({"position_after_qty": 0, "position_fully_closed": False}, "卖出｜"),
+            ({"shares": 200.5, "position_fully_closed": True}, "卖出｜"),
+        )
+        for fields, expected in cases:
+            with self.subTest(fields=fields):
+                text = notifications._trade_notification([{**sample_trades()[1], **fields}]).plain_text()
+                self.assertIn(expected, text)
+                if expected == "卖出｜":
+                    self.assertNotIn("清仓", text)
+                    self.assertIn("卖出比例（占该股持仓）：暂不可用", text)
+
+    def test_partial_sell_cannot_round_to_full_exit(self):
+        trade = {**sample_trades()[1], "shares": 100000,
+                 "position_before_qty": 100001, "position_after_qty": 1,
+                 "position_after_trade_pct": 0.0}
+        text = notifications._trade_notification([trade]).plain_text()
+        self.assertIn("卖出<100%持仓", text)
+        self.assertIn("卖后持股：1 股", text)
+        self.assertNotIn("清仓", text)
+
+    def test_order_position_is_shown_and_highlighted(self):
+        trade = sample_trades()[0]
+        trade["order_position_pct"] = 12.5
+        trade["position_after_trade_pct"] = 20.0
+        transport = RecordingTransport()
+
+        results = notifications.notify_trade_executions(
+            [trade],
+            single_channel_env("feishu"),
+            transport=transport,
+        )
+
+        self.assertTrue(results[0].ok)
+        fields = transport.calls[0]["payload"]["card"]["elements"][1]["fields"]
+        contents = [field["text"]["content"] for field in fields]
+        self.assertIn(
+            "<font color='red'>**本笔成交仓位**\n12.50%</font>",
+            contents,
+        )
+        self.assertFalse(any("成交后仓位" in content for content in contents))
+        notification = notifications._trade_notification([trade])
+        self.assertIn("**本笔成交仓位**　**12.50%**", notification.markdown_text())
+        self.assertNotIn("成交后仓位", notification.markdown_text())
 
     def test_registry_can_extend_dispatch_without_changing_core(self):
         class CustomChannel:

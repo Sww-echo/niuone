@@ -18,13 +18,35 @@ class DecisionIntelligenceContextTests(unittest.TestCase):
     def setUp(self):
         self._fetch = trader.fetch_global_decision_sources
         self._enabled = trader.DECISION_INTELLIGENCE_ENABLED
+        self._news_enabled = trader.NEWSNOW_DECISION_ENABLED
+        self._load_realtime_news = trader.load_important_realtime_news_decision_context
 
     def tearDown(self):
         trader.fetch_global_decision_sources = self._fetch
         trader.DECISION_INTELLIGENCE_ENABLED = self._enabled
+        trader.NEWSNOW_DECISION_ENABLED = self._news_enabled
+        trader.load_important_realtime_news_decision_context = self._load_realtime_news
 
     def test_builds_prompt_with_global_market_channels(self):
         trader.DECISION_INTELLIGENCE_ENABLED = True
+        trader.NEWSNOW_DECISION_ENABLED = True
+        trader.load_important_realtime_news_decision_context = lambda *_args, **_kwargs: {
+            "enabled": True,
+            "available": True,
+            "status": "success",
+            "stale": False,
+            "target_trading_date": "2026-07-02",
+            "items": [
+                {
+                    "id": "cls-telegraph:policy",
+                    "source_name": "财联社电报",
+                    "title": "重要产业政策发布",
+                    "summary": "利好高端制造",
+                    "published_at": "2026-07-02T09:45:00+08:00",
+                    "decision_role": "intraday",
+                }
+            ],
+        }
 
         def fake_sources(force=False):
             return {
@@ -93,6 +115,8 @@ class DecisionIntelligenceContextTests(unittest.TestCase):
         prompt = trader.format_decision_intelligence_context_for_prompt(ctx)
 
         self.assertTrue(ctx["news_precheck"]["available"])
+        self.assertTrue(ctx["realtime_news"]["available"])
+        self.assertEqual(ctx["source_status"]["realtime_news"], "success")
         self.assertIn("上证指数-1.20%", prompt)
         self.assertIn("富时中国A50期货-1.10%", prompt)
         self.assertIn("隔夜美股：中性", prompt)
@@ -103,8 +127,12 @@ class DecisionIntelligenceContextTests(unittest.TestCase):
         self.assertIn("强势板块", prompt)
         self.assertIn("资金流入", prompt)
         self.assertIn("热门榜", prompt)
+        self.assertIn("【财经快讯重要信息】", prompt)
+        self.assertIn("重要产业政策发布", prompt)
+        self.assertIn("不能自行新增候选", prompt)
         self.assertIn("【综合决策参考】", prompt)
         self.assertIn("决策要求", prompt)
+        self.assertIn("预检失败、超时、未检查、待判断或不可用不是冲突信号", prompt)
 
     def test_disabled_context_formats_as_closed(self):
         self.assertEqual(

@@ -1,10 +1,22 @@
 <script setup>
-import { computed, nextTick, ref } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
+import {
+  commonReasoningEfforts,
+  reasoningCapabilityForModel,
+} from '../utils/modelReasoning.js'
 
 const props = defineProps({
   item: {
     type: Object,
     required: true,
+  },
+  reasoningModel: {
+    type: String,
+    default: '',
+  },
+  reasoningCapabilities: {
+    type: Array,
+    default: () => [],
   },
 })
 const emit = defineEmits(['field-change'])
@@ -14,27 +26,40 @@ const label = computed(() => String(props.item.label || props.item.name || '设�
 const fieldName = computed(() => `env__${name.value}`)
 const value = computed(() => String(props.item.file_value ?? ''))
 const kind = computed(() => String(props.item.kind || 'text'))
+const reasoningValue = ref(value.value)
+const normalizedReasoningModel = computed(() => String(props.reasoningModel || '').trim().toLowerCase())
+const reasoningCapability = computed(() => reasoningCapabilityForModel(
+  normalizedReasoningModel.value,
+  props.reasoningCapabilities,
+))
+const reasoningOptions = computed(() => reasoningCapability.value?.accepted_efforts || [])
+const commonReasoningOptions = computed(() => commonReasoningEfforts(props.reasoningCapabilities))
+const reasoningListId = computed(() => `${fieldName.value}__options`)
+const reasoningValueIsUnsupported = computed(() => (
+  Boolean(reasoningValue.value)
+  && Boolean(reasoningCapability.value)
+  && !reasoningOptions.value.includes(reasoningValue.value)
+))
+const boolNoDefault = computed(() => Boolean(props.item.bool_no_default))
 const boolValue = computed(() => {
-  const normalized = value.value.trim().toLowerCase()
+  const normalized = (
+    value.value.trim() || (boolNoDefault.value ? String(props.item.default ?? '').trim() : '')
+  ).toLowerCase()
   if (['1', 'true', 'yes', 'on'].includes(normalized)) return '1'
   return normalized === '' ? '' : '0'
 })
-const boolNoDefault = computed(() => (
-  name.value === 'DASHBOARD_US_FEATURES_ENABLED' || Boolean(props.item.bool_no_default)
-))
 const apiMode = computed(() => (
   ['auto', 'responses', 'chat'].includes(value.value) ? value.value : 'auto'
+))
+const streamMode = computed(() => (
+  ['auto', 'stream', 'non_stream'].includes(value.value) ? value.value : 'auto'
 ))
 const playbackSpeed = computed(() => (
   ['0.5', '0.75', '1', '1.5', '2', '5', '10'].includes(value.value) ? value.value : '0.5'
 ))
 const listValues = ref([
-  ...(String(props.item.kind || '') === 'time_list'
-    ? (props.item.time_values || [])
-    : (props.item.handle_values || [])),
+  ...(props.item.time_values || []),
 ])
-const listInputType = computed(() => kind.value === 'time_list' ? 'time' : 'text')
-const listLabel = computed(() => kind.value === 'time_list' ? '时间点' : '作者')
 const strategyOptions = computed(() => (
   kind.value === 'strategy_suite'
     ? (props.item.strategy_suite_options || [])
@@ -42,6 +67,30 @@ const strategyOptions = computed(() => (
 ))
 const selectedStrategies = computed(() => new Set(props.item.strategy_values || []))
 const selectedUniverse = computed(() => new Set(props.item.stock_universe_values || []))
+const newsSourceQuery = ref('')
+const newsSourceValues = ref([...(props.item.news_source_values || [])])
+let newsSourceServerValue = newsSourceValues.value.join(',')
+const newsSourceOptions = computed(() => props.item.news_source_options || [])
+const newsSourceGroups = computed(() => {
+  const query = newsSourceQuery.value.trim().toLocaleLowerCase()
+  const grouped = new Map()
+  newsSourceOptions.value.forEach(option => {
+    const searchable = [option.id, option.label, option.category_label]
+      .map(entry => String(entry || '').toLocaleLowerCase())
+      .join(' ')
+    if (query && !searchable.includes(query)) return
+    const category = String(option.category || 'other')
+    if (!grouped.has(category)) {
+      grouped.set(category, {
+        id: category,
+        label: String(option.category_label || '其他'),
+        options: [],
+      })
+    }
+    grouped.get(category).options.push(option)
+  })
+  return [...grouped.values()]
+})
 const textPreset = computed(() => kind.value === 'preset_strategy_text')
 const textMaxChars = computed(() => Number(
   textPreset.value
@@ -60,6 +109,28 @@ async function removeListValue(index) {
   await nextTick()
   emit('field-change')
 }
+
+async function resetNewsSources() {
+  newsSourceValues.value = [...(props.item.news_source_default_values || [])]
+  await nextTick()
+  emit('field-change')
+}
+
+function newsSourceIntervalText(value) {
+  const seconds = Number(value || 0)
+  if (seconds >= 60 && seconds % 60 === 0) return `${seconds / 60} 分钟`
+  return `${seconds} 秒`
+}
+
+watch(
+  () => (props.item.news_source_values || []).join(','),
+  nextValue => {
+    if (newsSourceValues.value.join(',') === newsSourceServerValue) {
+      newsSourceValues.value = nextValue ? nextValue.split(',') : []
+    }
+    newsSourceServerValue = nextValue
+  },
+)
 </script>
 
 <template>
@@ -77,7 +148,6 @@ async function removeListValue(index) {
     :name="fieldName"
     :aria-label="label"
     :value="boolValue"
-    :data-feature-toggle="name === 'DASHBOARD_US_FEATURES_ENABLED' ? 'us' : null"
   >
     <option v-if="!boolNoDefault" value="">默认</option>
     <option value="1">启用</option>
@@ -90,7 +160,56 @@ async function removeListValue(index) {
       <option value="responses">Responses API（搜索工具）</option>
       <option value="chat">Chat Completions（兼容模式）</option>
     </select>
-    <div class="config-meta">自动模式下，Grok 4.5 使用 Responses API，其他模型保持 Chat Completions</div>
+    <div class="config-meta">自动模式下，Grok 4.3/4.5、MiMo 2.5 和常用 Qwen Responses 型号使用 Responses API，其他模型保持 Chat Completions</div>
+  </template>
+
+  <template v-else-if="kind === 'reasoning_effort'">
+    <select
+      v-if="reasoningCapability"
+      v-model="reasoningValue"
+      :name="fieldName"
+      :aria-label="label"
+    >
+      <option value="">留空（使用模型默认）</option>
+      <option
+        v-if="reasoningValueIsUnsupported"
+        :value="reasoningValue"
+        disabled
+      >{{ reasoningValue }}（当前模型不支持）</option>
+      <option v-for="effort in reasoningOptions" :key="effort" :value="effort">
+        {{ effort }}
+      </option>
+    </select>
+    <input
+      v-else
+      v-model="reasoningValue"
+      type="text"
+      :name="fieldName"
+      :aria-label="label"
+      :list="normalizedReasoningModel ? reasoningListId : null"
+      maxlength="64"
+      placeholder="留空使用默认，例如 high、max、enabled"
+      autocomplete="off"
+      autocapitalize="none"
+      spellcheck="false"
+    >
+    <datalist v-if="normalizedReasoningModel && !reasoningCapability" :id="reasoningListId">
+      <option v-for="effort in commonReasoningOptions" :key="effort" :value="effort" />
+    </datalist>
+    <div v-if="reasoningCapability" class="config-meta">
+      已知常见模型会按本地能力表校验。已识别 {{ reasoningModel }}：{{ reasoningOptions.length ? `可选 ${reasoningOptions.join('、')}` : '固定思考模式，仅可留空' }}；留空使用模型默认
+    </div>
+    <div v-else-if="normalizedReasoningModel" class="config-meta">未匹配本地能力表，已列出常见候选值；仍可填写网关自定义强度并手动测试</div>
+    <div v-else class="config-meta">填写模型名称后会列出该模型全部可选思考强度；留空不发送参数</div>
+  </template>
+
+  <template v-else-if="kind === 'stream_mode'">
+    <select :name="fieldName" :aria-label="label" :value="streamMode">
+      <option value="auto">自动（推荐）</option>
+      <option value="stream">流式</option>
+      <option value="non_stream">非流式</option>
+    </select>
+    <div class="config-meta">自动模式默认使用非流式；如果网关明确要求 stream=true，会自动切换为流式。流式内容会在后端拼接完整后再校验和使用</div>
   </template>
 
   <template v-else-if="kind === 'playback_speed'">
@@ -109,32 +228,28 @@ async function removeListValue(index) {
     </div>
   </template>
 
-  <template v-else-if="kind === 'time_list' || kind === 'handle_list'">
+  <template v-else-if="kind === 'time_list'">
     <div
       class="time-list-control"
       data-time-list
       :data-field-name="fieldName"
-      :data-input-type="listInputType"
-      :data-placeholder="kind === 'handle_list' ? 'handle' : ''"
+      data-input-type="time"
       :data-input-label="label"
     >
       <input type="hidden" :name="fieldName" value="">
       <div class="time-list-grid" data-time-list-items>
         <div v-for="(entry, index) in listValues" :key="index" class="time-list-item">
           <input
-            :type="listInputType"
+            type="time"
             :name="fieldName"
             :aria-label="`${label} ${index + 1}`"
             v-model="listValues[index]"
-            :placeholder="kind === 'handle_list' ? 'handle' : null"
-            :autocapitalize="kind === 'handle_list' ? 'off' : null"
-            :spellcheck="kind === 'handle_list' ? 'false' : null"
           >
           <button
             type="button"
             class="time-list-remove"
             data-time-list-remove
-            :aria-label="`删除${listLabel}`"
+            aria-label="删除时间点"
             @click.stop="removeListValue(index)"
           >x</button>
         </div>
@@ -143,11 +258,66 @@ async function removeListValue(index) {
         type="button"
         class="time-list-add"
         data-time-list-add
-        :aria-label="`添加${listLabel}`"
+        aria-label="添加时间点"
         @click.stop="addListValue"
       >+</button>
     </div>
-    <div class="config-meta">{{ kind === 'time_list' ? '北京时间' : 'X/Twitter handle' }}</div>
+    <div class="config-meta">北京时间</div>
+  </template>
+
+  <template v-else-if="kind === 'news_sources'">
+    <div class="news-source-picker" data-news-source-picker>
+      <input type="hidden" :name="fieldName" value="">
+      <div class="news-source-toolbar">
+        <input
+          v-model="newsSourceQuery"
+          type="search"
+          :aria-label="`搜索${label}`"
+          placeholder="搜索来源名称"
+          autocomplete="off"
+          @input.stop
+        >
+        <span class="news-source-count" aria-live="polite">
+          已选择 <b>{{ newsSourceValues.length }}</b> / {{ newsSourceOptions.length }}
+        </span>
+        <button type="button" class="news-source-reset" @click.stop="resetNewsSources">
+          恢复默认来源
+        </button>
+      </div>
+      <div class="news-source-groups" role="group" :aria-label="label">
+        <section
+          v-for="group in newsSourceGroups"
+          :key="group.id"
+          class="news-source-group"
+          :data-news-source-category="group.id"
+        >
+          <div class="news-source-options">
+            <label
+              v-for="option in group.options"
+              :key="option.id"
+              class="news-source-option"
+              :class="{selected: newsSourceValues.includes(option.id)}"
+            >
+              <input
+                v-model="newsSourceValues"
+                type="checkbox"
+                :name="fieldName"
+                :value="option.id"
+                :aria-label="`${label}：${option.label || option.id}`"
+              >
+              <span class="news-source-option-copy">
+                <strong>{{ option.label || option.id }}</strong>
+                <small>上游约 {{ newsSourceIntervalText(option.interval_seconds) }}更新</small>
+              </span>
+            </label>
+          </div>
+        </section>
+        <div v-if="!newsSourceGroups.length" class="news-source-empty">
+          没有匹配的数据源
+        </div>
+      </div>
+    </div>
+    <div class="config-meta">至少选择一项；来源越多，首次刷新耗时和上游请求量越大</div>
   </template>
 
   <template v-else-if="kind === 'stock_universe'">

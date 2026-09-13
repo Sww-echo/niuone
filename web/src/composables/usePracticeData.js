@@ -349,6 +349,7 @@ async function triggerManualCycle() {
     stage: 'starting',
     stage_label: '正在启动',
     error: '',
+    notice: '',
   }
   try {
     state.manualCycle = await fetchJson('/api/niuniu_practice/manual-cycle', {
@@ -372,6 +373,7 @@ async function triggerManualCycle() {
       running: false,
       stage: 'error',
       stage_label: '启动失败',
+      notice: '',
       error: String(error?.message || error),
     }
     return false

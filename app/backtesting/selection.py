@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import math
 import statistics
+import sys
 import time
 from bisect import bisect_left
 from collections import Counter
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_UP
@@ -57,7 +58,29 @@ except ImportError:  # pragma: no cover - legacy top-level import path
 TRADING_DAYS_PER_YEAR = 252
 BUILTIN_STRATEGY_HISTORY_LIMIT = 120
 NIUONE_CONTEXT_WARMUP_SESSIONS = 60
+REPLAY_ETA_RECENT_SESSION_COUNT = 10
 DIAGNOSTIC_SCORE_THRESHOLD_OFFSETS = (-1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0)
+
+
+class _OwnedImmutableMapping(Mapping[Any, Any]):
+    """Read-only view over a dict whose ownership was transferred internally."""
+
+    __slots__ = ("_values",)
+
+    def __init__(self, values: dict[Any, Any]) -> None:
+        object.__setattr__(self, "_values", MappingProxyType(values))
+
+    def __getitem__(self, key: Any) -> Any:
+        return self._values[key]
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self._values)
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def __setattr__(self, _name: str, _value: Any) -> None:
+        raise AttributeError(f"{type(self).__name__} is immutable")
 
 
 def _diagnostic_blocker_family(reason: str) -> str:
@@ -140,12 +163,12 @@ def _optional_float(value: Any, *, field_name: str) -> float | None:
 
 def _date_text(value: Any) -> str:
     if isinstance(value, datetime):
-        return value.strftime("%Y-%m-%d")
+        return sys.intern(value.strftime("%Y-%m-%d"))
     if isinstance(value, date):
-        return value.isoformat()
+        return sys.intern(value.isoformat())
     text = str(value or "").strip()[:10]
     try:
-        return date.fromisoformat(text).isoformat()
+        return sys.intern(date.fromisoformat(text).isoformat())
     except ValueError:
         raise SelectionBacktestError(f"invalid trading date: {value!r}") from None
 
@@ -154,10 +177,10 @@ def _normalize_symbol(value: Any) -> str:
     symbol = str(value or "").strip().lower()
     if not symbol:
         raise SelectionBacktestError("symbol is required")
-    return symbol
+    return sys.intern(symbol)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class HistoricalBar:
     """One completed daily bar plus optional session metadata."""
 
@@ -208,7 +231,14 @@ class HistoricalBar:
                 field_name,
                 _optional_float(getattr(self, field_name), field_name=field_name),
             )
-        object.__setattr__(self, "extras", MappingProxyType(dict(self.extras or {})))
+        extras = self.extras
+        object.__setattr__(
+            self,
+            "extras",
+            extras
+            if isinstance(extras, _OwnedImmutableMapping)
+            else MappingProxyType(dict(extras or {})),
+        )
 
     @classmethod
     def from_value(
@@ -272,7 +302,7 @@ class HistoricalBar:
             "amount": self.amount,
             "turnover": self.turnover,
             "prev_close": self.previous_close,
-            "symbol_code": self.symbol[-6:],
+            "symbol_code": sys.intern(self.symbol[-6:]),
             "stock_name": self.name,
             "industry": self.industry,
         })
@@ -451,6 +481,7 @@ class PositionExitSignal:
     reason: str
     sell_ratio: float = 1.0
     fill_reference_price: float | None = None
+    metadata: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         signal = str(self.signal or "").strip()
@@ -475,6 +506,7 @@ class PositionExitSignal:
         object.__setattr__(self, "reason", reason)
         object.__setattr__(self, "sell_ratio", ratio)
         object.__setattr__(self, "fill_reference_price", fill_reference)
+        object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata or {})))
 
 
 class PositionExitStrategy(Protocol):
@@ -734,13 +766,17 @@ class ReplaySelectionStrategy:
 
 
 def _normalized_bars(
-    bars_by_symbol: Mapping[str, Iterable[HistoricalBar | Mapping[str, Any]]],
+    bars_by_symbol: Mapping[
+        str,
+        Iterable[HistoricalBar | Mapping[str, Any]]
+        | Mapping[str, HistoricalBar | Mapping[str, Any]],
+    ],
     *,
     progress_callback: SelectionPhaseProgress | None = None,
-) -> tuple[dict[str, dict[str, HistoricalBar]], tuple[str, ...]]:
+) -> tuple[dict[str, Mapping[str, HistoricalBar]], tuple[str, ...]]:
     if not isinstance(bars_by_symbol, Mapping) or not bars_by_symbol:
         raise SelectionBacktestError("bars_by_symbol must contain at least one symbol")
-    result: dict[str, dict[str, HistoricalBar]] = {}
+    result: dict[str, Mapping[str, HistoricalBar]] = {}
     dates: set[str] = set()
     total = len(bars_by_symbol)
     if progress_callback is not None:
@@ -750,20 +786,43 @@ def _normalized_bars(
         start=1,
     ):
         symbol = _normalize_symbol(raw_symbol)
-        by_date: dict[str, HistoricalBar] = {}
-        for raw_bar in raw_bars or []:
-            if isinstance(raw_bar, HistoricalBar):
+        by_date: Mapping[str, HistoricalBar]
+        reuse_date_index = (
+            isinstance(raw_bars, _OwnedImmutableMapping) and bool(raw_bars)
+        )
+        if reuse_date_index:
+            for raw_date, raw_bar in raw_bars.items():
+                if not isinstance(raw_bar, HistoricalBar):
+                    reuse_date_index = False
+                    break
                 if raw_bar.symbol != symbol:
                     raise SelectionBacktestError(
                         f"bar symbol mismatch: expected {symbol}, got {raw_bar.symbol}"
                     )
-                bar = raw_bar
-            else:
-                bar = HistoricalBar.from_value(symbol, raw_bar)
-            by_date[bar.date] = bar
-            dates.add(bar.date)
+                if raw_date != raw_bar.date:
+                    reuse_date_index = False
+                    break
+        if reuse_date_index:
+            by_date = raw_bars
+        else:
+            normalized_by_date: dict[str, HistoricalBar] = {}
+            raw_values = (
+                raw_bars.values() if isinstance(raw_bars, Mapping) else raw_bars or ()
+            )
+            for raw_bar in raw_values:
+                if isinstance(raw_bar, HistoricalBar):
+                    if raw_bar.symbol != symbol:
+                        raise SelectionBacktestError(
+                            f"bar symbol mismatch: expected {symbol}, got {raw_bar.symbol}"
+                        )
+                    bar = raw_bar
+                else:
+                    bar = HistoricalBar.from_value(symbol, raw_bar)
+                normalized_by_date[bar.date] = bar
+            by_date = normalized_by_date
         if by_date:
             result[symbol] = by_date
+            dates.update(by_date)
         if progress_callback is not None and (
             completed == 1 or completed % 25 == 0 or completed == total
         ):
@@ -868,6 +927,72 @@ def _selection_statistics(
     }
 
 
+_STRATEGY_ROW_BASE_FIELDS = (
+    "date",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "amount",
+    "turnover",
+    "prev_close",
+    "symbol_code",
+    "stock_name",
+    "industry",
+)
+_STRATEGY_ROW_ENRICHED_FIELDS = (
+    "bbi",
+    "j",
+    "ema20",
+    "ema50",
+    "z_white",
+    "z_yellow",
+    "change_pct",
+)
+_STRATEGY_ROW_STORAGE_TYPES: dict[
+    tuple[Any, ...], tuple[type, object]
+] = {}
+
+
+def _new_prepared_strategy_row(bar: HistoricalBar) -> dict[str, Any]:
+    """Build a mutable key-sharing row for one exact indicator enrichment pass."""
+
+    keys = tuple(dict.fromkeys((
+        *bar.extras,
+        *_STRATEGY_ROW_BASE_FIELDS,
+        *_STRATEGY_ROW_ENRICHED_FIELDS,
+    )))
+    entry = _STRATEGY_ROW_STORAGE_TYPES.get(keys)
+    if entry is None:
+        if len(_STRATEGY_ROW_STORAGE_TYPES) >= 64:
+            return bar.as_strategy_row()
+        storage_type = type("_PreparedStrategyRowStorage", (), {})
+        seed = storage_type()
+        for key in keys:
+            seed.__dict__[key] = None
+        entry = (storage_type, seed)
+        _STRATEGY_ROW_STORAGE_TYPES[keys] = entry
+    storage = entry[0]()
+    row = storage.__dict__
+    row.update(bar.extras)
+    row.update({
+        "date": bar.date,
+        "open": bar.open,
+        "high": bar.high,
+        "low": bar.low,
+        "close": bar.close,
+        "volume": bar.volume,
+        "amount": bar.amount,
+        "turnover": bar.turnover,
+        "prev_close": bar.previous_close,
+        "symbol_code": sys.intern(bar.symbol[-6:]),
+        "stock_name": bar.name,
+        "industry": bar.industry,
+    })
+    return row
+
+
 def _prepared_strategy_rows(
     bars: Mapping[str, Mapping[str, HistoricalBar]],
     *,
@@ -880,7 +1005,10 @@ def _prepared_strategy_rows(
     if progress_callback is not None:
         progress_callback(0, total)
     for completed, (symbol, by_date) in enumerate(bars.items(), start=1):
-        rows = [by_date[trading_date].as_strategy_row() for trading_date in sorted(by_date)]
+        rows = [
+            _new_prepared_strategy_row(by_date[trading_date])
+            for trading_date in sorted(by_date)
+        ]
         enrich_rows(rows)
         prepared[symbol] = tuple(MappingProxyType(row) for row in rows)
         if preparation_callback is not None and (
@@ -919,8 +1047,39 @@ def _first_selector_session(
     return first_session
 
 
+def _estimate_replay_eta(
+    elapsed_sessions: Sequence[float],
+    remaining_sessions: int,
+    *,
+    current_session_elapsed: float = 0.0,
+) -> float | None:
+    """Estimate replay time without letting cheap warmup days dominate."""
+    remaining = max(0, int(remaining_sessions))
+    if remaining == 0:
+        return 0.0
+    samples = [
+        max(0.0, float(value))
+        for value in elapsed_sessions
+        if math.isfinite(float(value))
+    ]
+    current_elapsed = max(0.0, float(current_session_elapsed))
+    if not samples:
+        return current_elapsed * remaining if current_elapsed > 0 else None
+    recent = samples[-REPLAY_ETA_RECENT_SESSION_COUNT:]
+    seconds_per_session = max(
+        statistics.mean(samples),
+        statistics.mean(recent),
+        current_elapsed,
+    )
+    return seconds_per_session * remaining
+
+
 def build_selection_replay_tape(
-    bars_by_symbol: Mapping[str, Iterable[HistoricalBar | Mapping[str, Any]]],
+    bars_by_symbol: Mapping[
+        str,
+        Iterable[HistoricalBar | Mapping[str, Any]]
+        | Mapping[str, HistoricalBar | Mapping[str, Any]],
+    ],
     selector: SelectionStrategy | SelectionFunction,
     *,
     config: SelectionBacktestConfig | None = None,
@@ -1025,20 +1184,17 @@ def build_selection_replay_tape(
         def replay_phase(phase: str, _date: str = trading_date) -> None:
             if replay_progress_callback is None:
                 return
-            average_elapsed = (
-                sum(elapsed_sessions) / len(elapsed_sessions)
-                if elapsed_sessions else None
-            )
+            current_elapsed = max(0.0, time.perf_counter() - session_started_at)
             replay_progress_callback(
                 completed_sessions,
                 len(evaluation_dates),
                 trading_date,
                 str(phase or "scoring"),
-                max(0.0, time.perf_counter() - session_started_at),
-                (
-                    average_elapsed
-                    * max(0, len(evaluation_dates) - completed_sessions)
-                    if average_elapsed is not None else None
+                current_elapsed,
+                _estimate_replay_eta(
+                    elapsed_sessions,
+                    len(evaluation_dates) - completed_sessions,
+                    current_session_elapsed=current_elapsed,
                 ),
             )
 
@@ -1098,7 +1254,6 @@ def build_selection_replay_tape(
         completed_sessions += 1
         session_elapsed = max(0.0, time.perf_counter() - session_started_at)
         elapsed_sessions.append(session_elapsed)
-        average_elapsed = sum(elapsed_sessions) / len(elapsed_sessions)
         if replay_progress_callback is not None:
             replay_progress_callback(
                 min(completed_sessions, len(evaluation_dates)),
@@ -1106,8 +1261,10 @@ def build_selection_replay_tape(
                 trading_date,
                 "scoring",
                 session_elapsed,
-                average_elapsed
-                * max(0, len(evaluation_dates) - completed_sessions),
+                _estimate_replay_eta(
+                    elapsed_sessions,
+                    len(evaluation_dates) - completed_sessions,
+                ),
             )
         if progress_callback is not None:
             progress_callback(
@@ -1463,6 +1620,7 @@ def _run_trade_lifecycle_backtest(
                 "signal": decision.signal,
                 "reason": decision.reason,
                 "fee": exit_fee,
+                "metadata": dict(decision.metadata),
             }
             trade["exit_legs"].append(leg)
             position["remaining_units"] = max(0.0, remaining_units - exit_units)
@@ -1476,7 +1634,8 @@ def _run_trade_lifecycle_backtest(
                 - exit_fee
             )
             if position["remaining_units"] > 1e-8:
-                position["partial_tp_done"] = True
+                if not decision.metadata.get("risk_reduction_only"):
+                    position["partial_tp_done"] = True
                 trade["mark_net_return_pct"] = _trade_mark_to_market(
                     position,
                     current_bar.close,
@@ -1834,6 +1993,9 @@ def _run_strategy_portfolio_backtest(
     reset_selector = getattr(selector, "reset", None)
     if callable(reset_selector):
         reset_selector()
+    reset_strategy = getattr(strategy, "reset", None)
+    if callable(reset_strategy):
+        reset_strategy()
     evaluation_dates = tuple(trading_dates[first_selector_session:])
     completed_sessions = 0
 
@@ -1916,6 +2078,9 @@ def _run_strategy_portfolio_backtest(
                 raise SelectionBacktestError(
                     "portfolio entry strategy must return PortfolioEntryDecision"
                 )
+            decision_metadata = decision.state.get("decision_metadata")
+            if isinstance(decision_metadata, Mapping):
+                record["entry_decision_metadata"] = dict(decision_metadata)
             if decision.action == "reject" or decision.units <= 0:
                 record["status_reason"] = decision.reason or "entry_risk_rejected"
                 continue
@@ -1935,6 +2100,10 @@ def _run_strategy_portfolio_backtest(
                 "strategy_id": selected.strategy_id,
                 "action": decision.action,
                 "fee": entry_fee,
+                "metadata": (
+                    dict(decision_metadata)
+                    if isinstance(decision_metadata, Mapping) else {}
+                ),
             }
             if position is None:
                 trade_id = f"trade-{len(trades) + 1}"
@@ -2120,7 +2289,29 @@ def _run_strategy_portfolio_backtest(
         if callable(set_exit_tracking_symbols):
             set_exit_tracking_symbols(positions)
         generated_signals = _call_selector(selector, context)
+        prepare_session_signals = getattr(
+            strategy,
+            "prepare_session_signals",
+            None,
+        )
+        if callable(prepare_session_signals):
+            try:
+                generated_signals = tuple(
+                    prepare_session_signals(
+                        generated_signals,
+                        positions,
+                        context,
+                        selector,
+                    )
+                    or ()
+                )
+            except Exception as exc:
+                raise SelectionBacktestError(
+                    "portfolio strategy failed while ranking session signals "
+                    f"after {trading_date} close: {exc}"
+                ) from exc
         completed_sessions += 1
+        had_portfolio_activity = within_signal_window or bool(positions)
 
         for symbol, position in tuple(positions.items()):
             current_bar = current_bars.get(symbol)
@@ -2164,6 +2355,14 @@ def _run_strategy_portfolio_backtest(
                 position["deferred_exit_signal"] = decision.signal
                 position["deferred_exit_reason"] = decision.reason
                 continue
+            board_lot = int(getattr(strategy, "board_lot", 100))
+            if (
+                decision.metadata.get("risk_reduction_only")
+                and available_units < 2 * board_lot
+            ):
+                position["soft_exit_reduction_deferred"] = True
+                position["soft_exit_status"] = "board_lot_runner_hold"
+                continue
             exit_price = _fill_price(
                 current_bar,
                 entry=False,
@@ -2174,10 +2373,10 @@ def _run_strategy_portfolio_backtest(
                 exit_units = available_units
             else:
                 exit_units = max(
-                    int(getattr(strategy, "board_lot", 100)),
+                    board_lot,
                     int(available_units * decision.sell_ratio)
-                    // int(getattr(strategy, "board_lot", 100))
-                    * int(getattr(strategy, "board_lot", 100)),
+                    // board_lot
+                    * board_lot,
                 )
                 exit_units = min(available_units, exit_units)
             exit_amount = exit_price * exit_units
@@ -2192,6 +2391,7 @@ def _run_strategy_portfolio_backtest(
                 "signal": decision.signal,
                 "reason": decision.reason,
                 "fee": exit_fee,
+                "metadata": dict(decision.metadata),
             }
             trade["exit_legs"].append(exit_leg)
             position["remaining_units"] = max(0, remaining_before - exit_units)
@@ -2212,7 +2412,10 @@ def _run_strategy_portfolio_backtest(
                         "portfolio strategy failed while recording filled "
                         f"exit for {symbol}: {exc}"
                     ) from exc
-            if decision.sell_ratio < 1.0 - 1e-12:
+            if (
+                decision.sell_ratio < 1.0 - 1e-12
+                and not decision.metadata.get("risk_reduction_only")
+            ):
                 position["partial_tp_done"] = True
             if int(position["remaining_units"]) > 0:
                 trade["mark_net_return_pct"] = _trade_mark_to_market(
@@ -2290,7 +2493,7 @@ def _run_strategy_portfolio_backtest(
 
         if (
             (not config.signal_start_date or trading_date >= config.signal_start_date)
-            and (within_signal_window or positions)
+            and (had_portfolio_activity or positions)
         ):
             close_marks = {
                 symbol: (
@@ -2356,7 +2559,11 @@ def _run_strategy_portfolio_backtest(
 
 
 def run_selection_backtest(
-    bars_by_symbol: Mapping[str, Iterable[HistoricalBar | Mapping[str, Any]]],
+    bars_by_symbol: Mapping[
+        str,
+        Iterable[HistoricalBar | Mapping[str, Any]]
+        | Mapping[str, HistoricalBar | Mapping[str, Any]],
+    ],
     selector: SelectionStrategy | SelectionFunction,
     *,
     config: SelectionBacktestConfig | None = None,
@@ -3475,7 +3682,8 @@ class NiuOneHistoricalContextProvider:
                     "prev_close": previous_close,
                     "low": current_bar.low,
                     "change_pct": change_pct,
-                    "amount": current_bar.amount or 0.0,
+                    "amount": current_bar.amount,
+                    "turnover": current_bar.turnover,
                 },
             })
         flow_rows = self.flow_provider(context) if self.flow_provider is not None else None

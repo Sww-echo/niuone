@@ -76,6 +76,8 @@ def classify_exit_rule(reason: str = "", exit_signal: str | None = None) -> str:
             return "sell_score"
         if signal == "shaofu_soft_reduce":
             return "position_adjust"
+        if signal == "niu_priority_replacement":
+            return "position_adjust"
         if signal in {
             "no_progress", "max_hold_days", "stale_loser", "stale_below_bbi",
             "tide_leader_no_progress", "tide_rotation_no_follow_through", "tide_recovery_unconfirmed",
@@ -103,7 +105,7 @@ def classify_exit_rule(reason: str = "", exit_signal: str | None = None) -> str:
         return "market_risk"
     if "未兑现" in text or "低效持仓" in text or "持仓到期" in text or "次日不涨" in text or "未延续" in text:
         return "no_progress"
-    if "调仓" in text or "仓位" in text or "硬约束" in text:
+    if "调仓" in text or "换仓" in text or "仓位" in text or "硬约束" in text:
         return "position_adjust"
     if "模型卖出" in text:
         return "model_sell"

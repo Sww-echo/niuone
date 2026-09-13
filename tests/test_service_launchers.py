@@ -61,15 +61,26 @@ class ServiceLauncherTests(unittest.TestCase):
         for value in (
             "ai.niuone.dashboard",
             "ai.niuone.cron-scheduler",
-            "ai.niuone.x-watchlist",
             "niuone-dashboard.service",
             "niuone-cron-scheduler.service",
-            "niuone-x-watchlist.service",
             "NIUONE_LOCAL_DATA_DIR",
             "DASHBOARD_ENV_FILE",
             "is-installed",
         ):
             self.assertIn(value, text)
+
+    def test_linux_service_installer_does_not_reference_removed_process(self):
+        text = (ROOT / "scripts" / "manage-long-running.sh").read_text(encoding="utf-8")
+        self.assertNotIn("LINUX_UNITS[2]", text)
+        self.assertNotIn("PROGRAMS[2]", text)
+        self.assertNotIn("NiuOne X Watchlist Daemon", text)
+
+    def test_linux_working_directory_is_an_unquoted_absolute_path(self):
+        text = (ROOT / "scripts" / "manage-long-running.sh").read_text(encoding="utf-8")
+        self.assertIn("printf 'WorkingDirectory=%s\\n'", text)
+        self.assertNotIn("printf 'WorkingDirectory=\"%s\"\\n'", text)
+        self.assertIn("printf 'Environment=\"NIUONE_LOCAL_DATA_DIR=%s\"\\n'", text)
+        self.assertIn("printf 'ExecStart=\"%s\"\\n'", text)
 
     def test_windows_launcher_and_manager_cover_all_processes(self):
         launcher = (ROOT / "run.bat").read_text(encoding="utf-8")
@@ -80,9 +91,9 @@ class ServiceLauncherTests(unittest.TestCase):
         self.assertIn("-Action IsInstalled", launcher)
         self.assertIn("NIUONE_MANAGED_SERVICE_CHILD", runner)
         self.assertIn('"IsInstalled"', manager)
-        for task_name in ("NiuOne Dashboard", "NiuOne Cron Scheduler", "NiuOne X Watchlist"):
+        for task_name in ("NiuOne Dashboard", "NiuOne Cron Scheduler"):
             self.assertIn(task_name, manager)
-        for service_name in ("dashboard", "cron-scheduler", "x-watchlist"):
+        for service_name in ("dashboard", "cron-scheduler"):
             self.assertIn(service_name, runner)
         self.assertIn("NIUONE_LOCAL_DATA_DIR", runner)
         self.assertIn("DASHBOARD_ENV_FILE", runner)

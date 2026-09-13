@@ -5,6 +5,7 @@ import sys
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
+from types import MappingProxyType
 from unittest.mock import patch
 
 
@@ -214,6 +215,11 @@ class StrategySelectionBacktestingTests(unittest.TestCase):
 
         def scored(strategy_id):
             return {
+                "stock_activity_data_available": True,
+                "stock_market_amount_percentile": 90.0,
+                "stock_theme_amount_percentile": 75.0,
+                "turnover": 4.0,
+                "recent_close": 10.0,
                 "stop_price": 9.5,
                 "stop_source": "niu_structure_low",
                 "atr20": 0.5,
@@ -329,7 +335,7 @@ class StrategySelectionBacktestingTests(unittest.TestCase):
             "niu_reversal_probe",
         )
 
-    def test_niuone_strategy_portfolio_limits_new_positions_per_session(self):
+    def test_niuone_strategy_portfolio_does_not_limit_new_positions_per_session(self):
         symbols = ("600000", "600001", "600002")
         rows = {
             symbol: [
@@ -349,6 +355,10 @@ class StrategySelectionBacktestingTests(unittest.TestCase):
                     strategy_id="niu_leader",
                     score=9.0 - index / 10,
                     metadata={"scored": {
+                        "stock_activity_data_available": True,
+                        "stock_market_amount_percentile": 90.0,
+                        "stock_theme_amount_percentile": 75.0,
+                        "turnover": 4.0,
                         "stop_price": 9.5,
                         "atr20": 0.5,
                         "gap_buffer_pct": 0.5,
@@ -387,21 +397,118 @@ class StrategySelectionBacktestingTests(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(result.statistics["evaluated_signal_count"], 2)
-        self.assertEqual(result.portfolio["open_position_count"], 2)
-        self.assertEqual(
-            [row["status_reason"] for row in result.signals if row["status"] == "rejected"],
-            ["max_new_positions"],
+        self.assertEqual(result.statistics["evaluated_signal_count"], 3)
+        self.assertEqual(result.portfolio["open_position_count"], 3)
+        self.assertEqual(result.statistics["entry_rejection_counts"], {})
+
+    def test_niuone_strategy_portfolio_replaces_only_with_higher_priority_signal(self):
+        symbols = tuple(f"60000{index}" for index in range(5))
+        incoming_symbol = "600099"
+        all_symbols = (*symbols, incoming_symbol)
+        rows = {
+            symbol: [
+                daily_bar(day, 10.0, 10.0, industry=f"行业{index}")
+                for day in (
+                    "2026-01-05",
+                    "2026-01-06",
+                    "2026-01-07",
+                    "2026-01-08",
+                    "2026-01-09",
+                )
+            ]
+            for index, symbol in enumerate(all_symbols)
+        }
+
+        class ReplacementSelector:
+            def on_close(self, context):
+                if context.date == "2026-01-05":
+                    selected = symbols
+                    decision_score = 6.0
+                elif context.date == "2026-01-07":
+                    selected = (incoming_symbol,)
+                    decision_score = 9.8
+                else:
+                    return []
+                return [SelectionSignal(
+                    symbol,
+                    strategy_id="niu_leader",
+                    score=decision_score,
+                    metadata={"scored": {
+                        "stock_activity_data_available": True,
+                        "stock_market_amount_percentile": 90.0,
+                        "stock_theme_amount_percentile": 75.0,
+                        "turnover": 4.0,
+                        "decision_score": decision_score,
+                        "stop_price": 9.5,
+                        "atr20": 0.5,
+                        "gap_buffer_pct": 0.5,
+                        "execution_buffer_pct": 0.2,
+                        "industry": f"行业{all_symbols.index(symbol)}",
+                        "market_regime": "offensive",
+                        "market_allows_buys": True,
+                        "market_hard_stop": False,
+                        "mainline_score": 80,
+                        "mainline_state": "mainline",
+                        "mainline_confirmed": True,
+                        "niuone_lifecycle_stage": "markup",
+                        "stock_leader_tier": True,
+                        "stock_strong": True,
+                    }},
+                ) for symbol in selected]
+
+            def latest_scored(self, symbol, _strategy_id):
+                is_incoming = symbol == incoming_symbol
+                return {
+                    "decision_score": 9.8 if is_incoming else 6.0,
+                    "mainline_score": 80,
+                    "mainline_state": "mainline",
+                    "mainline_confirmed": True,
+                    "niuone_lifecycle_stage": "markup",
+                    "stock_leader_tier": True,
+                    "stock_strong": True,
+                    "atr20": 0.5,
+                }
+
+        result = run_selection_backtest(
+            rows,
+            ReplacementSelector(),
+            position_exit_strategy=NiuOneStrategyBacktestPolicy(
+                entry_order_scale=0.1,
+                max_open_positions=5,
+                max_industry_positions=5,
+            ),
+            config=SelectionBacktestConfig(
+                holding_sessions=(1,),
+                signal_start_date="2026-01-05",
+                signal_end_date="2026-01-07",
+                slippage_bps=0,
+                price_limit_resolver=None,
+                cost_model=SelectionCostModel(
+                    commission_rate=0,
+                    transfer_fee_rate=0,
+                    sell_stamp_duty_rate=0,
+                ),
+            ),
         )
-        self.assertEqual(
-            result.statistics["entry_rejection_counts"],
-            {"max_new_positions": 1},
+
+        replacement_trades = [
+            trade
+            for trade in result.trades
+            if trade["exit_signal"] == "niu_priority_replacement"
+        ]
+        self.assertEqual(len(replacement_trades), 1)
+        self.assertEqual(replacement_trades[0]["symbol"], "600000")
+        incoming_trade = next(
+            trade for trade in result.trades
+            if trade["symbol"] == incoming_symbol
         )
+        self.assertEqual(incoming_trade["entry_date"], "2026-01-08")
+        self.assertEqual(result.portfolio["open_position_count"], 5)
 
     def test_niuone_strategy_portfolio_accepts_research_new_position_limit(self):
         self.assertEqual(
             NiuOneStrategyBacktestPolicy().max_new_positions_per_session,
-            2,
+            None,
         )
         self.assertEqual(
             NiuOneStrategyBacktestPolicy(
@@ -414,23 +521,29 @@ class StrategySelectionBacktestingTests(unittest.TestCase):
 
     def test_niuone_strategy_portfolio_accepts_research_slot_limits(self):
         production = NiuOneStrategyBacktestPolicy()
-        self.assertEqual(production.max_open_positions, 5)
-        self.assertEqual(production.max_industry_positions, 2)
+        self.assertEqual(production.max_open_positions, 6)
+        self.assertEqual(production.max_industry_positions, 6)
 
-        diversified = NiuOneStrategyBacktestPolicy(
-            max_open_positions=7,
+        concentrated = NiuOneStrategyBacktestPolicy(
+            max_open_positions=4,
             max_industry_positions=1,
         )
-        self.assertEqual(diversified.max_open_positions, 7)
-        self.assertEqual(diversified.max_industry_positions, 1)
+        self.assertEqual(concentrated.max_open_positions, 4)
+        self.assertEqual(concentrated.max_industry_positions, 1)
 
         with self.assertRaisesRegex(ValueError, "max_open_positions"):
             NiuOneStrategyBacktestPolicy(max_open_positions=0)
+        expanded = NiuOneStrategyBacktestPolicy(max_open_positions=10)
+        self.assertEqual(expanded.max_open_positions, 10)
         with self.assertRaisesRegex(ValueError, "max_industry_positions"):
             NiuOneStrategyBacktestPolicy(max_industry_positions=0)
 
     def test_niuone_structure_gate_uses_market_open_before_slippage(self):
         scored = {
+            "stock_activity_data_available": True,
+            "stock_market_amount_percentile": 90.0,
+            "stock_theme_amount_percentile": 75.0,
+            "turnover": 4.0,
             "stop_price": 9.4,
             "atr20": 0.5,
             "gap_buffer_pct": 0.5,
@@ -502,8 +615,6 @@ class StrategySelectionBacktestingTests(unittest.TestCase):
         aggressive = NiuOneStrategyBacktestPolicy(
             risk_budget_scale=1.35,
             position_budget_scale=1.15,
-            max_new_positions_per_session=3,
-            max_open_positions=6,
             max_industry_positions=3,
         )
 
@@ -521,7 +632,7 @@ class StrategySelectionBacktestingTests(unittest.TestCase):
             aggressive_budget["max_sector_position_pct"],
             46.0,
         )
-        self.assertEqual(aggressive.max_new_positions_per_session, 3)
+        self.assertIsNone(aggressive.max_new_positions_per_session)
         self.assertEqual(aggressive.max_open_positions, 6)
         self.assertEqual(aggressive.max_industry_positions, 3)
         defensive_budget = balanced._risk_budget(
@@ -539,6 +650,10 @@ class StrategySelectionBacktestingTests(unittest.TestCase):
 
     def test_niuone_backtest_allows_defensive_entry_but_not_hard_stop(self):
         scored = {
+            "stock_activity_data_available": True,
+            "stock_market_amount_percentile": 90.0,
+            "stock_theme_amount_percentile": 75.0,
+            "turnover": 4.0,
             "recent_close": 10.0,
             "stop_price": 9.5,
             "stop_source": "niu_structure_low",
@@ -746,6 +861,67 @@ class StrategySelectionBacktestingTests(unittest.TestCase):
             "markup_upgrade_rule",
         )
 
+    def test_same_strategy_add_requires_and_records_a_new_high_buy_score(self):
+        policy = NiuOneStrategyBacktestPolicy(markup_upgrade_only=True)
+        scored = {
+            "mainline_confirmed": True,
+            "mainline_state": "mainline",
+            "niuone_lifecycle_stage": "markup",
+            "stock_leader_tier": True,
+            "stock_strong": True,
+        }
+        position = {
+            "strategy_id": "niu_leader",
+            "avg_cost": 10.0,
+            "last_price": 10.5,
+            "entry_signal_score": 8.8,
+            "last_buy_signal_score": 9.0,
+            "highest_buy_signal_score": 9.0,
+            "niuone_buy_signal_count": 2,
+            "lots": [{"date": "2026-01-05"}],
+        }
+        unchanged = SelectionSignal(
+            "600000",
+            strategy_id="niu_leader",
+            score=9.0,
+            metadata={"scored": scored},
+        )
+        stronger = SelectionSignal(
+            "600000",
+            strategy_id="niu_leader",
+            score=9.2,
+            metadata={"scored": scored},
+        )
+
+        self.assertEqual(
+            policy.schedule_block_reason(
+                position,
+                unchanged,
+                "2026-01-06",
+            ),
+            "signal_score_not_improved",
+        )
+        self.assertEqual(
+            policy.schedule_block_reason(
+                position,
+                stronger,
+                "2026-01-06",
+            ),
+            "",
+        )
+        entry_bar = HistoricalBar.from_value(
+            "600000",
+            daily_bar("2026-01-07", 10.5, industry="半导体"),
+        )
+        updated = policy.on_add(position, stronger, entry_bar, 10.5)
+        self.assertEqual(updated["last_buy_signal_score"], 9.2)
+        self.assertEqual(updated["highest_buy_signal_score"], 9.2)
+        self.assertEqual(updated["niuone_buy_signal_count"], 3)
+        self.assertEqual(
+            updated["niuone_buy_signal_score_history"][-1]["route"],
+            "score_progression",
+        )
+
     def test_markup_rebalance_reentry_requires_a_filled_trim_not_a_fixed_count(self):
         policy = NiuOneStrategyBacktestPolicy(
             markup_upgrade_only=True,
@@ -825,6 +1001,11 @@ class StrategySelectionBacktestingTests(unittest.TestCase):
             daily_bar("2026-01-07", 10.0, 10.0, industry="半导体"),
         ]
         scored = {
+            "stock_activity_data_available": True,
+            "stock_market_amount_percentile": 90.0,
+            "stock_theme_amount_percentile": 75.0,
+            "turnover": 4.0,
+            "recent_close": 10.0,
             "stop_price": 9.5,
             "atr20": 0.5,
             "gap_buffer_pct": 0.5,
@@ -898,6 +1079,75 @@ class StrategySelectionBacktestingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"within \(0, 1\]"):
             NiuOneStrategyBacktestPolicy(entry_order_scale=0)
 
+    def test_entry_activity_uses_signal_turnover_never_next_session_totals(self):
+        scored = {
+            "stock_activity_data_available": True,
+            "stock_market_amount_percentile": 90.0,
+            "stock_theme_amount_percentile": 75.0,
+            "recent_close": 10.0, "stop_price": 9.5, "atr20": 0.5,
+            "gap_buffer_pct": 0.5, "execution_buffer_pct": 0.2,
+            "industry": "半导体", "market_regime": "offensive",
+            "market_allows_buys": True, "market_hard_stop": False,
+        }
+        policy = NiuOneStrategyBacktestPolicy()
+        for signal_turnover, next_day_turnover in ((None, 20), (2.999, 20), (3.0, 0.5)):
+            with self.subTest(signal=signal_turnover, next_day=next_day_turnover):
+                bar = HistoricalBar.from_value("600000", daily_bar(
+                    "2026-01-06", 10.0, turnover=next_day_turnover,
+                ))
+                result = policy.size_entry(
+                    SelectionSignal("600000", strategy_id="niu_reversal_probe", score=9.0,
+                                    metadata={"scored": {**scored, "turnover": signal_turnover}}),
+                    bar, 10.0, None, {}, {}, 100000.0, 100000.0, 0, SelectionCostModel(),
+                )
+                if signal_turnover == 3.0:
+                    self.assertGreater(result.units, 0)
+                else:
+                    self.assertEqual(result.reason, "stock_activity")
+                    self.assertEqual(result.units, 0)
+                    # An existing position and research price override cannot bypass activity.
+                    research_policy = NiuOneStrategyBacktestPolicy(reversal_max_execution_gap_pct=10.0)
+                    added = research_policy.size_entry(
+                        SelectionSignal("600000", strategy_id="niu_reversal_probe", score=9.0,
+                                        metadata={"scored": {**scored, "turnover": signal_turnover}}),
+                        bar, 10.0, {"remaining_units": 100}, {}, {},
+                        100000.0, 100000.0, 0, SelectionCostModel(),
+                    )
+                    self.assertEqual(added.reason, "stock_activity")
+
+    def test_default_probe_entry_guard_uses_fill_price_and_fails_closed(self):
+        scored = {
+            "stock_activity_data_available": True,
+            "stock_market_amount_percentile": 90.0,
+            "stock_theme_amount_percentile": 75.0,
+            "turnover": 4.0,
+            "recent_close": 10.0, "stop_price": 10.0, "atr20": 0.5,
+            "gap_buffer_pct": 0.5, "execution_buffer_pct": 0.2,
+            "industry": "半导体", "market_regime": "offensive",
+            "market_allows_buys": True, "market_hard_stop": False,
+        }
+        bar = HistoricalBar.from_value("600000", daily_bar("2026-01-06", 10.29))
+        policy = NiuOneStrategyBacktestPolicy()
+        for price, previous_close, rejected in (
+            (10.299, 10.0, False), (10.3, 10.0, True),
+            (10.31, 10.0, True), (10.1, None, True),
+            (10.1, float("nan"), True), (10.1, float("inf"), True),
+        ):
+            with self.subTest(price=price, previous_close=previous_close):
+                result = policy.size_entry(
+                    SelectionSignal(
+                        "600000", strategy_id="niu_reversal_probe", score=9.0,
+                        metadata={"scored": {**scored, "recent_close": previous_close}},
+                    ),
+                    bar, price, None, {}, {}, 100000.0, 100000.0, 0,
+                    SelectionCostModel(),
+                )
+                if rejected:
+                    self.assertEqual(result.reason, "reversal_entry_price")
+                    self.assertEqual(result.units, 0)
+                else:
+                    self.assertGreater(result.units, 0)
+
     def test_reversal_execution_gap_cap_is_research_configurable(self):
         rows = [
             daily_bar("2026-01-05", 10.0, 10.0, industry="半导体"),
@@ -905,6 +1155,10 @@ class StrategySelectionBacktestingTests(unittest.TestCase):
             daily_bar("2026-01-07", 10.2, 10.2, industry="半导体"),
         ]
         scored = {
+            "stock_activity_data_available": True,
+            "stock_market_amount_percentile": 90.0,
+            "stock_theme_amount_percentile": 75.0,
+            "turnover": 4.0,
             "score": 8.0,
             "recent_close": 10.0,
             "stop_price": 9.5,
@@ -965,6 +1219,10 @@ class StrategySelectionBacktestingTests(unittest.TestCase):
 
     def test_markup_momentum_probe_replays_wide_stop_with_four_percent_cap(self):
         scored = {
+            "stock_activity_data_available": True,
+            "stock_market_amount_percentile": 90.0,
+            "stock_theme_amount_percentile": 75.0,
+            "turnover": 4.0,
             "score": 8.0,
             "recent_close": 10.0,
             "stop_price": 8.4,
@@ -1056,6 +1314,11 @@ class StrategySelectionBacktestingTests(unittest.TestCase):
                 strategy_id=strategy_id,
                 score=9.0,
                 metadata={"scored": {
+                    "stock_activity_data_available": True,
+                    "stock_market_amount_percentile": 90.0,
+                    "stock_theme_amount_percentile": 75.0,
+                    "turnover": 4.0,
+                    "recent_close": 10.0,
                     "stop_price": 9.5,
                     "atr20": 0.5,
                     "gap_buffer_pct": 0.5,
@@ -1114,6 +1377,18 @@ class StrategySelectionBacktestingTests(unittest.TestCase):
         self.assertEqual(
             trade["exit_legs"][1]["units"],
             trade["entry_legs"][1]["units"],
+        )
+        equity_curve = result.portfolio["equity_curve"]
+        self.assertEqual(equity_curve[-1]["date"], trade["exit_date"])
+        self.assertEqual(
+            equity_curve[-1]["equity"],
+            result.portfolio["final_equity"],
+        )
+        self.assertEqual(equity_curve[-1]["market_value"], 0.0)
+        self.assertEqual(equity_curve[-1]["position_count"], 0)
+        self.assertEqual(
+            result.portfolio["trading_session_count"],
+            len(equity_curve),
         )
 
     def test_trade_lifecycle_allows_reentry_after_a_completed_exit(self):
@@ -1399,6 +1674,10 @@ class StrategySelectionBacktestingTests(unittest.TestCase):
             strategy_id="niu_reversal_probe",
             score=8.0,
             metadata={"scored": {
+                "stock_activity_data_available": True,
+                "stock_market_amount_percentile": 90.0,
+                "stock_theme_amount_percentile": 75.0,
+                "turnover": 4.0,
                 "stop_price": 9.0,
                 "market_regime": "recovery",
             }},
@@ -1660,11 +1939,14 @@ class StrategySelectionBacktestingTests(unittest.TestCase):
                     "atr20": 0.5,
                 }
 
-        self.assertIsNone(policy.on_close(
+        decision = policy.on_close(
             position,
             context,
             DivergenceSelector(),
-        ))
+        )
+        self.assertEqual(decision.signal, "niu_leader_lost")
+        self.assertEqual(decision.sell_ratio, 0.5)
+        self.assertEqual(decision.metadata["soft_exit_stage"], "reduce")
         self.assertEqual(position["niuone_lifecycle_stage"], "divergence")
 
     def test_niuone_reversal_strong_leader_can_promote_only_exit_identity(self):
@@ -1740,9 +2022,10 @@ class StrategySelectionBacktestingTests(unittest.TestCase):
                     "atr20": 0.5,
                 }
 
-        self.assertIsNone(
-            policy.on_close(position, fading_context, FadingSelector())
-        )
+        first_fade = policy.on_close(position, fading_context, FadingSelector())
+        self.assertEqual(first_fade.sell_ratio, 0.5)
+        self.assertEqual(first_fade.metadata["soft_exit_stage"], "reduce")
+        position["soft_exit_reduced"] = True
         second_fading_context = selection_module.SelectionContext(
             date="2026-01-12",
             session_index=5,
@@ -1826,13 +2109,14 @@ class StrategySelectionBacktestingTests(unittest.TestCase):
                     "atr20": 0.5,
                 }
 
-        self.assertIsNone(
-            policy.on_close(
+        first_fade = policy.on_close(
                 position,
                 context("2026-01-09", 4),
                 FadingSelector(),
             )
-        )
+        self.assertEqual(first_fade.sell_ratio, 0.5)
+        self.assertEqual(first_fade.metadata["soft_exit_stage"], "reduce")
+        position["soft_exit_reduced"] = True
         self.assertEqual(position["niu_leader_lost_count"], 0)
         decision = policy.on_close(
             position,
@@ -2125,6 +2409,110 @@ class StrategySelectionBacktestingTests(unittest.TestCase):
         )
         self.assertEqual(object_result.to_dict(), mapping_result.to_dict())
 
+    def test_external_mapping_proxies_are_detached_before_replay(self):
+        extras_backing = {
+            "data_source": "eastmoney",
+            "adjustment": "qfq",
+            "themes": ("银行",),
+        }
+        shared_extras = MappingProxyType(extras_backing)
+        bars = tuple(
+            HistoricalBar(
+                symbol="600000",
+                date=trading_date,
+                open=price,
+                high=price,
+                low=price,
+                close=price,
+                volume=100,
+                extras=shared_extras,
+            )
+            for trading_date, price in (
+                ("2026-01-05", 10.0),
+                ("2026-01-06", 10.1),
+            )
+        )
+        index_backing = {bar.date: bar for bar in bars}
+        indexed = MappingProxyType(index_backing)
+
+        normalized, dates = selection_module._normalized_bars({
+            "600000": indexed,
+        })
+
+        extras_backing["themes"] = ("证券",)
+        index_backing.clear()
+
+        self.assertFalse(hasattr(bars[0], "__dict__"))
+        self.assertEqual(bars[0].extras["themes"], ("银行",))
+        self.assertEqual(bars[1].extras["themes"], ("银行",))
+        self.assertIsNot(normalized["600000"], indexed)
+        self.assertEqual(tuple(normalized["600000"]), tuple(bar.date for bar in bars))
+        self.assertEqual(dates, ("2026-01-05", "2026-01-06"))
+
+    def test_compact_prepared_rows_match_regular_strategy_rows_exactly(self):
+        shared_extras = MappingProxyType({
+            "data_source": "eastmoney",
+            "adjustment": "qfq",
+            "themes": ("银行",),
+            "custom_score": 7.25,
+            "__dict__": "ordinary-extra-field",
+            1: "non-string-extra-field",
+        })
+        bars = tuple(
+            HistoricalBar(
+                symbol="sh600000",
+                date=trading_date,
+                open=price,
+                high=price + 0.2,
+                low=price - 0.1,
+                close=price + 0.1,
+                volume=1000 + index,
+                amount=10_000 + index,
+                turnover=1.2 + index / 10,
+                previous_close=None if index == 0 else price,
+                name="浦发银行",
+                industry="银行",
+                extras=shared_extras,
+            )
+            for index, (trading_date, price) in enumerate((
+                ("2026-01-05", 10.0),
+                ("2026-01-06", 10.2),
+                ("2026-01-07", 10.1),
+            ))
+        )
+        reference = [bar.as_strategy_row() for bar in bars]
+        enrich_strategy_rows(reference)
+        indexed = MappingProxyType({bar.date: bar for bar in bars})
+
+        compact = selection_module._prepared_strategy_rows({
+            "sh600000": indexed,
+        })["sh600000"]
+
+        self.assertEqual([dict(row) for row in compact], reference)
+        self.assertEqual(
+            [list(row.items()) for row in compact],
+            [list(row.items()) for row in reference],
+        )
+        self.assertNotIn("change_pct", compact[0])
+        self.assertIn("change_pct", compact[1])
+        with self.assertRaises(TypeError):
+            compact[0]["close"] = 0
+
+    def test_mutable_date_mapping_is_detached_before_replay(self):
+        bar = HistoricalBar.from_value(
+            "600000",
+            daily_bar("2026-01-05", 10.0),
+        )
+        mutable = {bar.date: bar}
+
+        normalized, _dates = selection_module._normalized_bars({
+            "600000": mutable,
+        })
+        mutable.clear()
+
+        self.assertIsNot(normalized["600000"], mutable)
+        self.assertEqual(normalized["600000"][bar.date], bar)
+
     def test_measures_next_open_forward_returns_and_deduplicates(self):
         bars = {"600000": [
             daily_bar("2026-01-05", 9.8, 10.0),
@@ -2264,6 +2652,33 @@ class StrategySelectionBacktestingTests(unittest.TestCase):
         self.assertIn("rebuilding_context", phase_names)
         self.assertIn("scoring", phase_names)
         self.assertEqual(phases[-1][0:4], (2, 2, "2026-01-06", "scoring"))
+
+    def test_replay_eta_uses_recent_or_current_slow_sessions(self):
+        self.assertIsNone(selection_module._estimate_replay_eta([], 5))
+        self.assertEqual(selection_module._estimate_replay_eta([], 0), 0.0)
+        self.assertEqual(
+            selection_module._estimate_replay_eta(
+                [],
+                5,
+                current_session_elapsed=2.0,
+            ),
+            10.0,
+        )
+        self.assertEqual(
+            selection_module._estimate_replay_eta(
+                [1.0] * 10 + [3.0] * 10,
+                5,
+            ),
+            15.0,
+        )
+        self.assertEqual(
+            selection_module._estimate_replay_eta(
+                [1.0] * 20,
+                5,
+                current_session_elapsed=4.0,
+            ),
+            20.0,
+        )
 
     def test_registered_selector_caps_one_strategy_without_hiding_other_paths(self):
         def reversal(_rows):

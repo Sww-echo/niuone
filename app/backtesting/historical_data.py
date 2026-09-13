@@ -5,6 +5,7 @@ import concurrent.futures
 import json
 import math
 import re
+import sys
 import threading
 import time
 import urllib.error
@@ -18,7 +19,9 @@ from typing import Any
 
 
 EASTMONEY_KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
-TENCENT_KLINE_URL = "https://ifzq.gtimg.cn/appstock/app/fqkline/get"
+TENCENT_KLINE_URL = (
+    "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get"
+)
 SINA_KLINE_URL = (
     "https://quotes.sina.cn/cn/api/jsonp_v2.php/"
     "var%20_{symbol}_niuone=/CN_MarketDataService.getKLineData"
@@ -57,14 +60,14 @@ def normalize_a_share_symbol(value: Any) -> str:
     """Return a market-prefixed A-share symbol."""
     raw = re.sub(r"[^a-zA-Z0-9]", "", str(value or "")).lower()
     if re.fullmatch(r"(?:sh|sz|bj)\d{6}", raw):
-        return raw
+        return sys.intern(raw)
     if not re.fullmatch(r"\d{6}", raw):
         raise HistoricalDataError(f"unsupported A-share symbol: {value!r}")
     if raw.startswith(("6", "9")):
-        return f"sh{raw}"
+        return sys.intern(f"sh{raw}")
     if raw.startswith(("4", "8")):
-        return f"bj{raw}"
-    return f"sz{raw}"
+        return sys.intern(f"bj{raw}")
+    return sys.intern(f"sz{raw}")
 
 
 def _eastmoney_secid(symbol: str) -> str:
@@ -74,10 +77,13 @@ def _eastmoney_secid(symbol: str) -> str:
 
 
 def _finite_float(value: Any) -> float | None:
-    try:
-        number = float(str(value).replace(",", "").strip())
-    except (TypeError, ValueError):
-        return None
+    if type(value) in (int, float):
+        number = float(value)
+    else:
+        try:
+            number = float(str(value).replace(",", "").strip())
+        except (TypeError, ValueError):
+            return None
     return number if math.isfinite(number) else None
 
 
@@ -112,6 +118,9 @@ def _normalize_rows(
     source: str,
     adjustment: str,
 ) -> list[dict[str, Any]]:
+    symbol = sys.intern(symbol)
+    source = sys.intern(source)
+    adjustment = sys.intern(adjustment)
     by_date: dict[str, dict[str, Any]] = {}
     for raw in rows or []:
         if not isinstance(raw, Mapping):
@@ -120,7 +129,7 @@ def _normalize_rows(
         matched = re.search(r"\d{4}-\d{2}-\d{2}", str(raw_date or ""))
         if not matched:
             continue
-        trading_date = matched.group(0)
+        trading_date = sys.intern(matched.group(0))
         if trading_date < start_date or trading_date > end_date:
             continue
         values = {
@@ -371,6 +380,32 @@ DEFAULT_SOURCE_FETCHERS: Mapping[str, SourceFetcher] = MappingProxyType({
 })
 
 
+_HISTORICAL_ROW_STORAGE_TYPES: dict[
+    tuple[str, ...], tuple[type, object]
+] = {}
+
+
+def _immutable_historical_row(row: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Freeze a row in a key-sharing dict without changing mapping semantics."""
+
+    keys = tuple(row)
+    entry = _HISTORICAL_ROW_STORAGE_TYPES.get(keys)
+    if entry is None:
+        # Built-in rows have at most four stable schemas. Keep a defensive cap for
+        # custom fetchers so a long-lived caller cannot create unbounded classes.
+        if len(_HISTORICAL_ROW_STORAGE_TYPES) >= 16:
+            return MappingProxyType(dict(row))
+        storage_type = type("_HistoricalRowStorage", (), {})
+        seed = storage_type()
+        for key in keys:
+            seed.__dict__[key] = None
+        entry = (storage_type, seed)
+        _HISTORICAL_ROW_STORAGE_TYPES[keys] = entry
+    storage = entry[0]()
+    storage.__dict__.update(row)
+    return MappingProxyType(storage.__dict__)
+
+
 @dataclass(frozen=True)
 class HistoricalFetchConfig:
     sources: tuple[str, ...] = DEFAULT_HISTORICAL_SOURCE_PRIORITY
@@ -412,7 +447,7 @@ class HistoricalFetchConfig:
         object.__setattr__(self, "adjustment", adjustment)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class HistoricalSeries:
     symbol: str
     source: str
@@ -430,7 +465,64 @@ class HistoricalSeries:
         }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
+class HistoricalSeriesSummary:
+    """Compact metadata retained after raw bars have entered the replay engine."""
+
+    symbol: str
+    source: str
+    adjustment: str
+    bar_count: int
+    first_date: str
+    last_date: str
+    attempts: tuple[Mapping[str, Any], ...] = ()
+
+    @classmethod
+    def from_series(cls, series: HistoricalSeries) -> HistoricalSeriesSummary:
+        bars = series.bars
+        return cls(
+            symbol=series.symbol,
+            source=series.source,
+            adjustment=series.adjustment,
+            bar_count=len(bars),
+            first_date=str(bars[0].get("date") or "") if bars else "",
+            last_date=str(bars[-1].get("date") or "") if bars else "",
+            attempts=series.attempts,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "source": self.source,
+            "adjustment": self.adjustment,
+            "bar_count": self.bar_count,
+            "first_date": self.first_date,
+            "last_date": self.last_date,
+            "attempts": [dict(row) for row in self.attempts],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalDataSummary:
+    """Historical fetch metadata that does not retain raw per-session rows."""
+
+    series: Mapping[str, HistoricalSeriesSummary]
+    failures: Mapping[str, str] = field(default_factory=dict)
+
+    @property
+    def source_by_symbol(self) -> Mapping[str, str]:
+        return MappingProxyType({
+            symbol: value.source for symbol, value in self.series.items()
+        })
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "series": {symbol: value.to_dict() for symbol, value in self.series.items()},
+            "failures": dict(self.failures),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class HistoricalDataResult:
     series: Mapping[str, HistoricalSeries]
     failures: Mapping[str, str] = field(default_factory=dict)
@@ -442,6 +534,16 @@ class HistoricalDataResult:
     @property
     def source_by_symbol(self) -> Mapping[str, str]:
         return MappingProxyType({symbol: value.source for symbol, value in self.series.items()})
+
+    def summary(self) -> HistoricalDataSummary:
+        """Detach compact fetch metadata so callers can release raw bars early."""
+        return HistoricalDataSummary(
+            series=MappingProxyType({
+                symbol: HistoricalSeriesSummary.from_series(value)
+                for symbol, value in self.series.items()
+            }),
+            failures=MappingProxyType(dict(self.failures)),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -588,7 +690,7 @@ def fetch_historical_series(
                     symbol=normalized,
                     source=source,
                     adjustment=resolved.adjustment,
-                    bars=tuple(MappingProxyType(dict(row)) for row in rows),
+                    bars=tuple(_immutable_historical_row(row) for row in rows),
                     attempts=tuple(attempts),
                 )
             except Exception as exc:
@@ -667,7 +769,7 @@ def fetch_historical_data(
                 return_when=concurrent.futures.FIRST_COMPLETED,
             )
             for future in done:
-                symbol = futures[future]
+                symbol = futures.pop(future)
                 succeeded = False
                 try:
                     series[symbol] = future.result()
@@ -708,8 +810,10 @@ def fetch_historical_data(
 __all__ = [
     "HistoricalDataError",
     "HistoricalDataResult",
+    "HistoricalDataSummary",
     "HistoricalFetchConfig",
     "HistoricalSeries",
+    "HistoricalSeriesSummary",
     "FetchProgress",
     "DEFAULT_HISTORICAL_SOURCE_PRIORITY",
     "SUPPORTED_ADJUSTMENTS",

@@ -6,6 +6,61 @@ from app.dashboard.public_projection import PUBLIC_SCHEMA_VERSION, build_public_
 
 
 class PublicProjectionTests(unittest.TestCase):
+    def test_today_candidates_section_is_bounded_and_allow_listed(self) -> None:
+        sections = build_public_sections(
+            {},
+            today_candidates={
+                "current_date": "2026-08-28",
+                "generated_at": "2026-08-28 10:30:00",
+                "scan_count": 3,
+                "current_count": 1,
+                "items": [{
+                    "code": "600001",
+                    "name": "测试",
+                    "best_strategy": "niu_leader",
+                    "best_score": 9.1,
+                    "first_qualified_at": "2026-08-28 09:45:00",
+                    "last_qualified_at": "2026-08-28 10:30:00",
+                    "qualified_count": 2,
+                    "currently_qualified": True,
+                    "qualification_transitions": [{
+                        "at": "2026-08-28 09:45:00",
+                        "qualified": True,
+                        "score": 8.4,
+                        "strategy": "niu_leader",
+                        "private_note": "secret",
+                    }],
+                    "private_context": "/private/runtime/secret.json",
+                }],
+                "strategy_meta": {
+                    "niu_leader": {
+                        "label": "牛牛战法 · 领涨",
+                        "color": "#8b5cf6",
+                        "private_rule": "secret",
+                    }
+                },
+            },
+        )
+
+        section = sections["today_candidates"]
+        self.assertEqual(section["current_date"], "2026-08-28")
+        self.assertEqual(section["scan_count"], 3)
+        self.assertEqual(section["count"], 1)
+        self.assertEqual(section["current_count"], 1)
+        self.assertEqual(section["items"][0]["qualified_count"], 2)
+        self.assertTrue(section["items"][0]["currently_qualified"])
+        self.assertEqual(
+            section["items"][0]["qualification_transitions"],
+            [{
+                "at": "2026-08-28 09:45:00",
+                "qualified": True,
+                "score": 8.4,
+                "strategy": "niu_leader",
+            }],
+        )
+        self.assertNotIn("private_context", section["items"][0])
+        self.assertNotIn("private_rule", section["strategy_meta"]["niu_leader"])
+
     def test_projection_uses_allow_lists_and_removes_private_paths(self) -> None:
         sections = build_public_sections(
             {
@@ -14,6 +69,8 @@ class PublicProjectionTests(unittest.TestCase):
                 "initial_cash": 1_000_000,
                 "cash": 400_000,
                 "total_equity": 1_030_000,
+                "daily_pnl": 2500,
+                "daily_pnl_pct": 0.243,
                 "last_error": "/private/runtime/state.json: provider token=secret",
                 "positions": [{
                     "code": "600000",
@@ -76,6 +133,10 @@ class PublicProjectionTests(unittest.TestCase):
                     "daily_v_trough_date": "2026-07-15",
                     "daily_v_decline_pct": 12.5,
                     "daily_v_rebound_pct": 8.2,
+                    "stock_activity_score": 84.25,
+                    "stock_market_amount_percentile": 90.0,
+                    "stock_theme_amount_percentile": 75.0,
+                    "stock_activity_confirmed": True,
                     "hard_blockers": ["停牌"],
                     "private_note": "secret",
                 }],
@@ -108,6 +169,8 @@ class PublicProjectionTests(unittest.TestCase):
         )
 
         self.assertEqual(sections["metadata"]["schema_version"], PUBLIC_SCHEMA_VERSION)
+        self.assertEqual(sections["account"]["daily_pnl"], 2500)
+        self.assertEqual(sections["account"]["daily_pnl_pct"], 0.243)
         self.assertEqual(sections["metadata"]["current_date"], "2026-07-21")
         self.assertTrue(sections["metadata"]["degraded"])
         self.assertNotIn("generated_at", sections["metadata"])
@@ -156,6 +219,15 @@ class PublicProjectionTests(unittest.TestCase):
                 "signal_theme_return_correlation_rank_score"
             ],
             100.0,
+        )
+        self.assertEqual(
+            sections["candidates"]["items"][0]["stock_activity_score"],
+            84.25,
+        )
+        self.assertTrue(
+            sections["candidates"]["items"][0][
+                "stock_activity_confirmed"
+            ]
         )
         self.assertEqual(
             sections["candidates"]["items"][0][

@@ -11,7 +11,6 @@ const route = useRoute()
 const router = useRouter()
 const {
   activeCategory,
-  categoryAvailable,
   initializeDashboardTabs,
   items,
   setActiveCategory,
@@ -24,14 +23,12 @@ watch(
 )
 
 async function selectCategory(category) {
-  if (!categoryAvailable(category)) return
   if (category === activeCategory.value) return
   await router.push(dashboardCategoryPath(category))
 }
 
 onMounted(async () => {
   await initializeDashboardTabs()
-  if (!categoryAvailable(activeCategory.value)) await router.replace('/practice')
 })
 </script>
 

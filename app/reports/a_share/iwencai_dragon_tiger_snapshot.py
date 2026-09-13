@@ -19,7 +19,10 @@ from dashboard.apis.iwencai_service import (
     read_dragon_tiger_snapshot,
     write_dragon_tiger_snapshot,
 )
-from market_data.news_precheck import repair_cached_news_record
+from market_data.news_precheck import (
+    NewsPrecheckConfig,
+    cached_news_record_matches_source,
+)
 from a_share_calendar import trading_day_status
 from niuone_paths import get_dashboard_home
 
@@ -32,6 +35,34 @@ SNAPSHOT_FILE = Path(
 ).expanduser()
 CN_TZ = ZoneInfo("Asia/Shanghai")
 DEFAULT_DRAGON_TIGER_CRON = "0 18 * * 1-5"
+SNAPSHOT_STAGE_RANK = {
+    "core": 1,
+    "details": 2,
+    "news": 3,
+}
+
+
+def _snapshot_stage_rank(payload: Mapping[str, Any] | None) -> int:
+    if not isinstance(payload, Mapping):
+        return 0
+    stage = str(payload.get("snapshot_stage") or "").strip().lower()
+    if stage:
+        return SNAPSHOT_STAGE_RANK.get(stage, 0)
+    # Snapshots written before staged persistence were saved only after the
+    # complete refresh path, so they must not be downgraded by an intermediate
+    # stage during a same-day retry.
+    return SNAPSHOT_STAGE_RANK["news"]
+
+
+def _stage_can_replace(
+    previous_snapshot: Mapping[str, Any] | None,
+    candidate: Mapping[str, Any],
+) -> bool:
+    if not isinstance(previous_snapshot, Mapping):
+        return True
+    if str(previous_snapshot.get("date") or "") != str(candidate.get("date") or ""):
+        return True
+    return _snapshot_stage_rank(candidate) >= _snapshot_stage_rank(previous_snapshot)
 
 
 def _news_precheck_items(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
@@ -56,27 +87,27 @@ def _news_precheck_items(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     return candidates
 
 
-def _pending_news_items(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+def _pending_news_items(
+    payload: Mapping[str, Any],
+    *,
+    judgment_model: str = "",
+) -> list[Mapping[str, Any]]:
     return [
         item
         for item in _news_precheck_items(payload)
-        if not isinstance(item.get("news_precheck"), Mapping)
-        or item.get("news_precheck", {}).get("checked") is not True
+        if not cached_news_record_matches_source(
+            item.get("news_precheck"),
+            "iwencai",
+            judgment_model,
+        )
     ]
 
 
-def _locally_repairable_news_items(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
-    repairable: list[Mapping[str, Any]] = []
-    for item in _news_precheck_items(payload):
-        record = item.get("news_precheck")
-        if not isinstance(record, Mapping):
-            continue
-        if repair_cached_news_record(record) != dict(record):
-            repairable.append(item)
-    return repairable
-
-
-def _news_tracking_is_current(payload: Mapping[str, Any]) -> bool:
+def _news_tracking_is_current(
+    payload: Mapping[str, Any],
+    *,
+    judgment_model: str = "",
+) -> bool:
     candidates = _news_precheck_items(payload)
     checked_codes: list[str] = []
     pending_codes: list[str] = []
@@ -84,7 +115,7 @@ def _news_tracking_is_current(payload: Mapping[str, Any]) -> bool:
     for item in candidates:
         code = str(item.get("code") or item.get("name") or "").strip()
         record = item.get("news_precheck")
-        if isinstance(record, Mapping) and record.get("checked") is True:
+        if cached_news_record_matches_source(record, "iwencai", judgment_model):
             if code:
                 checked_codes.append(code)
             if record.get("available") is True:
@@ -120,10 +151,20 @@ def backfill_snapshot_news(
     snapshot = read_dragon_tiger_snapshot(path)
     if snapshot is None or not _news_precheck_items(snapshot):
         return snapshot, False
+    values = os.environ if env is None else env
+    enabled = str(
+        values.get("IWENCAI_NEWS_PRECHECK_ENABLED") or "0"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if not enabled:
+        return snapshot, False
+    try:
+        config = NewsPrecheckConfig.from_mapping(values)
+    except ValueError:
+        config = None
+    judgment_model = config.model if config is not None else ""
     if (
-        not _pending_news_items(snapshot)
-        and not _locally_repairable_news_items(snapshot)
-        and _news_tracking_is_current(snapshot)
+        not _pending_news_items(snapshot, judgment_model=judgment_model)
+        and _news_tracking_is_current(snapshot, judgment_model=judgment_model)
     ):
         return snapshot, False
     updated = enrich_consecutive_dragon_tiger_news(
@@ -172,8 +213,31 @@ def refresh_snapshot(
     env: dict[str, str] | None = None,
     trade_date: str | None = None,
 ) -> tuple[dict[str, object], bool]:
-    previous_snapshot, _ = backfill_snapshot_news(path, env=env)
-    payload = fetch_dragon_tiger(trade_date) if trade_date else fetch_dragon_tiger()
+    previous_snapshot = read_dragon_tiger_snapshot(path)
+    core_saved = False
+
+    def persist_core_snapshot(core_payload: Mapping[str, Any]) -> None:
+        nonlocal core_saved
+        calendar = trading_day_status(
+            str(core_payload.get("date") or ""),
+            allow_refresh=False,
+        )
+        staged = mark_consecutive_dragon_tiger_items(
+            core_payload,
+            previous_snapshot,
+            previous_trading_day=str(calendar.get("previous_trading_day") or ""),
+        )
+        staged["snapshot_stage"] = "core"
+        if _stage_can_replace(previous_snapshot, staged):
+            core_saved = write_dragon_tiger_snapshot(path, staged)
+
+    fetch_kwargs = {"on_core_payload": persist_core_snapshot}
+    payload = (
+        fetch_dragon_tiger(trade_date, **fetch_kwargs)
+        if trade_date
+        else fetch_dragon_tiger(**fetch_kwargs)
+    )
+    detail_saved = False
     if payload.get("available") is True and payload.get("items"):
         calendar = trading_day_status(
             str(payload.get("date") or ""),
@@ -184,12 +248,22 @@ def refresh_snapshot(
             previous_snapshot,
             previous_trading_day=str(calendar.get("previous_trading_day") or ""),
         )
+        payload["snapshot_stage"] = "details"
+        if _stage_can_replace(previous_snapshot, payload):
+            detail_saved = write_dragon_tiger_snapshot(path, payload)
         payload = enrich_consecutive_dragon_tiger_news(
             payload,
             env=env,
             previous_snapshot=previous_snapshot,
         )
-    saved = write_dragon_tiger_snapshot(path, payload)
+        payload["snapshot_stage"] = "news"
+    saved = write_dragon_tiger_snapshot(path, payload) or detail_saved or core_saved
+    if not saved and previous_snapshot is not None:
+        # A failed or empty new-date query still leaves the previous snapshot
+        # visible.  Complete its pending news after the current pull attempt so
+        # that this work can never consume the budget needed to publish a new
+        # core list.
+        backfill_snapshot_news(path, env=env)
     if saved:
         try:
             payload["expired_archive_count"] = expire_dragon_tiger_archives(
@@ -212,6 +286,8 @@ def catch_up_snapshot(
     if not target_date or latest_date > target_date:
         return latest, False
     if latest_date == target_date:
+        if _snapshot_stage_rank(latest) < SNAPSHOT_STAGE_RANK["details"]:
+            return refresh_snapshot(path, env=env, trade_date=target_date)
         return backfill_snapshot_news(path, env=env)
     return refresh_snapshot(path, env=env, trade_date=target_date)
 

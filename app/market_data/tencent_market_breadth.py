@@ -364,6 +364,8 @@ def build_tencent_quote_snapshot(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 "change_pct",
                 "high",
                 "low",
+                "upper_limit",
+                "lower_limit",
                 "amount",
                 "turnover",
                 "quote_time",

@@ -42,12 +42,14 @@ const groups = computed(() => {
           :class="toneClass(item.change_pct, 'index')"
         >
           <div class="index-name">{{ item.name }}</div>
-          <div class="index-price">{{ formatNumber(item.price) }}</div>
-          <div
-            v-if="item.change_pct != null"
-            class="index-change"
-            :class="toneClass(item.change_pct, 'index')"
-          >{{ Number(item.change_pct) > 0 ? '+' : '' }}{{ formatNumber(item.change_pct) }}%</div>
+          <div class="index-quote">
+            <div class="index-price">{{ formatNumber(item.price) }}</div>
+            <div
+              v-if="item.change_pct != null"
+              class="index-change"
+              :class="toneClass(item.change_pct, 'index')"
+            >{{ Number(item.change_pct) > 0 ? '+' : '' }}{{ formatNumber(item.change_pct) }}%</div>
+          </div>
           <IndexSparkline :item="item" />
           <div class="index-time">{{ item.time || '' }}</div>
         </article>

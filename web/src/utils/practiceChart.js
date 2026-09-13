@@ -1,4 +1,5 @@
 import { mergePracticeTimedRows } from './practicePayload.js'
+import { finitePracticeNumber } from './practiceDisplay.js'
 
 export function currentChinaDateKey(date = new Date()) {
   try {
@@ -12,6 +13,15 @@ export function currentChinaDateKey(date = new Date()) {
     if (get('year') && get('month') && get('day')) return `${get('year')}-${get('month')}-${get('day')}`
   } catch {}
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+}
+
+export function practiceCalendarDateState(date, currentDate = currentChinaDateKey()) {
+  const value = String(date || '').slice(0, 10)
+  const today = String(currentDate || '').slice(0, 10)
+  return {
+    today: Boolean(value && today && value === today),
+    future: Boolean(value && today && value > today),
+  }
 }
 
 export function tradingClockMinuteOfDay(timeText) {
@@ -130,8 +140,8 @@ export function normalizePracticeTradeMarkers(payload) {
       name: String(raw?.name || ''),
       shares: Number(raw?.shares),
       price: Number(raw?.price),
-      pnl: Number(raw?.pnl),
-      pnlPct: Number(raw?.pnl_pct),
+      pnl: finitePracticeNumber(raw?.cumulative_realized_pnl),
+      pnlPct: finitePracticeNumber(raw?.realized_return_pct),
       isFullExit: raw?.is_full_exit === true
         || (action === 'SELL' && afterPct != null && Number(afterPct) <= 0),
     }

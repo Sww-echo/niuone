@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import math
 from typing import Any
 
 from .lifecycle import (
@@ -23,10 +24,16 @@ from .registry import STRATEGY_DEFINITIONS, STRATEGY_POSITION_LIMIT_PCT
 
 NIUONE_TODAY_OBSERVATION_THRESHOLD = 60.0
 NIUONE_LEADER_MIN_SECTOR_RANK = 80.0
+NIUONE_MATURE_MIN_MARKET_AMOUNT_PERCENTILE = 60.0
+NIUONE_MATURE_MIN_THEME_AMOUNT_PERCENTILE = 50.0
+NIUONE_MIN_ENTRY_TURNOVER_PCT = 3.0
 NIUONE_DAILY_V_MIN_RECOVERY_RATIO = 0.60
 NIUONE_DAILY_V_MAX_RECOVERY_RATIO = 2.0
 NIUONE_REVERSAL_CONTINUATION_MIN_STRONG_COUNT = 6
 NIUONE_REVERSAL_CONTINUATION_MIN_STATE_STREAK = 3
+NIUONE_REVERSAL_ENTRY_MAX_CHANGE_PCT_EXCLUSIVE = 3.0
+NIUONE_THEME_ATTRIBUTION_CONFIDENCE_SCORE = 60.0
+NIUONE_THEME_LEADER_MIN_ATTRIBUTION_WEIGHT = 0.15
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -80,6 +87,85 @@ def niu_startup_theme_blocker(values: Mapping[str, Any]) -> str | None:
     return None
 
 
+def niuone_stock_activity_blocker(
+    strategy_id: str,
+    values: Mapping[str, Any],
+) -> str | None:
+    """Require observed capital participation for every NiuOne BUY route.
+
+    The legacy opt-in flag remains readable metadata, never an exemption.
+    Intraday turnover is actual cumulative turnover, not a full-day estimate.
+    """
+    if strategy_id not in NIUONE_LIFECYCLE_ACTION_LABELS:
+        return None
+    if values.get("stock_activity_data_available") is not True:
+        return "个股成交活跃度数据不可用，牛牛各阶段暂停入选"
+    market_percentile = _safe_float(
+        values.get("stock_market_amount_percentile"),
+        -1.0,
+    )
+    theme_percentile = _safe_float(
+        values.get("stock_theme_amount_percentile"),
+        -1.0,
+    )
+    if (
+        not math.isfinite(market_percentile)
+        or not math.isfinite(theme_percentile)
+        or not 0 <= market_percentile <= 100
+        or not 0 <= theme_percentile <= 100
+        or market_percentile + 1e-9
+        < NIUONE_MATURE_MIN_MARKET_AMOUNT_PERCENTILE
+        or theme_percentile + 1e-9
+        < NIUONE_MATURE_MIN_THEME_AMOUNT_PERCENTILE
+    ):
+        return (
+            "个股成交活跃度不足（全市场成交额分位需≥"
+            f"{NIUONE_MATURE_MIN_MARKET_AMOUNT_PERCENTILE:g}，题材内需≥"
+            f"{NIUONE_MATURE_MIN_THEME_AMOUNT_PERCENTILE:g}）"
+        )
+    return niuone_turnover_blocker(values.get("turnover"))
+
+
+def niuone_turnover_blocker(turnover: Any) -> str | None:
+    """Check cumulative turnover in percentage points, including exactly 3%."""
+    value = _safe_float(turnover, math.nan)
+    if isinstance(turnover, bool) or not math.isfinite(value) or value < 0:
+        return "个股换手率数据不可用，牛牛各阶段暂停买入"
+    if value + 1e-9 < NIUONE_MIN_ENTRY_TURNOVER_PCT:
+        return f"个股当日累计换手率需≥{NIUONE_MIN_ENTRY_TURNOVER_PCT:g}%，当前{value:.2f}%"
+    return None
+
+
+def niu_reversal_entry_price_blocker(
+    *,
+    price: Any,
+    previous_close: Any,
+) -> str | None:
+    """Reject chased first probes using the execution price, never a scan price.
+
+    Composition layers call this only for a zero-position Probe BUY. Existing
+    holdings and mature entry routes keep their own scale-in/entry policies.
+    """
+    current = _safe_float(price, math.nan)
+    reference = _safe_float(previous_close, math.nan)
+    if (
+        isinstance(price, bool)
+        or isinstance(previous_close, bool)
+        or not math.isfinite(current)
+        or not math.isfinite(reference)
+        or current <= 0
+        or reference <= 0
+    ):
+        return "牛牛试仓新开仓缺少有效现价或前收盘价，等待有效报价"
+    change_pct = (current / reference - 1.0) * 100.0
+    if change_pct >= NIUONE_REVERSAL_ENTRY_MAX_CHANGE_PCT_EXCLUSIVE - 1e-9:
+        return (
+            f"牛牛试仓新开仓涨幅{change_pct:.2f}%达到"
+            f"{NIUONE_REVERSAL_ENTRY_MAX_CHANGE_PCT_EXCLUSIVE:g}%，等待回落后重新评估"
+        )
+    return None
+
+
 def niu_reversal_recovery_blocker(
     values: Mapping[str, Any],
 ) -> str | None:
@@ -95,6 +181,65 @@ def niu_reversal_recovery_blocker(
         recovery_pct = NIUONE_DAILY_V_MAX_RECOVERY_RATIO * 100
         return f"V型右侧修复已达到左侧跌幅的{recovery_pct:g}%，不再按早期试仓"
     return None
+
+
+def niu_reversal_theme_attribution_blocker(
+    values: Mapping[str, Any],
+) -> str | None:
+    """Require participation in the selected theme, even for non-leader probes.
+
+    Action routing retains a weak fallback for diagnostics. It is not entry
+    evidence. Reuse the established theme membership boundary and preserve
+    the high-evidence primary-theme exception for multi-concept stocks.
+    """
+    raw_weight = values.get("signal_theme_attribution_weight")
+    raw_score = values.get("signal_theme_attribution_score")
+    weight = _safe_float(raw_weight, math.nan)
+    score = _safe_float(raw_score, math.nan)
+    if (
+        isinstance(raw_weight, bool) or isinstance(raw_score, bool)
+        or not math.isfinite(weight) or not 0 <= weight <= 1
+        or not math.isfinite(score) or not 0 <= score <= 100
+    ):
+        return "牛牛试仓题材归因数据不可用，等待有效归因证据"
+    if weight >= NIUONE_THEME_LEADER_MIN_ATTRIBUTION_WEIGHT:
+        return None
+
+    # Recompute primary identity from the complete attribution list; a model
+    # flag or a high score on a secondary theme cannot grant this exception.
+    attributions = values.get("theme_attributions")
+    if isinstance(attributions, list) and attributions:
+        valid: list[Mapping[str, Any]] = []
+        for item in attributions:
+            if not isinstance(item, Mapping):
+                break
+            item_score = _safe_float(item.get("attribution_score"), math.nan)
+            if (
+                not str(item.get("theme") or "").strip()
+                or isinstance(item.get("attribution_score"), bool)
+                or not math.isfinite(item_score) or not 0 <= item_score <= 100
+            ):
+                break
+            valid.append(item)
+        if len(valid) == len(attributions):
+            # The scorer already orders score ties by stock rank and name;
+            # max preserves that order without requiring omitted rank fields.
+            primary = max(valid, key=lambda item: float(item["attribution_score"]))
+            if (
+                str(primary["theme"]).strip()
+                == str(values.get("signal_theme") or values.get("industry") or "").strip()
+                and score >= NIUONE_THEME_ATTRIBUTION_CONFIDENCE_SCORE
+                and math.isclose(score, float(primary["attribution_score"]), abs_tol=1e-9)
+                and math.isclose(
+                    weight, _safe_float(primary.get("attribution_weight"), math.nan),
+                    abs_tol=1e-9,
+                )
+            ):
+                return None
+    return (
+        "牛牛试仓题材归因不足（权重需≥15%，"
+        "或为归因分≥60的首要题材）"
+    )
 
 
 def niu_reversal_continuation_blocker(
@@ -337,6 +482,12 @@ def candidate_buy_blockers(
         )
         if lifecycle_blocker and lifecycle_blocker not in blockers:
             blockers.append(lifecycle_blocker)
+        activity_blocker = niuone_stock_activity_blocker(
+            strategy_id,
+            candidate,
+        )
+        if activity_blocker and activity_blocker not in blockers:
+            blockers.append(activity_blocker)
     raw_score = candidate.get("best_score")
     if raw_score is None:
         raw_score = candidate.get("score")
@@ -361,6 +512,9 @@ def candidate_buy_blockers(
         ):
             blockers.append("主升动量试仓身份条件不完整")
     if strategy_id == "niu_reversal_probe":
+        attribution_blocker = niu_reversal_theme_attribution_blocker(candidate)
+        if attribution_blocker and attribution_blocker not in blockers:
+            blockers.append(attribution_blocker)
         recovery_blocker = niu_reversal_recovery_blocker(candidate)
         if recovery_blocker and recovery_blocker not in blockers:
             blockers.append(recovery_blocker)

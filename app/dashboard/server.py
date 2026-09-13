@@ -15,12 +15,12 @@ import time
 import subprocess
 import sys
 import threading
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
-from urllib.parse import urlparse
+from typing import Any, Callable, Iterable
+import urllib.error
 import urllib.request
 
 from a_share_calendar import is_a_share_trading_day as calendar_is_a_share_trading_day, trading_day_status
@@ -30,9 +30,32 @@ from dashboard_json_cache import (
     write_json_cache,
 )
 from core.process_lease import FileLease
+from core.model_api import (
+    build_model_request,
+    normalize_model_stream_mode,
+    normalize_reasoning_effort,
+    request_model_complete,
+    stream_model_response,
+)
+from core.model_reasoning import (
+    reasoning_effort_capability_catalog,
+    resolve_model_reasoning_effort,
+)
+from core.shared_model_config import (
+    LEGACY_SUMMARY_MODEL_ENV_NAMES,
+    SHARED_MODEL_ENV_NAMES,
+    SHARED_MODEL_NAMES,
+    legacy_summary_migration_values,
+    resolve_shared_model_config,
+)
 from dashboard import practice_payload as practice_payload_impl
 from dashboard import practice_market_summary as practice_market_summary_impl
 from dashboard.niuone_mainline import build_niuone_mainline_view
+from dashboard.today_candidates import (
+    TODAY_CANDIDATES_SCHEMA_VERSION,
+    build_today_candidate_intraday_payload,
+    build_today_candidates_payload,
+)
 from dashboard import response_cache as response_cache_impl
 from dashboard import security as security_impl
 from dashboard import visit_stats as visit_stats_impl
@@ -43,9 +66,11 @@ from dashboard.iwencai_connectivity import (
 )
 from dashboard.model_connectivity import (
     MODEL_TEST_TARGET_BY_ID,
+    ResolvedModelTestConfig,
     model_test_metadata,
     model_test_override_names,
     model_test_setting_names,
+    resolve_model_test_config,
     test_model_connection,
 )
 from dashboard.apis.iwencai_service import (
@@ -80,6 +105,7 @@ from dashboard.apis.market_breadth import (
     append_market_breadth_sample,
     build_market_breadth_payload,
     compact_market_breadth_sample,
+    compact_previous_market_breadth_history,
     compact_previous_turnover_history,
     is_market_breadth_session_timestamp,
     roll_market_breadth_history,
@@ -88,6 +114,7 @@ from dashboard.apis.market_retention import (
     market_retention_date_key,
     seconds_until_next_market_retention_rollover,
 )
+from app.dashboard.market_breadth_recovery import plan_market_breadth_recovery
 from market_data.iwencai_client import (
     DEFAULT_BASE_URL as IWENCAI_DEFAULT_BASE_URL,
     normalize_base_url as normalize_iwencai_base_url,
@@ -108,11 +135,33 @@ from market_data.tencent_kline_cache import (
     mark_prewarm_run_failed,
     prewarm_completed_for_date,
 )
+from app.monitoring.news import (
+    DEFAULT_MAX_IMPORTANT_ITEMS as DEFAULT_NEWSNOW_MAX_IMPORTANT_ITEMS,
+    DEFAULT_MAX_ITEMS as DEFAULT_NEWSNOW_MAX_ITEMS,
+    DEFAULT_SOURCE_IDS as DEFAULT_NEWSNOW_SOURCE_IDS,
+    MAX_MAX_IMPORTANT_ITEMS as NEWSNOW_MAX_IMPORTANT_ITEMS_MAX,
+    MAX_MAX_ITEMS as NEWSNOW_MAX_ITEMS_MAX,
+    MIN_MAX_IMPORTANT_ITEMS as NEWSNOW_MAX_IMPORTANT_ITEMS_MIN,
+    MIN_MAX_ITEMS as NEWSNOW_MAX_ITEMS_MIN,
+    NewsNowConfig,
+    NewsNowConfigurationError,
+    NewsNowService,
+    SUPPORTED_SOURCES as NEWSNOW_SUPPORTED_SOURCES,
+    normalize_endpoint as normalize_newsnow_endpoint,
+    parse_source_ids as parse_newsnow_source_ids,
+    shared_newsnow_service,
+    source_options as newsnow_source_options,
+)
 from niuone_paths import apply_container_runtime_overrides, get_dashboard_env_file, get_dashboard_home, get_local_data_dir
 import push_history
 from screening.candidate_cache import (
     build_practice_candidates_cache_payload,
     write_practice_candidates_cache,
+)
+from screening.holding_cycle import (
+    HOLDING_CYCLE_KIND,
+    build_holding_cycle_payload,
+    merge_niuone_holding_cycle_context,
 )
 from screening.niuone_mainline_cache import (
     build_niuone_mainline_summary_cache_payload,
@@ -128,6 +177,16 @@ from screening.stock_universe import (
     normalize_stock_universe,
     selected_stock_universe,
 )
+from storage.prompt_strategies import PromptStrategyStore
+from strategies.prompt_refinement import (
+    PromptRefinementContractError,
+    PromptRefinementCoverageError,
+    PromptRefinementParseError,
+    build_refinement_messages,
+    finalize_prompt_refinement,
+    refine_prompt_once,
+)
+from strategies.rules import DEFAULT_FEATURE_REGISTRY, compile_strategy_spec
 from strategies.registry import (
     ACTIVE_STRATEGY_ENV,
     PERSONA_STRATEGY_ENV,
@@ -138,6 +197,7 @@ from strategies.registry import (
     STRATEGY_SOURCE_BUILTIN,
     STRATEGY_SOURCE_ENV,
     STRATEGY_SOURCE_OPTIONS,
+    STRATEGY_SOURCE_PRESET_TEXT,
     active_strategy_suite,
     decode_preset_strategy_text,
     decode_trade_discipline_text,
@@ -194,6 +254,7 @@ CONFIG_PATH = Path(os.environ.get("DASHBOARD_CONFIG") or str(DASHBOARD_HOME / "c
 DASHBOARD_ENV_FILE = get_dashboard_env_file(PROJECT_ROOT)
 CRON_OUTPUT_DIR = DASHBOARD_HOME / "cron" / "output"
 CRON_STATE_DIR = DASHBOARD_HOME / "cron" / "state"
+NEWSNOW_CACHE_FILE = DASHBOARD_HOME / "news" / "realtime_news_latest.json"
 INDICES_SNAPSHOT_FILE = CRON_OUTPUT_DIR / "indices_dashboard_cache.json"
 IWENCAI_DRAGON_TIGER_SNAPSHOT_FILE = Path(
     os.environ.get("IWENCAI_DRAGON_TIGER_SNAPSHOT_FILE")
@@ -201,6 +262,7 @@ IWENCAI_DRAGON_TIGER_SNAPSHOT_FILE = Path(
 ).expanduser()
 B1_CACHE_FILE = CRON_OUTPUT_DIR / "b1_screen_latest.json"
 PRACTICE_CANDIDATES_CACHE_FILE = CRON_OUTPUT_DIR / "practice_candidates_latest.json"
+TODAY_CANDIDATES_CACHE_FILE = CRON_OUTPUT_DIR / "today_candidates_latest.json"
 NIUONE_MAINLINE_CACHE_FILE = CRON_OUTPUT_DIR / "niuone_mainline_latest.json"
 NIUONE_MAINLINE_MINUTE_CACHE_FILE = CRON_OUTPUT_DIR / "niuone_mainline_minute_latest.json"
 NIUONE_MAINLINE_SUMMARY_CACHE_FILE = CRON_OUTPUT_DIR / "niuone_mainline_summary_latest.json"
@@ -221,7 +283,6 @@ VISITOR_COOKIE_NAME = "niuone_visitor_id"
 ACTION_HEADER_NAME = "X-NiuOne-Action"
 ACTION_HEADER_VALUES = {"1", "true", "yes", "on"}
 TRUTHY_VALUES = {"1", "true", "yes", "on"}
-US_FEATURE_CATEGORIES = {"x_monitor", "us_ratings"}
 INDUSTRY_FLOW_PLAYBACK_SPEED_OPTIONS = (0.5, 0.75, 1.0, 1.5, 2.0, 5.0, 10.0)
 INDUSTRY_FLOW_WINDOW_CONFIG_NAMES = (
     "DASHBOARD_INDUSTRY_FLOW_MORNING_START",
@@ -277,7 +338,6 @@ def _industry_flow_sampling_windows_value(
 
 NIUONE_LAUNCHD_LABELS = (
     "ai.niuone.cron-scheduler",
-    "ai.niuone.x-watchlist",
     "ai.niuone.dashboard",
 )
 NIUONE_RESTART_DELAY_SECONDS = float(os.environ.get("NIUONE_RESTART_DELAY_SECONDS", "1.2") or "1.2")
@@ -294,8 +354,15 @@ B1_SCAN_TIMEOUT_SECONDS = int(os.environ.get("DASHBOARD_B1_SCAN_TIMEOUT_SECONDS"
 PRACTICE_SCHEDULE_TIMES_ENV = "DASHBOARD_PRACTICE_SCHEDULE_TIMES"
 LEGACY_B1_SCHEDULE_TIMES_ENV = "DASHBOARD_B1_SCHEDULE_TIMES"
 DEFAULT_PRACTICE_SCHEDULE_TIMES = "09:25,10:00,10:30,11:00,11:20,13:00,13:30,14:00,14:30,14:50"
+PRACTICE_FAST_CYCLE_ENABLED_ENV = "DASHBOARD_PRACTICE_FAST_CYCLE_ENABLED"
+PRACTICE_FAST_CYCLE_INTERVAL_ENV = (
+    "DASHBOARD_PRACTICE_FAST_CYCLE_INTERVAL_SECONDS"
+)
+DEFAULT_PRACTICE_FAST_CYCLE_INTERVAL_SECONDS = 300
+MIN_PRACTICE_FAST_CYCLE_INTERVAL_SECONDS = 60
+MAX_PRACTICE_FAST_CYCLE_INTERVAL_SECONDS = 900
 NIUONE_FORWARD_COHORT_START_ENV = "DASHBOARD_NIUONE_FORWARD_COHORT_START"
-DEFAULT_NIUONE_FORWARD_COHORT_START = "2026-08-04"
+DEFAULT_NIUONE_FORWARD_COHORT_START = "2026-09-10"
 
 
 def resolve_practice_schedule_times(values: Mapping[str, str] | None = None) -> tuple[str, ...]:
@@ -314,6 +381,15 @@ def resolve_practice_schedule_times(values: Mapping[str, str] | None = None) -> 
 
 
 PRACTICE_SCHEDULE_TIMES = resolve_practice_schedule_times()
+PRACTICE_FAST_CYCLE_ENABLED = str(
+    os.environ.get(PRACTICE_FAST_CYCLE_ENABLED_ENV, "0") or "0"
+).strip().lower() not in {"0", "false", "no", "off"}
+PRACTICE_FAST_CYCLE_INTERVAL_SECONDS = _bounded_int_value(
+    os.environ.get(PRACTICE_FAST_CYCLE_INTERVAL_ENV),
+    DEFAULT_PRACTICE_FAST_CYCLE_INTERVAL_SECONDS,
+    MIN_PRACTICE_FAST_CYCLE_INTERVAL_SECONDS,
+    MAX_PRACTICE_FAST_CYCLE_INTERVAL_SECONDS,
+)
 B1_SCHEDULE_ENABLED = os.environ.get("DASHBOARD_B1_SCHEDULE_ENABLED", "1").lower() not in {"0", "false", "no"}
 B1_SCHEDULE_STATE_FILE = CRON_STATE_DIR / "b1_schedule_state.json"
 B1_SCHEDULE_HISTORY_RETENTION_DAYS = 400
@@ -322,6 +398,7 @@ B1_SCHEDULE_STALE_SECONDS = int(os.environ.get("DASHBOARD_B1_SCHEDULE_STALE_SECO
 B1_SCHEDULE_RUN_KEYS: set[str] = set()
 B1_SCHEDULE_LOCK = threading.RLock()
 B1_SCHEDULE_THREAD: threading.Thread | None = None
+PRACTICE_FAST_CYCLE_THREAD: threading.Thread | None = None
 NIUONE_MAINLINE_SCAN_LOCK = threading.Lock()
 NIUONE_MAINLINE_SCAN_THREAD: threading.Thread | None = None
 DEFAULT_KLINE_PREWARM_TIME = "09:10"
@@ -372,7 +449,13 @@ INDUSTRY_FLOW_SAMPLER_THREAD: threading.Thread | None = None
 MARKET_BREADTH_HISTORY_LOCK = threading.RLock()
 MARKET_BREADTH_REFRESH_LOCK = threading.Lock()
 MARKET_BREADTH_SAMPLER_THREAD: threading.Thread | None = None
+MARKET_BREADTH_AUTO_RECOVERY_THREAD: threading.Thread | None = None
 DAILY_MARKET_HISTORY_RESET_THREAD: threading.Thread | None = None
+MARKET_BREADTH_AUTO_RECOVERY_DEADLINE_SECONDS = 900
+MARKET_BREADTH_AUTO_RECOVERY_PROCESS_TIMEOUT_SECONDS = 960
+MARKET_BREADTH_AUTO_RECOVERY_RETRY_SECONDS = 60.0
+MARKET_BREADTH_AUTO_RECOVERY_MAX_ATTEMPTS = 3
+MARKET_API_PREWARM_THREAD: threading.Thread | None = None
 MARKET_BREADTH_SAMPLE_INTERVAL_SECONDS = _bounded_int_value(
     os.environ.get(
         "DASHBOARD_MARKET_BREADTH_SAMPLE_INTERVAL_SECONDS",
@@ -400,6 +483,9 @@ INDUSTRY_FLOW_PLAYBACK_SPEED = _industry_flow_playback_speed_value(
 INDUSTRY_FLOW_SAMPLING_WINDOWS = _industry_flow_sampling_windows_value(os.environ)
 B1_CANDIDATE_REFRESH_LOCK = threading.Lock()
 B1_FULL_SCAN_LOCK = threading.Lock()
+B1_FULL_SCAN_CONDITION = threading.Condition(threading.RLock())
+B1_FULL_SCAN_ACTIVE: dict[str, Any] = {}
+B1_FULL_SCAN_LAST_RESULT: dict[str, Any] = {}
 B1_CANDIDATE_REFRESH_MIN_SECONDS = float(os.environ.get("DASHBOARD_B1_CANDIDATE_REFRESH_MIN_SECONDS", "0") or "0")
 B1_CANDIDATE_REFRESH_LAST_TS = 0.0
 MULTI_STRATEGY_CACHE_FILE = CRON_OUTPUT_DIR / "multi_strategy_latest.json"
@@ -419,6 +505,7 @@ PRACTICE_MANUAL_SCAN_REUSE_SECONDS = max(
     0,
     int(os.environ.get("DASHBOARD_MANUAL_SCAN_REUSE_SECONDS", "0") or "0"),
 )
+PRACTICE_MANUAL_ERROR_DISPLAY_SECONDS = 10 * 60
 PRACTICE_MANUAL_CYCLE_STATE: dict[str, Any] = {
     "running": False,
     "stage": "idle",
@@ -444,6 +531,10 @@ PRACTICE_MANUAL_CYCLE_PUBLIC_FIELDS = (
     "generated_at",
     "candidate_count",
     "manual_scan_reused",
+    "joined_existing_scan",
+    "active_scan_job_id",
+    "notice_code",
+    "notice",
     "failure_stage",
     "error_code",
     "error",
@@ -476,18 +567,13 @@ CN_TZ = timezone(timedelta(hours=8), "Asia/Shanghai")
 # so 1000 viewers do not trigger 1000 identical DB/行情/akshare computations.
 API_RESPONSE_CACHE: dict[str, dict[str, Any]] = {}
 API_RESPONSE_LOCK = threading.RLock()
+TODAY_CANDIDATES_LOCK = threading.Lock()
 API_CACHE_KEY_LOCKS: dict[str, threading.Lock] = {}
 API_CACHE_KEY_GENERATIONS: dict[str, int] = {}
 API_CACHE_MAX_ENTRIES = int(os.environ.get("DASHBOARD_API_CACHE_MAX_ENTRIES", "256") or "256")
 API_STALE_WHILE_REFRESH_SECONDS = int(
     os.environ.get("DASHBOARD_API_STALE_WHILE_REFRESH_SECONDS", "300") or "300"
 )
-X_MEDIA_CACHE: dict[str, dict[str, Any]] = {}
-X_MEDIA_CACHE_LOCK = threading.RLock()
-X_MEDIA_CACHE_MAX_ENTRIES = int(os.environ.get("DASHBOARD_X_MEDIA_CACHE_MAX_ENTRIES", "96") or "96")
-X_MEDIA_CACHE_TTL_SECONDS = int(os.environ.get("DASHBOARD_X_MEDIA_CACHE_TTL_SECONDS", str(7 * 24 * 3600)) or str(7 * 24 * 3600))
-X_MEDIA_MAX_BYTES = int(os.environ.get("DASHBOARD_X_MEDIA_MAX_BYTES", str(8 * 1024 * 1024)) or str(8 * 1024 * 1024))
-X_MEDIA_ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif", "image/avif"}
 EDGE_CACHE_ENABLED = os.environ.get("DASHBOARD_EDGE_CACHE_ENABLED", "0").lower() in {"1", "true", "yes", "on"}
 API_DEFAULT_LIMIT = 80
 API_LIMIT_MAX = 200
@@ -507,6 +593,14 @@ MODEL_TEST_TIMEOUT_SECONDS = max(
 )
 MODEL_TEST_MAX_CONCURRENCY = 2
 MODEL_TEST_SEMAPHORE = threading.BoundedSemaphore(MODEL_TEST_MAX_CONCURRENCY)
+PROMPT_REFINEMENT_MAX_CONCURRENCY = max(
+    1,
+    min(2, int(os.environ.get("DASHBOARD_PROMPT_REFINEMENT_MAX_CONCURRENCY", "1") or "1")),
+)
+PROMPT_REFINEMENT_SEMAPHORE = threading.BoundedSemaphore(
+    PROMPT_REFINEMENT_MAX_CONCURRENCY
+)
+PROMPT_REFINEMENT_MAX_ATTEMPTS = 2
 IWENCAI_TEST_MAX_CONCURRENCY = 2
 IWENCAI_TEST_SEMAPHORE = threading.BoundedSemaphore(IWENCAI_TEST_MAX_CONCURRENCY)
 RATE_LIMIT_BUCKETS: dict[tuple[str, str], tuple[float, int]] = {}
@@ -515,7 +609,24 @@ ADMIN_TOKEN_LOCK = threading.Lock()
 VISIT_STATS_LOCK = threading.RLock()
 VISIT_STATS_INIT_SIGNATURE: tuple[Any, ...] | None = None
 ENV_FILE_WRITE_LOCK = threading.RLock()
+NEWSNOW_SERVICE_LOCK = threading.Lock()
+NEWSNOW_SERVICE: NewsNowService | None = None
+NEWSNOW_CONFIG_NAMES = (
+    "NEWSNOW_ENABLED",
+    "NEWSNOW_DECISION_ENABLED",
+    "NEWSNOW_OVERVIEW_IMPORTANT_ONLY",
+    "NEWSNOW_BASE_URL",
+    "NEWSNOW_SOURCES",
+    "NEWSNOW_MAX_ITEMS",
+    "NEWSNOW_MAX_IMPORTANT_ITEMS",
+    "NEWSNOW_REFRESH_SECONDS",
+    "NEWSNOW_TIMEOUT_SECONDS",
+    "NEWSNOW_MAX_RETRIES",
+    "NEWSNOW_MAX_CONCURRENCY",
+)
 PRACTICE_CANDIDATES_CACHE_KEY = "practice_candidates"
+TODAY_CANDIDATES_CACHE_KEY = "today_candidates"
+TODAY_CANDIDATE_INTRADAY_CACHE_KEY = "today_candidate_intraday"
 NIUONE_MAINLINE_CACHE_KEY = "niuone_mainline"
 PRACTICE_CANDIDATES_API_PATHS = frozenset({"/api/practice_candidates", "/api/b1_screen"})
 PRACTICE_CANDIDATES_REFRESH_API_PATHS = frozenset({"/api/practice_candidates/refresh", "/api/b1_screen/trigger"})
@@ -524,11 +635,18 @@ PRACTICE_MARKET_SUMMARY_API_PATH = "/api/niuniu_practice/market-summary"
 PRACTICE_MARKET_SUMMARY_FILE = CRON_OUTPUT_DIR / "practice_market_summary_latest.json"
 API_TTLS = {
     "messages": 10,
+    "realtime_news": 15,
     "practice_candidates": int(
         os.environ.get("DASHBOARD_PRACTICE_CANDIDATES_TTL_SECONDS")
         or os.environ.get("DASHBOARD_B1_SCREEN_TTL_SECONDS")
         or "15"
     ),
+    "today_candidates": int(
+        os.environ.get("DASHBOARD_PRACTICE_CANDIDATES_TTL_SECONDS")
+        or os.environ.get("DASHBOARD_B1_SCREEN_TTL_SECONDS")
+        or "15"
+    ),
+    "today_candidate_intraday": 45,
     "niuone_mainline": int(os.environ.get("DASHBOARD_NIUONE_MAINLINE_TTL_SECONDS", "15") or "15"),
     "niuniu_practice": int(os.environ.get("DASHBOARD_PRACTICE_TTL_SECONDS", "15") or "15"),
     "practice_benchmarks": 30,
@@ -540,8 +658,6 @@ API_TTLS = {
     "money_flow": 60,
     "industry_flow": 30,
     "market_flow": 30,
-    "us_quotes": 30,
-    "us_profiles": int(os.environ.get("DASHBOARD_US_PROFILES_TTL_SECONDS", "86400") or "86400"),
     "us_market_summary": int(os.environ.get("DASHBOARD_US_MARKET_SUMMARY_TTL_SECONDS", "300") or "300"),
     "iwencai_dragon_tiger": int(os.environ.get("IWENCAI_CACHE_TTL_SECONDS", "300") or "300"),
 }
@@ -567,11 +683,11 @@ ENV_CONFIG_SCHEMA: list[dict[str, Any]] = [
     {"name": "DASHBOARD_PUSH_HISTORY_DB", "label": "消息历史 DB", "group": "基础路径", "kind": "path", "default": str(DASHBOARD_HOME / "push_history.db"), "effect": "restart"},
     {"name": "DASHBOARD_PORTFOLIO_STATE", "label": "模拟账户状态文件", "group": "基础路径", "kind": "path", "default": str(DASHBOARD_HOME / "cron" / "output" / "niuniu_practice_portfolio.json"), "effect": "restart"},
     {"name": "DASHBOARD_NIUNIU_DB", "label": "实战页面 DB", "group": "基础路径", "kind": "path", "default": str(DASHBOARD_HOME / "niuniu.db"), "effect": "restart"},
+    {"name": "DASHBOARD_PROMPT_STRATEGY_DB", "label": "文字策略版本与审计 DB", "group": "基础路径", "kind": "path", "default": str(DASHBOARD_HOME / "prompt_strategies.db"), "effect": "restart"},
     {"name": "DASHBOARD_TRADER_SCRIPT", "label": "实战页面脚本", "group": "基础路径", "kind": "path", "default": str(ENTRYPOINT_DIR / "niuniu_practice_trader.py"), "effect": "restart"},
     {"name": "DASHBOARD_B1_SCANNER", "label": "实战选股扫描脚本", "group": "基础路径", "kind": "path", "default": str(ENTRYPOINT_DIR / "multi_strategy_screen.py"), "effect": "restart"},
     {"name": "DASHBOARD_CN_STOCK_TOOLS", "label": "A股行情工具脚本", "group": "基础路径", "kind": "path", "default": str(ENTRYPOINT_DIR / "cn_stock_tools.py"), "effect": "restart"},
     {"name": "DASHBOARD_CRON_JOBS", "label": "Cron jobs JSON", "group": "基础路径", "kind": "path", "default": str(DASHBOARD_HOME / "cron" / "jobs.json"), "effect": "next_run"},
-    {"name": "DASHBOARD_X_WATCHLIST_STATE", "label": "X 监控状态文件", "group": "基础路径", "kind": "path", "default": str(DASHBOARD_HOME / "cron" / "state" / "x_watchlist_latest.json"), "effect": "next_run"},
     {"name": "DASHBOARD_PUBLIC_DATA_DIR", "label": "公开快照目录", "group": "基础路径", "kind": "path", "default": str(DASHBOARD_HOME / "public-data"), "effect": "restart"},
     {"name": "DASHBOARD_PUBLIC_PROJECTION_ENABLED", "label": "公开增量快照", "group": "基础路径", "kind": "bool", "default": "1", "effect": "restart"},
 
@@ -586,9 +702,6 @@ ENV_CONFIG_SCHEMA: list[dict[str, Any]] = [
     {"name": "DASHBOARD_RATE_LIMIT_ADMIN", "label": "管理操作/窗口", "group": "限流与缓存", "kind": "int", "default": "90", "effect": "restart"},
     {"name": "DASHBOARD_API_CACHE_MAX_ENTRIES", "label": "API 缓存条目上限", "group": "限流与缓存", "kind": "int", "default": "256", "effect": "restart"},
     {"name": "DASHBOARD_API_OFFSET_MAX", "label": "消息分页最大 offset", "group": "限流与缓存", "kind": "int", "default": "5000", "effect": "restart"},
-    {"name": "DASHBOARD_X_MEDIA_CACHE_MAX_ENTRIES", "label": "X 图片缓存条目上限", "group": "限流与缓存", "kind": "int", "default": "96", "effect": "restart"},
-    {"name": "DASHBOARD_X_MEDIA_CACHE_TTL_SECONDS", "label": "X 图片缓存 TTL 秒数", "group": "限流与缓存", "kind": "int", "default": str(7 * 24 * 3600), "effect": "restart"},
-    {"name": "DASHBOARD_X_MEDIA_MAX_BYTES", "label": "X 图片代理最大字节", "group": "限流与缓存", "kind": "int", "default": str(8 * 1024 * 1024), "effect": "restart"},
     {"name": "DASHBOARD_PUBLIC_REFRESH_SECONDS", "label": "公开快照刷新秒数", "group": "行情与资金流设置", "kind": "int", "default": "15", "effect": "restart"},
     {"name": "DASHBOARD_NIUONE_MAINLINE_MINUTE_REFRESH_ENABLED", "label": "题材强度跟随全市场行情更新", "group": "行情与资金流设置", "kind": "bool", "default": "1", "effect": "restart"},
     {
@@ -619,11 +732,86 @@ ENV_CONFIG_SCHEMA: list[dict[str, Any]] = [
         "help_footer": "仅在 A 股交易日 09:30–11:30、13:00–15:00 生效；允许 30–600 秒，保存后需重启 Dashboard。",
     },
 
+    {
+        "name": "NEWSNOW_ENABLED",
+        "label": "启用财经快讯",
+        "group": "财经快讯",
+        "kind": "bool",
+        "default": "1",
+        "effect": "runtime",
+        "bool_no_default": "1",
+    },
+    {
+        "name": "NEWSNOW_DECISION_ENABLED",
+        "label": "重要快讯辅助买卖决策",
+        "group": "财经快讯",
+        "kind": "bool",
+        "default": "1",
+        "effect": "runtime",
+        "bool_no_default": "1",
+        "help_title": "决策信息归属",
+        "help_summary": "开启后，模型决策只读取上游标记为重要且具备可靠发布时间的财经快讯。",
+        "help_footer": "交易日 15:00 前的快讯归属当日；15:00 后及休市日快讯归属下一交易日。快讯只作辅助，不会绕过候选资格、仓位与风控。",
+    },
+    {
+        "name": "NEWSNOW_OVERVIEW_IMPORTANT_ONLY",
+        "label": "在总览中仅显示重要信息",
+        "group": "财经快讯",
+        "kind": "bool",
+        "default": "1",
+        "effect": "runtime",
+        "bool_no_default": "1",
+    },
+    {
+        "name": "NEWSNOW_SOURCES",
+        "label": "新闻数据源",
+        "group": "财经快讯",
+        "kind": "news_sources",
+        "default": ",".join(DEFAULT_NEWSNOW_SOURCE_IDS),
+        "effect": "runtime",
+        "help_title": "NewsNow 数据源",
+        "help_summary": "可搜索并多选 NewsNow 当前财经商业来源；至少选择一项。",
+        "help_footer": "兼容跳转别名不会重复显示。来源越多，首次刷新耗时和上游请求量越大，建议按需选择。",
+    },
+    {
+        "name": "NEWSNOW_MAX_ITEMS",
+        "label": "快讯总保留上限",
+        "group": "财经快讯",
+        "kind": "int",
+        "default": str(DEFAULT_NEWSNOW_MAX_ITEMS),
+        "effect": "runtime",
+        "min": str(NEWSNOW_MAX_ITEMS_MIN),
+        "max": str(NEWSNOW_MAX_ITEMS_MAX),
+        "help_title": "滚动历史容量",
+        "help_summary": "控制财经快讯完整页和本地持久缓存合计保留的最大条数。",
+        "help_footer": "成功刷新会合并去重后按新到旧裁剪；重要快讯在总容量内优先保留。",
+    },
+    {
+        "name": "NEWSNOW_MAX_IMPORTANT_ITEMS",
+        "label": "重要快讯保留上限",
+        "group": "财经快讯",
+        "kind": "int",
+        "default": str(DEFAULT_NEWSNOW_MAX_IMPORTANT_ITEMS),
+        "effect": "runtime",
+        "min": str(NEWSNOW_MAX_IMPORTANT_ITEMS_MIN),
+        "max": str(NEWSNOW_MAX_IMPORTANT_ITEMS_MAX),
+        "help_title": "重要快讯容量",
+        "help_summary": "控制滚动历史中最多保留多少条上游标记为重要的快讯。",
+        "help_footer": "该值不能大于快讯总保留上限；达到上限后优先淘汰最旧的重要快讯。",
+    },
+    {"name": "NEWSNOW_REFRESH_SECONDS", "label": "本地刷新间隔（秒）", "group": "财经快讯", "kind": "int", "default": "60", "effect": "runtime", "min": "15", "max": "1800"},
+    {"name": "NEWSNOW_TIMEOUT_SECONDS", "label": "单次请求超时（秒）", "group": "财经快讯", "kind": "int", "default": "10", "effect": "runtime", "min": "2", "max": "30"},
+    {"name": "NEWSNOW_MAX_RETRIES", "label": "失败重试次数", "group": "财经快讯", "kind": "int", "default": "1", "effect": "runtime", "min": "0", "max": "2"},
+    {"name": "NEWSNOW_MAX_CONCURRENCY", "label": "最大并发来源数", "group": "财经快讯", "kind": "int", "default": "3", "effect": "runtime", "min": "1", "max": "3"},
+
     {"name": "DASHBOARD_B1_SCHEDULE_ENABLED", "label": "启用实战定时运行", "group": "任务调度", "kind": "bool", "default": "1", "effect": "restart"},
     {"name": PRACTICE_SCHEDULE_TIMES_ENV, "label": "实战盘面总结、选股及交易时间点", "group": "选股与买卖设置", "kind": "time_list", "default": DEFAULT_PRACTICE_SCHEDULE_TIMES, "effect": "runtime"},
+    {"name": PRACTICE_FAST_CYCLE_ENABLED_ENV, "label": "启用持仓快周期", "group": "选股与买卖设置", "kind": "bool", "default": "0", "effect": "runtime", "help_title": "同策略持仓快周期", "help_summary": "仅缩小到当前持仓并提高触发频率，评分、模型决策、退出优先和成交风控与完整选股周期共用。", "help_footer": "快周期 BUY 只表示已有持仓加仓，不发现或首次买入新股票；默认关闭。"},
+    {"name": PRACTICE_FAST_CYCLE_INTERVAL_ENV, "label": "持仓快周期间隔（秒）", "group": "选股与买卖设置", "kind": "int", "default": str(DEFAULT_PRACTICE_FAST_CYCLE_INTERVAL_SECONDS), "effect": "runtime", "min": str(MIN_PRACTICE_FAST_CYCLE_INTERVAL_SECONDS), "max": str(MAX_PRACTICE_FAST_CYCLE_INTERVAL_SECONDS), "help_title": "持仓重评频率", "help_summary": "在A股可成交时段按该间隔重新评判当前持仓，默认300秒。", "help_footer": "设置越短，行情与模型调用越频繁；同一时刻仍只允许一个账户决策事务。"},
     {"name": STOCK_UNIVERSE_ENV, "label": "选股范围（限制最终候选与新买入）", "group": "选股与买卖设置", "kind": "stock_universe", "default": DEFAULT_STOCK_UNIVERSE, "effect": "runtime"},
     {"name": "DASHBOARD_DISPLAY_CANDIDATE_LIMIT", "label": "候选池展示数量", "group": "选股与买卖设置", "kind": "int", "default": "10", "effect": "runtime"},
     {"name": "DASHBOARD_TRADE_CANDIDATE_LIMIT", "label": "买卖决策候选数量", "group": "选股与买卖设置", "kind": "int", "default": "10", "effect": "runtime"},
+    {"name": "DASHBOARD_PRESET_STRATEGY_CANDIDATE_LIMIT", "label": "文字策略中性候选数量", "group": "选股与交易策略", "kind": "int", "default": "60", "effect": "runtime", "min": "10", "max": "100"},
     {"name": "DASHBOARD_B3_EXIT_TIME", "label": "B3开盘离场检查时间", "group": "选股与买卖设置", "kind": "time", "default": "09:37", "effect": "runtime"},
     {"name": "DASHBOARD_TIME_EXIT_TIME", "label": "尾盘离场检查时间", "group": "选股与买卖设置", "kind": "time", "default": "14:45", "effect": "runtime"},
     {"name": "DASHBOARD_NIUONE_FORWARD_PREFLIGHT_CRON", "label": "牛牛严格前向开盘前协议预检", "group": "选股与买卖设置", "kind": "cron_time", "default": "5 9 * * 1-5", "effect": "next_run"},
@@ -631,7 +819,7 @@ ENV_CONFIG_SCHEMA: list[dict[str, Any]] = [
     {"name": "DASHBOARD_NIUONE_FORWARD_CRON", "label": "牛牛严格前向评估时间", "group": "选股与买卖设置", "kind": "cron_time", "default": "20 15 * * 1-5", "effect": "next_run"},
     {"name": NIUONE_FORWARD_COHORT_START_ENV, "label": "牛牛严格前向队列起始日", "group": "选股与买卖设置", "kind": "text", "default": DEFAULT_NIUONE_FORWARD_COHORT_START, "effect": "next_run"},
     {"name": ACTIVE_STRATEGY_ENV, "label": "当前独立策略", "group": "选股与交易策略", "kind": "strategy_suite", "default": default_enabled_persona_strategies_value(), "effect": "runtime"},
-    {"name": PRESET_STRATEGY_TEXT_ENV, "label": "预设文字策略", "group": "选股与交易策略", "kind": "preset_strategy_text", "default": "", "effect": "runtime"},
+    {"name": PRESET_STRATEGY_TEXT_ENV, "label": "旧版预设文字（兼容）", "group": "选股与交易策略", "kind": "preset_strategy_text", "default": "", "effect": "runtime"},
     {"name": "DASHBOARD_B1_SCAN_TIMEOUT_SECONDS", "label": "实战选股扫描超时秒数", "group": "任务调度", "kind": "int", "default": "480", "effect": "restart", "min": "60", "max": "1800"},
     {"name": "DASHBOARD_B1_SCAN_WORKERS", "label": "实战选股并发数", "group": "任务调度", "kind": "int", "default": "6", "effect": "restart", "min": "1", "max": "16"},
     {"name": "DASHBOARD_TENCENT_QUOTE_STAGE_TIMEOUT_SECONDS", "label": "腾讯全市场行情阶段总超时秒数", "group": "任务调度", "kind": "int", "default": "90", "effect": "restart", "min": "15", "max": "300"},
@@ -652,13 +840,15 @@ ENV_CONFIG_SCHEMA: list[dict[str, Any]] = [
     {"name": "DASHBOARD_CRON_RETRY_DELAY_SECONDS", "label": "Cron 失败重试间隔秒数", "group": "任务调度", "kind": "int", "default": "300", "effect": "next_run"},
     {"name": "DASHBOARD_PENDING_DECISION_POLL_SECONDS", "label": "延迟成交检查秒数", "group": "任务调度", "kind": "int", "default": "5", "effect": "restart"},
 
-    {"name": "DASHBOARD_DECISION_MAX_TOKENS", "label": "决策最大输出长度", "group": "买卖决策模型", "kind": "max_tokens", "default": DEFAULT_MODEL_MAX_TOKENS, "effect": "next_run"},
-    {"name": "DASHBOARD_DECISION_TIMEOUT", "label": "决策请求超时", "group": "买卖决策模型", "kind": "int", "default": "180", "effect": "next_run"},
+    {"name": "DASHBOARD_DECISION_MAX_TOKENS", "label": "模型最大输出长度", "group": "模型配置", "kind": "max_tokens", "default": DEFAULT_MODEL_MAX_TOKENS, "effect": "next_run"},
+    {"name": "DASHBOARD_DECISION_TIMEOUT", "label": "买卖决策请求超时", "group": "任务调度", "kind": "int", "default": "180", "effect": "next_run"},
+    {"name": "DASHBOARD_PROMPT_REFINEMENT_MAX_CONCURRENCY", "label": "文字策略细化并发数", "group": "任务调度", "kind": "int", "default": "1", "effect": "restart", "min": "1", "max": "2"},
     {"name": "DASHBOARD_DECISION_INTELLIGENCE_ENABLED", "label": "启用综合决策参考", "group": "综合决策参考", "kind": "bool", "default": "1", "effect": "next_run"},
     {"name": "DASHBOARD_DECISION_INTELLIGENCE_TTL_SECONDS", "label": "决策参考缓存秒数", "group": "综合决策参考", "kind": "int", "default": "75", "effect": "next_run"},
     {"name": "DASHBOARD_DECISION_INTELLIGENCE_MAX_ITEMS", "label": "单类参考数据上限", "group": "综合决策参考", "kind": "int", "default": "5", "effect": "next_run"},
 
     {"name": "IWENCAI_ENABLED", "label": "启用问财数据源", "group": "问财数据源", "kind": "bool", "default": "0", "effect": "runtime"},
+    {"name": "IWENCAI_NEWS_PRECHECK_ENABLED", "label": "开启消息面预检", "group": "问财数据源", "kind": "bool", "default": "0", "effect": "next_run"},
     {"name": "IWENCAI_BASE_URL", "label": "问财 API 地址", "group": "问财数据源", "kind": "text", "default": IWENCAI_DEFAULT_BASE_URL, "effect": "runtime"},
     {"name": "IWENCAI_API_KEY", "label": "问财 API Key", "group": "问财数据源", "kind": "secret", "default": "", "effect": "runtime"},
     {"name": "IWENCAI_TIMEOUT_SECONDS", "label": "问财请求超时秒数", "group": "问财数据源", "kind": "int", "default": "20", "effect": "runtime"},
@@ -675,6 +865,10 @@ ENV_CONFIG_SCHEMA: list[dict[str, Any]] = [
     {"name": "DASHBOARD_MAX_TOTAL_POSITION_PCT", "label": "总仓位参考%", "group": "交易规则与风控", "kind": "text", "default": "80", "effect": "next_run"},
     {"name": "DASHBOARD_MIN_CASH_RESERVE_PCT", "label": "现金缓冲参考%", "group": "交易规则与风控", "kind": "text", "default": "20", "effect": "next_run"},
     {"name": "DASHBOARD_MORNING_MAX_OPEN_POSITIONS", "label": "午盘前持仓上限", "group": "交易规则与风控", "kind": "int", "default": "3", "effect": "next_run"},
+    {"name": "DASHBOARD_EXIT_FEEDBACK_AUTO_TUNE_ENABLED", "label": "启用5日复盘全自动调参", "group": "交易规则与风控", "kind": "bool", "default": "1", "effect": "next_run"},
+    {"name": "DASHBOARD_EXIT_FEEDBACK_MIN_SAMPLES", "label": "自动调参最少有效样本簇", "group": "交易规则与风控", "kind": "int", "default": "30", "effect": "next_run", "min": "20", "max": "500"},
+    {"name": "DASHBOARD_EXIT_FEEDBACK_MIN_MONTHS", "label": "自动调参最少覆盖月份", "group": "交易规则与风控", "kind": "int", "default": "3", "effect": "next_run", "min": "2", "max": "12"},
+    {"name": "DASHBOARD_EXIT_FEEDBACK_COOLDOWN_SAMPLES", "label": "每轮评估新增证据冷却", "group": "交易规则与风控", "kind": "int", "default": "10", "effect": "next_run", "min": "5", "max": "100"},
 
     {"name": "DASHBOARD_NOTIFICATION_ENABLED", "label": "启用模拟成交通知", "group": "交易通知", "kind": "bool", "default": "0", "effect": "runtime"},
     {"name": "DASHBOARD_NOTIFICATION_TIMEOUT_SECONDS", "label": "单次推送超时秒数", "group": "交易通知", "kind": "int", "default": "5", "effect": "runtime"},
@@ -690,51 +884,29 @@ ENV_CONFIG_SCHEMA: list[dict[str, Any]] = [
     {"name": "DASHBOARD_TELEGRAM_BOT_TOKEN", "label": "Telegram Bot Token", "group": "交易通知", "kind": "secret", "default": "", "effect": "runtime"},
     {"name": "DASHBOARD_TELEGRAM_CHAT_ID", "label": "Telegram Chat ID", "group": "交易通知", "kind": "text", "default": "", "effect": "runtime"},
 
-    {"name": "DASHBOARD_US_FEATURES_ENABLED", "label": "开启牛牛美股", "group": "牛牛美股", "kind": "bool", "default": "0", "effect": "next_run"},
-    {"name": "US_RATING_BASE_URL", "label": "美股评级 API Base URL", "group": "牛牛美股", "kind": "text", "default": "", "effect": "next_run"},
-    {"name": "US_RATING_API_KEY", "label": "美股评级 API Key", "group": "牛牛美股", "kind": "secret", "default": "", "effect": "next_run"},
-    {"name": "US_RATING_CONTEXT_LENGTH", "label": "美股评级上下文长度", "group": "牛牛美股", "kind": "context_length", "default": DEFAULT_MODEL_CONTEXT_LENGTH, "effect": "next_run"},
-    {"name": "US_RATING_MAX_TOKENS", "label": "美股评级最大输出长度", "group": "牛牛美股", "kind": "max_tokens", "default": DEFAULT_MODEL_MAX_TOKENS, "effect": "next_run"},
     {"name": "CROSSDESK_BASE_URL", "label": "Crossdesk Base URL", "group": "上游模型覆盖", "kind": "text", "default": "", "effect": "next_run"},
     {"name": "CROSSDESK_API_KEY", "label": "Crossdesk API Key", "group": "上游模型覆盖", "kind": "secret", "default": "", "effect": "next_run"},
-    {"name": "DASHBOARD_GROK_MODEL", "label": "Grok 模型", "group": "牛牛美股", "kind": "text", "default": "grok-4.20-multi-agent-xhigh", "effect": "next_run"},
-    {"name": "DASHBOARD_GROK_API_MODE", "label": "Grok 搜索工具接口模式", "group": "牛牛美股", "kind": "api_mode", "default": "auto", "effect": "next_run"},
-    {"name": "DASHBOARD_GROK_CONTEXT_LENGTH", "label": "Grok 模型上下文长度", "group": "牛牛美股", "kind": "context_length", "default": DEFAULT_MODEL_CONTEXT_LENGTH, "effect": "next_run"},
-    {"name": "DASHBOARD_GROK_MAX_TOKENS", "label": "Grok 最大输出长度", "group": "牛牛美股", "kind": "max_tokens", "default": DEFAULT_MODEL_MAX_TOKENS, "effect": "next_run"},
-    {"name": "DASHBOARD_GROK_BASE_URL", "label": "Grok API 地址", "group": "牛牛美股", "kind": "text", "default": "", "effect": "next_run"},
-    {"name": "DASHBOARD_GROK_API_KEY", "label": "Grok API 密钥", "group": "牛牛美股", "kind": "secret", "default": "", "effect": "next_run"},
-    {"name": "DASHBOARD_NEWS_MODEL", "label": "消息面预检模型", "group": "消息面预检模型", "kind": "text", "default": "", "effect": "next_run"},
-    {"name": "DASHBOARD_NEWS_API_MODE", "label": "消息面搜索工具接口模式", "group": "消息面预检模型", "kind": "api_mode", "default": "auto", "effect": "next_run"},
-    {"name": "DASHBOARD_NEWS_CONTEXT_LENGTH", "label": "消息面预检上下文长度", "group": "消息面预检模型", "kind": "context_length", "default": DEFAULT_MODEL_CONTEXT_LENGTH, "effect": "next_run"},
-    {"name": "DASHBOARD_NEWS_MAX_TOKENS", "label": "消息面预检最大输出长度", "group": "消息面预检模型", "kind": "max_tokens", "default": DEFAULT_MODEL_MAX_TOKENS, "effect": "next_run"},
-    {"name": "DASHBOARD_NEWS_BASE_URL", "label": "消息面预检 API 地址", "group": "消息面预检模型", "kind": "text", "default": "", "effect": "next_run"},
-    {"name": "DASHBOARD_NEWS_API_KEY", "label": "消息面预检 API 密钥", "group": "消息面预检模型", "kind": "secret", "default": "", "effect": "next_run"},
-    {"name": "DASHBOARD_NEWS_TIMEOUT", "label": "消息面预检请求超时", "group": "消息面预检模型", "kind": "int", "default": "45", "effect": "next_run"},
-    {"name": "DASHBOARD_NEWS_MAX_RETRIES", "label": "消息面预检最大请求次数", "group": "消息面预检模型", "kind": "int", "default": "1", "effect": "next_run"},
-    {"name": "DASHBOARD_NEWS_CONCURRENCY", "label": "消息面预检并发数", "group": "消息面预检模型", "kind": "int", "default": "5", "effect": "next_run"},
-    {"name": "DASHBOARD_DECISION_MODEL", "label": "买卖决策模型", "group": "买卖决策模型", "kind": "text", "default": "deepseek-v4-pro", "effect": "next_run"},
-    {"name": "DASHBOARD_DECISION_CONTEXT_LENGTH", "label": "买卖决策上下文长度", "group": "买卖决策模型", "kind": "context_length", "default": DEFAULT_MODEL_CONTEXT_LENGTH, "effect": "next_run"},
-    {"name": "DASHBOARD_DECISION_BASE_URL", "label": "买卖决策 API 地址", "group": "买卖决策模型", "kind": "text", "default": "", "effect": "next_run"},
-    {"name": "DASHBOARD_DECISION_API_KEY", "label": "买卖决策 API 密钥", "group": "买卖决策模型", "kind": "secret", "default": "", "effect": "next_run"},
+    {"name": "DASHBOARD_DECISION_MODEL", "label": "模型名称", "group": "模型配置", "kind": "text", "default": "deepseek-v4-pro", "effect": "next_run"},
+    {"name": "DASHBOARD_DECISION_STREAM_MODE", "label": "流式模式", "group": "模型配置", "kind": "stream_mode", "default": "auto", "effect": "next_run"},
+    {"name": "DASHBOARD_DECISION_REASONING_EFFORT", "label": "思考强度", "group": "模型配置", "kind": "reasoning_effort", "default": "", "effect": "next_run"},
+    {"name": "DASHBOARD_DECISION_CONTEXT_LENGTH", "label": "上下文长度", "group": "模型配置", "kind": "context_length", "default": DEFAULT_MODEL_CONTEXT_LENGTH, "effect": "next_run"},
+    {"name": "DASHBOARD_DECISION_BASE_URL", "label": "API 地址", "group": "模型配置", "kind": "text", "default": "", "effect": "next_run"},
+    {"name": "DASHBOARD_DECISION_API_KEY", "label": "API 密钥", "group": "模型配置", "kind": "secret", "default": "", "effect": "next_run"},
     {"name": "DASHBOARD_US_MARKET_SUMMARY_CRON", "label": "隔夜美股盘面总结时间", "group": "盘面监控生产时间点", "kind": "cron_time", "default": "0 8 * * 1-5", "effect": "next_run"},
     {"name": "US_MARKET_SUMMARY_MAX_TOKENS", "label": "隔夜美股总结最大输出长度", "group": "盘面监控生产时间点", "kind": "max_tokens", "default": DEFAULT_MODEL_MAX_TOKENS, "effect": "next_run"},
     {"name": "DASHBOARD_MARKET_AUCTION_CRON", "label": "盘前竞价监控时间", "group": "盘面监控生产时间点", "kind": "cron_time", "default": "25 9 * * 1-5", "effect": "next_run"},
     {"name": "DASHBOARD_MARKET_MIDDAY_CRON", "label": "午盘监控时间", "group": "盘面监控生产时间点", "kind": "cron_time", "default": "40 11 * * 1-5", "effect": "next_run"},
     {"name": "DASHBOARD_MARKET_CLOSE_CRON", "label": "盘后监控时间", "group": "盘面监控生产时间点", "kind": "cron_time", "default": "10 15 * * 1-5", "effect": "next_run"},
     {"name": "A_SHARE_MODEL_SUMMARY_ENABLED", "label": "A股盘面模型总结", "group": "盘面监控生产时间点", "kind": "bool", "default": "1", "effect": "next_run", "bool_no_default": "1"},
-    {"name": "A_SHARE_MODEL_SUMMARY_MODEL", "label": "A股盘面总结模型", "group": "盘面监控生产时间点", "kind": "text", "default": "", "effect": "next_run"},
-    {"name": "A_SHARE_MODEL_SUMMARY_CONTEXT_LENGTH", "label": "A股盘面总结上下文长度", "group": "盘面监控生产时间点", "kind": "context_length", "default": DEFAULT_MODEL_CONTEXT_LENGTH, "effect": "next_run"},
+    {"name": "A_SHARE_MODEL_SUMMARY_MODEL", "label": "盘面总结模型（A股与隔夜美股）", "group": "盘面监控生产时间点", "kind": "text", "default": "", "effect": "next_run"},
+    {"name": "A_SHARE_MODEL_SUMMARY_STREAM_MODE", "label": "盘面总结流式模式", "group": "盘面监控生产时间点", "kind": "stream_mode", "default": "auto", "effect": "next_run"},
+    {"name": "A_SHARE_MODEL_SUMMARY_REASONING_EFFORT", "label": "盘面总结思考强度", "group": "盘面监控生产时间点", "kind": "reasoning_effort", "default": "", "effect": "next_run"},
+    {"name": "A_SHARE_MODEL_SUMMARY_CONTEXT_LENGTH", "label": "盘面总结上下文长度", "group": "盘面监控生产时间点", "kind": "context_length", "default": DEFAULT_MODEL_CONTEXT_LENGTH, "effect": "next_run"},
     {"name": "A_SHARE_MODEL_SUMMARY_MAX_TOKENS", "label": "A股盘面总结最大输出长度", "group": "盘面监控生产时间点", "kind": "max_tokens", "default": DEFAULT_MODEL_MAX_TOKENS, "effect": "next_run"},
-    {"name": "A_SHARE_MODEL_SUMMARY_BASE_URL", "label": "A股盘面总结 API地址", "group": "盘面监控生产时间点", "kind": "text", "default": "", "effect": "next_run"},
-    {"name": "A_SHARE_MODEL_SUMMARY_API_KEY", "label": "A股盘面总结 API密钥", "group": "盘面监控生产时间点", "kind": "secret", "default": "", "effect": "next_run"},
+    {"name": "A_SHARE_MODEL_SUMMARY_BASE_URL", "label": "盘面总结 API地址", "group": "盘面监控生产时间点", "kind": "text", "default": "", "effect": "next_run"},
+    {"name": "A_SHARE_MODEL_SUMMARY_API_KEY", "label": "盘面总结 API密钥", "group": "盘面监控生产时间点", "kind": "secret", "default": "", "effect": "next_run"},
     {"name": "A_SHARE_MODEL_SUMMARY_DEADLINE_SECONDS", "label": "A股模型总结总超时秒数", "group": "盘面监控生产时间点", "kind": "int", "default": "60", "effect": "next_run"},
     {"name": "A_SHARE_MODEL_SUMMARY_REQUEST_TIMEOUT_SECONDS", "label": "A股模型总结单次超时秒数", "group": "盘面监控生产时间点", "kind": "int", "default": "45", "effect": "next_run"},
-    {"name": "X_WATCHLIST_ACCOUNTS", "label": "推文监控作者", "group": "牛牛美股", "kind": "handle_list", "default": "", "effect": "next_run"},
-    {"name": "X_WATCHLIST_MAX_TOKENS", "label": "X 监控最大输出长度", "group": "牛牛美股", "kind": "max_tokens", "default": DEFAULT_MODEL_MAX_TOKENS, "effect": "next_run"},
-    {"name": "X_WATCHLIST_DAEMON_INTERVAL_SECONDS", "label": "推文监控间隔", "group": "牛牛美股", "kind": "int", "default": "1200", "effect": "next_run"},
-    {"name": "DASHBOARD_US_RATING_CRON", "label": "美股买入评级时间", "group": "牛牛美股", "kind": "cron_time", "default": "0 11 * * *", "effect": "next_run"},
-    {"name": "US_RATING_DEADLINE_SECONDS", "label": "美股评级总超时秒数", "group": "牛牛美股", "kind": "int", "default": "240", "effect": "next_run"},
-    {"name": "US_RATING_REQUEST_TIMEOUT_SECONDS", "label": "美股评级单次请求超时秒数", "group": "牛牛美股", "kind": "int", "default": "120", "effect": "next_run"},
     {"name": "DASHBOARD_INDICES_TTL_SECONDS", "label": "指数行情更新间隔（秒）", "group": "行情与资金流设置", "kind": "int", "default": "60", "effect": "runtime", "min": "1"},
     {"name": "DASHBOARD_INDUSTRY_FLOW_PLAYBACK_SPEED", "label": "资金流默认播放速度", "group": "行情与资金流设置", "kind": "playback_speed", "default": "0.5", "effect": "runtime"},
     {"name": "DASHBOARD_INDUSTRY_FLOW_SIDE_LIMIT", "label": "资金流每侧行业数量", "group": "行情与资金流设置", "kind": "int", "default": "10", "effect": "runtime", "min": "1", "max": "10"},
@@ -744,28 +916,14 @@ ENV_CONFIG_SCHEMA: list[dict[str, Any]] = [
     {"name": "DASHBOARD_INDUSTRY_FLOW_AFTERNOON_START", "label": "下午采样开始时间", "group": "行情与资金流设置", "kind": "time", "default": "13:00", "effect": "runtime"},
     {"name": "DASHBOARD_INDUSTRY_FLOW_AFTERNOON_END", "label": "下午采样结束时间", "group": "行情与资金流设置", "kind": "time", "default": "15:01", "effect": "runtime"},
 
-    {"name": "X_WATCHLIST_STRICT_CONTEXT_HOLD", "label": "X 上下文缺失时暂缓发送", "group": "X 监控", "kind": "bool", "default": "0", "effect": "next_run"},
-    {"name": "X_WATCHLIST_DEADLINE_SECONDS", "label": "X 总截止秒数", "group": "X 监控", "kind": "int", "default": "135", "effect": "next_run"},
-    {"name": "X_WATCHLIST_REQUEST_TIMEOUT_SECONDS", "label": "X 单账号请求超时秒数", "group": "牛牛美股", "kind": "int", "default": "45", "effect": "next_run"},
-    {"name": "X_WATCHLIST_SCRIPT_ALARM_SECONDS", "label": "X 脚本 alarm 秒数", "group": "X 监控", "kind": "int", "default": "90", "effect": "next_run"},
-    {"name": "X_WATCHLIST_MAX_WORKERS", "label": "X 抓取并发", "group": "X 监控", "kind": "int", "default": "5", "effect": "next_run"},
-    {"name": "X_WATCHLIST_MAX_ATTEMPTS", "label": "X 抓取重试次数", "group": "X 监控", "kind": "int", "default": "1", "effect": "next_run"},
-    {"name": "X_WATCHLIST_MAX_MEDIA_HTML_HYDRATE_ITEMS", "label": "X HTML 补图条数", "group": "X 监控", "kind": "int", "default": "6", "effect": "next_run"},
-    {"name": "X_WATCHLIST_MEDIA_HTML_WORKERS", "label": "X HTML 补图并发", "group": "X 监控", "kind": "int", "default": "3", "effect": "next_run"},
-    {"name": "X_WATCHLIST_CONTEXT_REPAIR_RETRY_ROUNDS", "label": "X 上下文修复轮数", "group": "X 监控", "kind": "int", "default": "2", "effect": "next_run"},
-    {"name": "X_WATCHLIST_MAX_CONTEXT_REPAIR_ITEMS", "label": "X 每轮修复条数", "group": "X 监控", "kind": "int", "default": "4", "effect": "next_run"},
-    {"name": "X_WATCHLIST_CONTEXT_REPAIR_WORKERS", "label": "X 上下文修复并发", "group": "X 监控", "kind": "int", "default": "4", "effect": "next_run"},
-    {"name": "X_WATCHLIST_CONTEXT_REPAIR_RETRY_SLEEP_SECONDS", "label": "X 修复轮间隔秒数", "group": "X 监控", "kind": "text", "default": "2", "effect": "next_run"},
-    {"name": "X_WATCHLIST_HELD_CONTEXT_REPAIR_TIMEOUT_SECONDS", "label": "X held 修复超时秒数", "group": "X 监控", "kind": "int", "default": "8", "effect": "next_run"},
-    {"name": "X_WATCHLIST_HELD_CONTEXT_REPAIR_ITEMS", "label": "X held 修复条数", "group": "X 监控", "kind": "int", "default": "4", "effect": "next_run"},
-    {"name": "X_WATCHLIST_SENT_CONTEXT_REPAIR_LOOKBACK_HOURS", "label": "X 已发修复回看小时", "group": "X 监控", "kind": "int", "default": "72", "effect": "next_run"},
-    {"name": "X_WATCHLIST_SENT_CONTEXT_REPAIR_MAX_ATTEMPTS", "label": "X 已发修复最大尝试", "group": "X 监控", "kind": "int", "default": "8", "effect": "next_run"},
-    {"name": "X_WATCHLIST_SENT_CONTEXT_REPAIR_COOLDOWN_MINUTES", "label": "X 已发修复冷却分钟", "group": "X 监控", "kind": "int", "default": "20", "effect": "next_run"},
-    {"name": "X_WATCHLIST_SENT_CONTEXT_REPAIR_ITEMS", "label": "X 已发修复条数", "group": "X 监控", "kind": "int", "default": "2", "effect": "next_run"},
-
     {"name": "DASHBOARD_AUTO_VERSION_CHECK_ENABLED", "label": "开启自动检测新版本", "group": "关于", "kind": "bool", "default": "1", "effect": "runtime"},
 ]
 ENV_CONFIG_BY_NAME = {item["name"]: item for item in ENV_CONFIG_SCHEMA}
+
+REASONING_EFFORT_MODEL_NAMES: dict[str, tuple[str, ...]] = {
+    "DASHBOARD_DECISION_REASONING_EFFORT": ("DASHBOARD_DECISION_MODEL",),
+}
+
 ADMIN_VISIBLE_ENV_NAMES = [
     "DASHBOARD_ADMIN_PASSWORD",
     "DASHBOARD_PUBLIC_REFRESH_SECONDS",
@@ -784,31 +942,19 @@ ADMIN_VISIBLE_ENV_NAMES = [
     "DASHBOARD_MANUAL_DATA_INITIALIZATION_TIMEOUT_SECONDS",
     "DASHBOARD_NIUONE_MAINLINE_MINUTE_REFRESH_ENABLED",
     "DASHBOARD_MARKET_BREADTH_SAMPLE_INTERVAL_SECONDS",
-    "DASHBOARD_US_FEATURES_ENABLED",
-    "DASHBOARD_GROK_MODEL",
-    "DASHBOARD_GROK_API_MODE",
-    "DASHBOARD_GROK_CONTEXT_LENGTH",
-    "DASHBOARD_GROK_MAX_TOKENS",
-    "DASHBOARD_GROK_BASE_URL",
-    "DASHBOARD_GROK_API_KEY",
-    "X_WATCHLIST_ACCOUNTS",
-    "X_WATCHLIST_DAEMON_INTERVAL_SECONDS",
-    "X_WATCHLIST_REQUEST_TIMEOUT_SECONDS",
-    "DASHBOARD_US_RATING_CRON",
-    "US_RATING_CONTEXT_LENGTH",
-    "US_RATING_MAX_TOKENS",
-    "US_RATING_DEADLINE_SECONDS",
-    "US_RATING_REQUEST_TIMEOUT_SECONDS",
-    "DASHBOARD_NEWS_MODEL",
-    "DASHBOARD_NEWS_API_MODE",
-    "DASHBOARD_NEWS_CONTEXT_LENGTH",
-    "DASHBOARD_NEWS_MAX_TOKENS",
-    "DASHBOARD_NEWS_BASE_URL",
-    "DASHBOARD_NEWS_API_KEY",
-    "DASHBOARD_NEWS_TIMEOUT",
-    "DASHBOARD_NEWS_MAX_RETRIES",
-    "DASHBOARD_NEWS_CONCURRENCY",
+    "NEWSNOW_ENABLED",
+    "NEWSNOW_DECISION_ENABLED",
+    "NEWSNOW_OVERVIEW_IMPORTANT_ONLY",
+    "NEWSNOW_SOURCES",
+    "NEWSNOW_MAX_ITEMS",
+    "NEWSNOW_MAX_IMPORTANT_ITEMS",
+    "NEWSNOW_REFRESH_SECONDS",
+    "NEWSNOW_TIMEOUT_SECONDS",
+    "NEWSNOW_MAX_RETRIES",
+    "NEWSNOW_MAX_CONCURRENCY",
     "DASHBOARD_DECISION_MODEL",
+    "DASHBOARD_DECISION_STREAM_MODE",
+    "DASHBOARD_DECISION_REASONING_EFFORT",
     "DASHBOARD_DECISION_CONTEXT_LENGTH",
     "DASHBOARD_DECISION_BASE_URL",
     "DASHBOARD_DECISION_API_KEY",
@@ -818,6 +964,7 @@ ADMIN_VISIBLE_ENV_NAMES = [
     "DASHBOARD_DECISION_INTELLIGENCE_TTL_SECONDS",
     "DASHBOARD_DECISION_INTELLIGENCE_MAX_ITEMS",
     "IWENCAI_ENABLED",
+    "IWENCAI_NEWS_PRECHECK_ENABLED",
     "IWENCAI_BASE_URL",
     "IWENCAI_API_KEY",
     "IWENCAI_TIMEOUT_SECONDS",
@@ -833,6 +980,10 @@ ADMIN_VISIBLE_ENV_NAMES = [
     "DASHBOARD_MAX_TOTAL_POSITION_PCT",
     "DASHBOARD_MIN_CASH_RESERVE_PCT",
     "DASHBOARD_MORNING_MAX_OPEN_POSITIONS",
+    "DASHBOARD_EXIT_FEEDBACK_AUTO_TUNE_ENABLED",
+    "DASHBOARD_EXIT_FEEDBACK_MIN_SAMPLES",
+    "DASHBOARD_EXIT_FEEDBACK_MIN_MONTHS",
+    "DASHBOARD_EXIT_FEEDBACK_COOLDOWN_SAMPLES",
     "DASHBOARD_NOTIFICATION_ENABLED",
     "DASHBOARD_NOTIFICATION_TIMEOUT_SECONDS",
     "DASHBOARD_FEISHU_NOTIFICATION_ENABLED",
@@ -847,9 +998,12 @@ ADMIN_VISIBLE_ENV_NAMES = [
     "DASHBOARD_TELEGRAM_BOT_TOKEN",
     "DASHBOARD_TELEGRAM_CHAT_ID",
     PRACTICE_SCHEDULE_TIMES_ENV,
+    PRACTICE_FAST_CYCLE_ENABLED_ENV,
+    PRACTICE_FAST_CYCLE_INTERVAL_ENV,
     STOCK_UNIVERSE_ENV,
     "DASHBOARD_DISPLAY_CANDIDATE_LIMIT",
     "DASHBOARD_TRADE_CANDIDATE_LIMIT",
+    "DASHBOARD_PRESET_STRATEGY_CANDIDATE_LIMIT",
     "DASHBOARD_B3_EXIT_TIME",
     "DASHBOARD_TIME_EXIT_TIME",
     "DASHBOARD_NIUONE_FORWARD_PREFLIGHT_CRON",
@@ -859,19 +1013,12 @@ ADMIN_VISIBLE_ENV_NAMES = [
     ACTIVE_STRATEGY_ENV,
     PRESET_STRATEGY_TEXT_ENV,
     "DASHBOARD_US_MARKET_SUMMARY_CRON",
-    "US_MARKET_SUMMARY_MAX_TOKENS",
     "DASHBOARD_MARKET_AUCTION_CRON",
     "DASHBOARD_MARKET_MIDDAY_CRON",
     "DASHBOARD_MARKET_CLOSE_CRON",
     "A_SHARE_MODEL_SUMMARY_ENABLED",
-    "A_SHARE_MODEL_SUMMARY_MODEL",
-    "A_SHARE_MODEL_SUMMARY_CONTEXT_LENGTH",
-    "A_SHARE_MODEL_SUMMARY_MAX_TOKENS",
-    "A_SHARE_MODEL_SUMMARY_BASE_URL",
-    "A_SHARE_MODEL_SUMMARY_API_KEY",
     "A_SHARE_MODEL_SUMMARY_DEADLINE_SECONDS",
     "A_SHARE_MODEL_SUMMARY_REQUEST_TIMEOUT_SECONDS",
-    "X_WATCHLIST_MAX_TOKENS",
     "DASHBOARD_CRON_MAX_ATTEMPTS",
     "DASHBOARD_CRON_RETRY_DELAY_SECONDS",
     "DASHBOARD_INDICES_TTL_SECONDS",
@@ -886,16 +1033,10 @@ ADMIN_VISIBLE_ENV_NAMES = [
 ]
 TRADER_RUNTIME_ENV_NAMES = {
     STOCK_UNIVERSE_ENV,
-    "DASHBOARD_NEWS_MODEL",
-    "DASHBOARD_NEWS_API_MODE",
-    "DASHBOARD_NEWS_CONTEXT_LENGTH",
-    "DASHBOARD_NEWS_MAX_TOKENS",
-    "DASHBOARD_NEWS_BASE_URL",
-    "DASHBOARD_NEWS_API_KEY",
-    "DASHBOARD_NEWS_TIMEOUT",
-    "DASHBOARD_NEWS_MAX_RETRIES",
-    "DASHBOARD_NEWS_CONCURRENCY",
+    "IWENCAI_NEWS_PRECHECK_ENABLED",
     "DASHBOARD_DECISION_MODEL",
+    "DASHBOARD_DECISION_STREAM_MODE",
+    "DASHBOARD_DECISION_REASONING_EFFORT",
     "DASHBOARD_DECISION_CONTEXT_LENGTH",
     "DASHBOARD_DECISION_BASE_URL",
     "DASHBOARD_DECISION_API_KEY",
@@ -904,6 +1045,7 @@ TRADER_RUNTIME_ENV_NAMES = {
     "DASHBOARD_DECISION_INTELLIGENCE_ENABLED",
     "DASHBOARD_DECISION_INTELLIGENCE_TTL_SECONDS",
     "DASHBOARD_DECISION_INTELLIGENCE_MAX_ITEMS",
+    "NEWSNOW_DECISION_ENABLED",
     "DASHBOARD_MARKET_GUIDANCE_ENABLED",
     TRADE_DISCIPLINE_TEXT_ENV,
     "DASHBOARD_MAX_OPEN_POSITIONS",
@@ -921,9 +1063,8 @@ TRADER_RUNTIME_ENV_NAMES = {
     PRESET_STRATEGY_TEXT_ENV,
 }
 ENV_GROUP_ORDER = [
-    "牛牛美股",
-    "消息面预检模型",
-    "买卖决策模型",
+    "财经快讯",
+    "模型配置",
     "交易规则与风控",
     "交易通知",
     "选股与买卖设置",
@@ -936,7 +1077,6 @@ ENV_GROUP_ORDER = [
     "限流与缓存",
     "任务调度",
     "上游模型覆盖",
-    "X 监控",
     "其他",
     "关于",
 ]
@@ -1377,6 +1517,58 @@ def apply_hot_stocks_sort(data: dict[str, Any], sort_by: str) -> dict[str, Any]:
     return payload
 
 
+def market_indices_available(payload: dict[str, Any]) -> bool:
+    return bool(payload.get("items")) and not payload.get("error")
+
+
+def market_sectors_available(payload: dict[str, Any]) -> bool:
+    return bool(
+        payload.get("sectors")
+        or payload.get("items")
+        or payload.get("gain_top")
+        or payload.get("loss_top")
+    ) and not payload.get("error")
+
+
+def market_hot_stocks_available(payload: dict[str, Any]) -> bool:
+    return any(
+        bool(payload.get(key))
+        for key in ("items", "amount_top", "turnover_top", "volume_top", "gain_top")
+    ) and not payload.get("error")
+
+
+def produce_sectors_data() -> dict[str, Any]:
+    return run_dashboard_helper(
+        "sectors_dashboard_api.py",
+        {
+            "sectors": [],
+            "items": [],
+            "gain_top": [],
+            "loss_top": [],
+            "industry_gain_top": [],
+            "industry_loss_top": [],
+            "concept_gain_top": [],
+            "concept_loss_top": [],
+        },
+        timeout=120,
+    )
+
+
+def produce_hot_stocks_data(sort_by: str = "amount") -> dict[str, Any]:
+    payload = run_dashboard_helper(
+        "hot_stocks_dashboard_api.py",
+        {
+            "items": [],
+            "amount_top": [],
+            "turnover_top": [],
+            "volume_top": [],
+            "gain_top": [],
+        },
+        timeout=120,
+    )
+    return apply_hot_stocks_sort(payload, sort_by)
+
+
 def get_practice_payload() -> dict[str, Any]:
     """Return the retained local portfolio history without request-side I/O.
 
@@ -1389,7 +1581,9 @@ def get_practice_payload() -> dict[str, Any]:
         now = current_cn_datetime()
         trader = get_trader_module()
         state = trader.load_state()
-        payload = trader.enrich_portfolio(state)
+        payload = getattr(
+            trader, "enrich_portfolio_with_realized_history", trader.enrich_portfolio,
+        )(state)
         equity_history = state.get("equity_history", []) or []
         daily_equity_history = state.get("daily_equity_history", []) or []
         history_loader = getattr(trader, "load_account_history", None)
@@ -1423,13 +1617,13 @@ def get_practice_payload() -> dict[str, Any]:
             source_updated_at=payload["source_updated_at"],
             now=now,
         )
-        payload["trade_markers"] = compact_trade_markers(state.get("trade_log") or [])
+        payload["trade_markers"] = compact_trade_markers(payload.get("trade_log") or state.get("trade_log") or [])
         payload["trading_calendar"] = dashboard_trading_day_status(now)
         payload["trading_paused"] = state.get("trading_paused", False)
         payload["pause_reason"] = state.get("pause_reason", "")
         payload["pause_since"] = state.get("pause_since", "")
         strategy_performance = (
-            trader.track_strategy_performance(state)
+            (getattr(trader, "build_strategy_performance", trader.track_strategy_performance))(state)
             if hasattr(trader, "track_strategy_performance")
             else {}
         )
@@ -1469,6 +1663,27 @@ def record_practice_equity_heartbeat(trader: Any | None = None) -> bool:
         return recorded
     except Exception as exc:
         print(f"[WARN] 模拟账户权益心跳失败: {type(exc).__name__}: {exc}", flush=True)
+        return False
+    finally:
+        PRACTICE_EQUITY_HEARTBEAT_LOCK.release()
+
+
+def refresh_practice_position_marks_on_startup(trader: Any | None = None) -> bool:
+    """Refresh stale quote marks once without running trading decisions."""
+
+    if not PRACTICE_EQUITY_HEARTBEAT_LOCK.acquire(blocking=False):
+        return False
+    try:
+        trader = trader or get_trader_module()
+        refresher = getattr(trader, "refresh_position_marks_on_startup", None)
+        if refresher is None:
+            return False
+        refreshed = bool(refresher())
+        if refreshed:
+            invalidate_api_cache("niuniu_practice", PRACTICE_FAST_CACHE_KEY)
+        return refreshed
+    except Exception as exc:
+        print(f"[WARN] 模拟持仓启动刷新失败: {type(exc).__name__}: {exc}", flush=True)
         return False
     finally:
         PRACTICE_EQUITY_HEARTBEAT_LOCK.release()
@@ -1610,7 +1825,9 @@ def get_practice_payload_fast() -> dict[str, Any]:
         now = current_cn_datetime()
         trader = get_trader_module()
         state = trader.load_state()
-        payload = trader.enrich_portfolio(state)
+        payload = getattr(
+            trader, "enrich_portfolio_with_realized_history", trader.enrich_portfolio,
+        )(state)
         equity_history = state.get("equity_history", []) or []
         daily_equity_history = state.get("daily_equity_history", []) or []
         # Keep the same intraday point density as the full payload. Otherwise the
@@ -1625,14 +1842,14 @@ def get_practice_payload_fast() -> dict[str, Any]:
             source_updated_at=payload["source_updated_at"],
             now=now,
         )
-        payload["trade_markers"] = compact_trade_markers(state.get("trade_log") or [])
+        payload["trade_markers"] = compact_trade_markers(payload.get("trade_log") or state.get("trade_log") or [])
         payload["trade_log"] = filter_today_log_entries(payload.get("trade_log") or [], now=now)
         payload["decision_log"] = filter_today_log_entries(payload.get("decision_log") or [], now=now)
         payload["trading_calendar"] = dashboard_trading_day_status(now)
         payload["trading_paused"] = state.get("trading_paused", False)
         payload["pause_reason"] = state.get("pause_reason", "")
         payload["pause_since"] = state.get("pause_since", "")
-        strategy_performance = trader.track_strategy_performance(state) if hasattr(trader, "track_strategy_performance") else {}
+        strategy_performance = (getattr(trader, "build_strategy_performance", trader.track_strategy_performance))(state) if hasattr(trader, "track_strategy_performance") else {}
         payload["strategy_performance"] = compact_strategy_performance(strategy_performance)
         if hasattr(trader, "build_trade_rule_note"):
             payload["trade_rule_note"] = trader.build_trade_rule_note()
@@ -1692,17 +1909,44 @@ def normalize_b1_payload_for_trader(b1_payload: dict[str, Any]) -> dict[str, Any
         payload["market_summary"] = b1_payload.get("market_summary")
     if isinstance(b1_payload.get("market_decision_context"), dict):
         payload["market_decision_context"] = b1_payload.get("market_decision_context")
+    if b1_payload.get("holding_cycle_only") is True:
+        payload["holding_cycle_only"] = True
+        payload["holding_cycle_codes"] = [
+            str(code)
+            for code in (b1_payload.get("holding_cycle_codes") or [])
+            if str(code)
+        ]
+    for key in (
+        "decision_cycle_kind",
+        "holding_cycle_data_status",
+        "holding_cycle_error",
+    ):
+        if b1_payload.get(key):
+            payload[key] = b1_payload.get(key)
     for key in ("schedule_slot", "schedule_run_kind", "schedule_triggered_at"):
         if b1_payload.get(key):
             payload[key] = b1_payload.get(key)
     return payload
 
-def run_practice_decision(b1_payload: dict[str, Any]) -> dict[str, Any]:
+def run_practice_decision(
+    b1_payload: dict[str, Any],
+    *,
+    blocking: bool = True,
+) -> dict[str, Any]:
     # Different schedule slots may finish their scans out of order. Serialize
     # the account read/decision/execute/save transaction so a later slot cannot
     # trade against a portfolio snapshot captured before an earlier fill.
-    with PRACTICE_DECISION_LOCK:
+    acquired = PRACTICE_DECISION_LOCK.acquire(blocking=blocking)
+    if not acquired:
+        return {
+            "skipped": True,
+            "reason": "practice_decision_busy",
+            "decision_cycle_kind": b1_payload.get("decision_cycle_kind") or "",
+        }
+    try:
         return get_trader_module().run_decision_after_b1(b1_payload)
+    finally:
+        PRACTICE_DECISION_LOCK.release()
 
 
 def _tencent_key_for_code(code: str) -> str:
@@ -1956,6 +2200,25 @@ def refresh_b1_candidate_cache_from_current_pool() -> dict[str, Any]:
                 "stock_leader_tier": best.get("stock_leader_tier"),
                 "stock_strong": best.get("stock_strong"),
                 "stock_strong_score": best.get("stock_strong_score"),
+                "stock_activity_gate_required": best.get(
+                    "stock_activity_gate_required"
+                ),
+                "stock_activity_data_available": best.get(
+                    "stock_activity_data_available"
+                ),
+                "stock_market_amount_percentile": best.get(
+                    "stock_market_amount_percentile"
+                ),
+                "stock_theme_amount_percentile": best.get(
+                    "stock_theme_amount_percentile"
+                ),
+                "stock_volume_participation_percentile": best.get(
+                    "stock_volume_participation_percentile"
+                ),
+                "stock_activity_score": best.get("stock_activity_score"),
+                "stock_activity_confirmed": best.get(
+                    "stock_activity_confirmed"
+                ),
                 "stock_sector_rank": best.get("stock_sector_rank"),
                 "stock_market_rank": best.get("stock_market_rank"),
                 "score_before_industry_flow": best.get("score_before_industry_flow"),
@@ -2051,6 +2314,8 @@ def refresh_b1_candidate_cache_from_current_pool() -> dict[str, Any]:
         )
         with API_RESPONSE_LOCK:
             API_RESPONSE_CACHE.pop(PRACTICE_CANDIDATES_CACHE_KEY, None)
+            API_RESPONSE_CACHE.pop(TODAY_CANDIDATES_CACHE_KEY, None)
+            API_RESPONSE_CACHE.pop(TODAY_CANDIDATE_INTRADAY_CACHE_KEY, None)
         B1_CANDIDATE_REFRESH_LAST_TS = time.time()
         return output["candidate_refresh"]
     finally:
@@ -2099,11 +2364,57 @@ def record_practice_decision_event(
         print(f"[WARN] 写入实战页面决策日志失败: {type(exc).__name__}: {exc}", flush=True)
 
 
+HOLDING_CYCLE_STATUS_LABELS = {
+    "ready": "持仓数据正常",
+    "partial": "部分持仓数据不可用",
+    "scoring_unavailable": "持仓评分不可用",
+    "scoring_error": "持仓评分发生错误",
+    "scorer_config_unavailable": "策略评分配置不可用",
+    "no_active_scorers": "没有启用的策略评分器",
+    "quote_unavailable": "持仓行情不可用",
+    "stale_or_missing_quotes": "持仓行情缺失或已过期",
+    "history_unavailable": "持仓日K数据不可用",
+    "empty_portfolio": "当前没有持仓",
+}
+
+
+def holding_cycle_start_messages(
+    payload: dict[str, Any],
+    *,
+    observed_count: int,
+    item_count: int,
+) -> tuple[str, str]:
+    holding_codes = {
+        str(code).strip()
+        for code in (payload.get("holding_cycle_codes") or [])
+        if str(code).strip()
+    }
+    holding_count = max(len(holding_codes), observed_count, item_count)
+    status = str(payload.get("holding_cycle_data_status") or "ready").strip()
+    status_label = HOLDING_CYCLE_STATUS_LABELS.get(status, "持仓评分状态未知")
+    if status == "ready":
+        scoring_note = f"成功重评{observed_count}只"
+    else:
+        scoring_note = f"{status_label}（成功重评{observed_count}只）"
+    candidate_note = (
+        f"其中{item_count}只达到加仓候选条件"
+        if item_count
+        else "未生成加仓候选"
+    )
+    return (
+        f"持仓快周期开始：当前持仓{holding_count}只，{scoring_note}，{candidate_note}；"
+        "开始执行已有持仓的原策略退出规则和模型持仓复核。",
+        f"持仓快周期开始：当前持仓{holding_count}只，成功重评{observed_count}只，"
+        f"加仓候选{item_count}只，开始退出检查和模型持仓复核；{status_label}",
+    )
+
+
 def run_practice_decision_logged(
     b1_payload: dict[str, Any],
     *,
     record_start: bool = False,
     refresh_market_summary: bool = True,
+    decision_blocking: bool = True,
 ) -> dict[str, Any]:
     payload = normalize_b1_payload_for_trader(b1_payload)
     try:
@@ -2128,7 +2439,23 @@ def run_practice_decision_logged(
     if payload.get("schedule_slot"):
         kind_label = "补跑" if payload.get("schedule_run_kind") == "catchup" else "定时"
         slot_note = f"（计划{str(payload.get('schedule_slot'))[-5:]}{kind_label}）"
-    if not item_count:
+    holding_cycle = (
+        payload.get("holding_cycle_only") is True
+        or payload.get("decision_cycle_kind") == HOLDING_CYCLE_KIND
+        or payload.get("schedule_run_kind") == HOLDING_CYCLE_KIND
+    )
+    if holding_cycle and (record_start or not item_count):
+        holding_summary, holding_reason = holding_cycle_start_messages(
+            payload,
+            observed_count=observed_count,
+            item_count=item_count,
+        )
+        record_practice_decision_event(
+            payload,
+            holding_summary,
+            holding_reason,
+        )
+    elif not item_count:
         record_practice_decision_event(
             payload,
             f"选股完成{slot_note}：候选池{observed_count}只，其中0只进入买卖决策，"
@@ -2143,7 +2470,7 @@ def run_practice_decision_logged(
             f"选股后买卖决策开始{slot_note}：候选池{observed_count}只，决策池{item_count}只",
         )
     try:
-        return run_practice_decision(payload)
+        return run_practice_decision(payload, blocking=decision_blocking)
     except Exception as exc:
         err = f"{type(exc).__name__}: {exc}"
         record_practice_decision_event(
@@ -2357,6 +2684,111 @@ def load_practice_candidates_cache() -> dict[str, Any]:
     if errors:
         base["error"] = "; ".join(errors)
     return base
+
+
+def _today_candidate_source_files(current_date: str) -> list[tuple[str, Path]]:
+    history_dir = CRON_OUTPUT_DIR / "multi_strategy_history" / current_date
+    history_files: list[Path] = []
+    if history_dir.is_dir() and not history_dir.is_symlink():
+        for path in history_dir.iterdir():
+            if path.is_symlink() or not path.is_file() or path.suffix != ".json":
+                continue
+            try:
+                timestamp = datetime.strptime(path.stem, "%Y-%m-%d_%H-%M-%S")
+            except ValueError:
+                continue
+            if timestamp.strftime("%Y-%m-%d") == current_date:
+                history_files.append(path)
+    history_files.sort(key=lambda path: path.name)
+
+    sources = [(f"history:{path.name}", path) for path in history_files[-12:]]
+    compact_path = _derived_read_model_path(
+        PRACTICE_CANDIDATES_CACHE_FILE,
+        _derived_read_model_path(MULTI_STRATEGY_CACHE_FILE, B1_CACHE_FILE),
+    )
+    if compact_path.is_file() and not compact_path.is_symlink():
+        sources.append(("latest", compact_path))
+    return sources
+
+
+def _today_candidate_source_versions(
+    sources: Iterable[tuple[str, Path]],
+) -> list[dict[str, Any]]:
+    versions: list[dict[str, Any]] = []
+    for source_id, path in sources:
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        versions.append({
+            "source": source_id,
+            "size": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+        })
+    return versions
+
+
+def load_today_candidates_cache() -> dict[str, Any]:
+    """Return stocks that reached the trade-ready pool in any scan today."""
+    current_date = current_cn_date_key()
+    summary_path = CRON_OUTPUT_DIR / TODAY_CANDIDATES_CACHE_FILE.name
+    with TODAY_CANDIDATES_LOCK:
+        sources = _today_candidate_source_files(current_date)
+        source_versions = _today_candidate_source_versions(sources)
+        cached = read_versioned_json_cache(summary_path)
+        if (
+            isinstance(cached, dict)
+            and cached.get("schema_version") == TODAY_CANDIDATES_SCHEMA_VERSION
+            and cached.get("current_date") == current_date
+            and cached.get("source_versions") == source_versions
+        ):
+            return {
+                key: value
+                for key, value in cached.items()
+                if key != "source_versions"
+            }
+
+        scans: list[dict[str, Any]] = []
+        for _source_id, path in sources:
+            parsed = read_json_cache(path, None)
+            if isinstance(parsed, dict):
+                scans.append(parsed)
+        payload = build_today_candidates_payload(
+            scans,
+            current_date=current_date,
+        )
+        try:
+            write_json_cache(
+                summary_path,
+                {**payload, "source_versions": source_versions},
+            )
+        except OSError:
+            pass
+        return payload
+
+
+def load_today_candidate_intraday() -> dict[str, Any]:
+    """Return bounded minute lines for the stocks in today's candidate read model."""
+    candidates = load_today_candidates_cache().get("items")
+    if not isinstance(candidates, list):
+        candidates = []
+    generated_at = current_cn_datetime().strftime("%Y-%m-%d %H:%M:%S")
+    if not candidates:
+        return build_today_candidate_intraday_payload(
+            [],
+            fetcher=lambda _code, _previous_close: {},
+            generated_at=generated_at,
+        )
+    try:
+        fetcher = get_trader_module().fetch_intraday_minutes
+    except Exception:
+        def fetcher(_code: str, _previous_close: float | None) -> dict[str, Any]:
+            raise RuntimeError("intraday provider unavailable")
+    return build_today_candidate_intraday_payload(
+        candidates,
+        fetcher=fetcher,
+        generated_at=generated_at,
+    )
 
 
 def load_niuone_mainline_cache_payload() -> dict[str, Any]:
@@ -2990,6 +3422,7 @@ def _trigger_b1_scan_unlocked(
             cache = {**data, "items": items, "candidates": candidates, "count": len(items),
                      "trade_items": trade_items, "trade_count": len(trade_items),
                      "total_analyzed": data.get("total_analyzed", 0),
+                     "job_id": resolved_job_id,
                      "generated_at": data.get("generated_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                      "running": False, "error": "", "cooldown_remaining_seconds": 0,
                      **schedule_meta}
@@ -3119,42 +3552,111 @@ def trigger_b1_scan(
                 "initializing": bool(initialization_started),
                 "readiness": readiness,
             }
+    resolved_job_id = str(job_id or f"scan-{secrets.token_urlsafe(12)}")[:120]
     if not B1_FULL_SCAN_LOCK.acquire(blocking=False):
-        return {
-            "error": "已有选股扫描正在运行，请等待当前扫描完成",
-            "items": [],
-            "count": 0,
-            "generated_at": "",
-            "running": True,
-            "busy": True,
-        }
+        return _b1_scan_busy_payload(other_process=False)
     process_lease = FileLease(
         CRON_STATE_DIR / "b1_full_scan.lock",
         stale_after_seconds=B1_SCAN_TIMEOUT_SECONDS + 120,
     )
     if not process_lease.acquire():
         B1_FULL_SCAN_LOCK.release()
-        return {
-            "error": "其他服务实例正在运行选股扫描，请等待当前扫描完成",
-            "error_code": "scan_in_progress_other_process",
-            "items": [],
-            "count": 0,
-            "generated_at": "",
-            "running": True,
-            "busy": True,
-        }
+        return _b1_scan_busy_payload(other_process=True)
+    _begin_b1_full_scan(resolved_job_id)
+    result: dict[str, Any] | None = None
     try:
-        return _trigger_b1_scan_unlocked(
+        result = _trigger_b1_scan_unlocked(
             force,
             decision_mode,
             schedule_slot=schedule_slot,
             schedule_run_kind=schedule_run_kind,
-            job_id=job_id,
+            job_id=resolved_job_id,
             require_ready_cache=require_ready_cache,
         )
+        result.setdefault("job_id", resolved_job_id)
+        return result
     finally:
+        _finish_b1_full_scan(resolved_job_id, result)
         process_lease.release()
         B1_FULL_SCAN_LOCK.release()
+
+
+def _b1_active_scan_snapshot(*, include_progress: bool) -> dict[str, Any]:
+    with B1_FULL_SCAN_CONDITION:
+        active = dict(B1_FULL_SCAN_ACTIVE)
+    if active.get("job_id") or not include_progress:
+        return active
+    progress = read_json_cache(
+        Path(
+            os.environ.get("DASHBOARD_B1_PROGRESS_FILE")
+            or CRON_STATE_DIR / "b1_scan_progress.json"
+        ).expanduser(),
+        None,
+    ) or {}
+    return {
+        key: progress.get(key)
+        for key in ("job_id", "stage", "stage_label", "updated_at")
+        if progress.get(key) not in {None, ""}
+    }
+
+
+def _b1_scan_busy_payload(*, other_process: bool) -> dict[str, Any]:
+    active = _b1_active_scan_snapshot(include_progress=other_process)
+    return {
+        "status": "busy",
+        "error": "",
+        "error_code": "",
+        "stage": "waiting_for_scan",
+        "stage_label": "已有选股扫描正在运行，已加入当前任务",
+        "items": [],
+        "count": 0,
+        "generated_at": "",
+        "running": True,
+        "busy": True,
+        "joined": True,
+        "other_process": other_process,
+        "active_job_id": str(active.get("job_id") or ""),
+        "active_stage": str(active.get("stage") or ""),
+        "active_stage_label": str(active.get("stage_label") or ""),
+    }
+
+
+def _begin_b1_full_scan(job_id: str) -> None:
+    with B1_FULL_SCAN_CONDITION:
+        B1_FULL_SCAN_ACTIVE.clear()
+        B1_FULL_SCAN_ACTIVE.update({
+            "job_id": job_id,
+            "running": True,
+            "started_at": _b1_schedule_now_text(),
+        })
+        B1_FULL_SCAN_CONDITION.notify_all()
+
+
+def _finish_b1_full_scan(
+    job_id: str,
+    result: Mapping[str, Any] | None,
+) -> None:
+    terminal = dict(result) if isinstance(result, Mapping) else {
+        "error": "选股扫描未返回结果",
+        "error_code": "candidate_scan_result_missing",
+        "stage": "screening",
+        "items": [],
+        "count": 0,
+        "generated_at": "",
+        "running": False,
+    }
+    terminal.setdefault("job_id", job_id)
+    terminal["running"] = False
+    with B1_FULL_SCAN_CONDITION:
+        B1_FULL_SCAN_LAST_RESULT.clear()
+        B1_FULL_SCAN_LAST_RESULT.update({
+            "job_id": job_id,
+            "result": terminal,
+            "finished_at": _b1_schedule_now_text(),
+        })
+        if str(B1_FULL_SCAN_ACTIVE.get("job_id") or "") == job_id:
+            B1_FULL_SCAN_ACTIVE.clear()
+        B1_FULL_SCAN_CONDITION.notify_all()
 
 
 class PracticeCycleError(RuntimeError):
@@ -3162,6 +3664,69 @@ class PracticeCycleError(RuntimeError):
         super().__init__(message)
         self.code = str(code or "practice_cycle_failed")[:120]
         self.stage = str(stage or "error")[:80]
+
+
+def wait_for_b1_scan_result(
+    busy_state: Mapping[str, Any],
+    *,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Join one bounded scan without starting a duplicate scan or decision."""
+
+    target_job_id = str(busy_state.get("active_job_id") or "")
+    timeout = max(
+        1.0,
+        float(timeout_seconds or (B1_SCAN_TIMEOUT_SECONDS + 120)),
+    )
+    deadline = time.monotonic() + timeout
+    while True:
+        with B1_FULL_SCAN_CONDITION:
+            last_job_id = str(B1_FULL_SCAN_LAST_RESULT.get("job_id") or "")
+            last_result = B1_FULL_SCAN_LAST_RESULT.get("result")
+            if (
+                target_job_id
+                and last_job_id == target_job_id
+                and isinstance(last_result, Mapping)
+            ):
+                return dict(last_result)
+            active_job_id = str(B1_FULL_SCAN_ACTIVE.get("job_id") or "")
+
+        if not target_job_id:
+            target_job_id = active_job_id
+            if not target_job_id and busy_state.get("other_process"):
+                progress = read_json_cache(b1_scan_progress_file(), None) or {}
+                target_job_id = str(progress.get("job_id") or "")
+
+        if target_job_id and not active_job_id:
+            cached = read_json_cache(B1_CACHE_FILE, None) or {}
+            if str(cached.get("job_id") or "") == target_job_id:
+                return cached
+            if not (CRON_STATE_DIR / "b1_full_scan.lock").exists():
+                raise PracticeCycleError(
+                    "已加入的选股扫描结束，但没有产生可复用结果",
+                    code="joined_scan_result_unavailable",
+                    stage="waiting_for_scan",
+                )
+        elif (
+            not target_job_id
+            and not B1_FULL_SCAN_LOCK.locked()
+            and not (CRON_STATE_DIR / "b1_full_scan.lock").exists()
+        ):
+            raise PracticeCycleError(
+                "当前选股扫描已经结束，但无法确认可复用任务",
+                code="joined_scan_identity_unavailable",
+                stage="waiting_for_scan",
+            )
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise PracticeCycleError(
+                f"等待当前选股扫描超过{int(timeout)}秒",
+                code="joined_scan_timeout",
+                stage="waiting_for_scan",
+            )
+        with B1_FULL_SCAN_CONDITION:
+            B1_FULL_SCAN_CONDITION.wait(timeout=min(1.0, remaining))
 
 
 def practice_manual_cycle_state_file() -> Path:
@@ -3222,6 +3787,7 @@ def practice_manual_cycle_status() -> dict[str, Any]:
     with PRACTICE_MANUAL_CYCLE_STATE_LOCK:
         status = _public_practice_manual_cycle_state(PRACTICE_MANUAL_CYCLE_STATE)
     if status.get("running") and status.get("stage") in {
+        "waiting_for_scan",
         "screening",
         "code_pool",
         "quotes",
@@ -3233,7 +3799,11 @@ def practice_manual_cycle_status() -> dict[str, Any]:
         "persisting",
     }:
         progress = read_json_cache(b1_scan_progress_file(), None) or {}
-        if str(progress.get("job_id") or "") == str(status.get("job_id") or ""):
+        progress_job_id = str(progress.get("job_id") or "")
+        expected_job_id = str(
+            status.get("active_scan_job_id") or status.get("job_id") or ""
+        )
+        if progress_job_id == expected_job_id:
             for name in (
                 "stage",
                 "stage_label",
@@ -3246,11 +3816,31 @@ def practice_manual_cycle_status() -> dict[str, Any]:
                 "updated_at",
             ):
                 if name in progress:
-                    status[name] = progress[name]
+                    if name == "stage" and status.get("stage") == "waiting_for_scan":
+                        status["active_scan_stage"] = progress[name]
+                    else:
+                        status[name] = progress[name]
     completed = int(status.get("completed") or 0)
     total = int(status.get("total") or 0)
     status["progress_pct"] = round(completed / total * 100, 1) if total else 0.0
+    status["error_visible"] = _practice_manual_error_is_visible(status)
     return status
+
+
+def _practice_manual_error_is_visible(status: Mapping[str, Any]) -> bool:
+    if status.get("running") or not status.get("error"):
+        return False
+    if str(status.get("stage") or "") not in {"error", "interrupted"}:
+        return False
+    timestamp = str(status.get("finished_at") or status.get("started_at") or "")[:19]
+    if not timestamp:
+        return True
+    try:
+        finished = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return True
+    age_seconds = (datetime.now() - finished).total_seconds()
+    return -60 <= age_seconds <= PRACTICE_MANUAL_ERROR_DISPLAY_SECONDS
 
 
 def _set_practice_manual_cycle_state(**updates: Any) -> dict[str, Any]:
@@ -3430,6 +4020,19 @@ def _run_practice_manual_cycle(process_lease: FileLease | None = None) -> None:
                 decision_mode="none",
                 job_id=str(PRACTICE_MANUAL_CYCLE_STATE.get("job_id") or ""),
             )
+        if cache.get("busy"):
+            active_scan_job_id = str(cache.get("active_job_id") or "")
+            _set_practice_manual_cycle_state(
+                stage="waiting_for_scan",
+                stage_label="已有选股扫描正在运行，正在加入当前任务",
+                joined_existing_scan=True,
+                active_scan_job_id=active_scan_job_id,
+                notice_code="joined_existing_scan",
+                notice="已加入当前选股扫描，完成后将复用同一份候选结果",
+                error_code="",
+                error="",
+            )
+            cache = wait_for_b1_scan_result(cache)
         if cache.get("error"):
             raise PracticeCycleError(
                 str(cache.get("error")),
@@ -3460,6 +4063,17 @@ def _run_practice_manual_cycle(process_lease: FileLease | None = None) -> None:
             stage_label="本轮选股及买卖已完成",
             finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             decision_result=decision_result,
+            active_scan_job_id="",
+            notice_code=(
+                "joined_existing_scan"
+                if PRACTICE_MANUAL_CYCLE_STATE.get("joined_existing_scan")
+                else ""
+            ),
+            notice=(
+                "已复用当前选股扫描，并完成本轮买卖策略"
+                if PRACTICE_MANUAL_CYCLE_STATE.get("joined_existing_scan")
+                else ""
+            ),
             error_code="",
             error="",
         )
@@ -3474,11 +4088,18 @@ def _run_practice_manual_cycle(process_lease: FileLease | None = None) -> None:
             stage_label="本轮执行失败",
             finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             failure_stage=failure_stage,
+            active_scan_job_id="",
             error_code=error_code,
             error=f"{type(exc).__name__}: {exc}",
         )
     finally:
-        invalidate_api_cache(PRACTICE_CANDIDATES_CACHE_KEY, "niuniu_practice", PRACTICE_FAST_CACHE_KEY)
+        invalidate_api_cache(
+            PRACTICE_CANDIDATES_CACHE_KEY,
+            TODAY_CANDIDATES_CACHE_KEY,
+            TODAY_CANDIDATE_INTRADAY_CACHE_KEY,
+            "niuniu_practice",
+            PRACTICE_FAST_CACHE_KEY,
+        )
         if process_lease is not None:
             process_lease.release()
         PRACTICE_MANUAL_CYCLE_LOCK.release()
@@ -3486,7 +4107,13 @@ def _run_practice_manual_cycle(process_lease: FileLease | None = None) -> None:
 
 def start_practice_manual_cycle() -> dict[str, Any]:
     if not PRACTICE_MANUAL_CYCLE_LOCK.acquire(blocking=False):
-        return {**practice_manual_cycle_status(), "accepted": False}
+        return {
+            **practice_manual_cycle_status(),
+            "accepted": False,
+            "busy": True,
+            "notice_code": "joined_existing_manual_cycle",
+            "notice": "已有手动任务正在运行，已加入当前任务",
+        }
     initialization_timeout = _bounded_int_value(
         os.environ.get(
             "DASHBOARD_MANUAL_DATA_INITIALIZATION_TIMEOUT_SECONDS",
@@ -3518,7 +4145,10 @@ def start_practice_manual_cycle() -> dict[str, Any]:
             "accepted": False,
             "running": True,
             "busy": True,
-            "error_code": "manual_cycle_in_progress_other_process",
+            "error_code": "",
+            "error": "",
+            "notice_code": "joined_existing_manual_cycle",
+            "notice": "其他服务实例正在执行本轮任务，已加入当前任务",
             "stage_label": "其他服务实例正在执行选股及买卖策略",
         }
     started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -3538,7 +4168,11 @@ def start_practice_manual_cycle() -> dict[str, Any]:
         cache_hits=0,
         network_fallbacks=0,
         manual_scan_reused=False,
+        joined_existing_scan=False,
+        active_scan_job_id="",
         decision_result=None,
+        notice_code="",
+        notice="",
         failure_stage="",
         error_code="",
         error="",
@@ -3803,8 +4437,31 @@ def run_scheduled_b1_scan(slot_key: str) -> None:
             schedule_slot=slot_key,
             schedule_run_kind=run_kind,
         )
+        if cache.get("busy"):
+            try:
+                cache = wait_for_b1_scan_result(cache)
+                cache = {
+                    **cache,
+                    "schedule_slot": slot_key,
+                    "schedule_run_kind": run_kind,
+                    "schedule_triggered_at": datetime.now().strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    ),
+                }
+            except PracticeCycleError as exc:
+                cache = {
+                    "error": str(exc),
+                    "error_code": exc.code,
+                    "stage": exc.stage,
+                    "items": [],
+                    "count": 0,
+                    "generated_at": "",
+                    "running": False,
+                }
         with API_RESPONSE_LOCK:
             API_RESPONSE_CACHE.pop(PRACTICE_CANDIDATES_CACHE_KEY, None)
+            API_RESPONSE_CACHE.pop(TODAY_CANDIDATES_CACHE_KEY, None)
+            API_RESPONSE_CACHE.pop(TODAY_CANDIDATE_INTRADAY_CACHE_KEY, None)
         start_independent_niuone_mainline_scan(slot_key)
         if cache.get("error"):
             _mark_b1_schedule_slot(
@@ -3883,6 +4540,166 @@ def b1_schedule_loop() -> None:
         time.sleep(15)
 
 
+def practice_fast_cycle_context_payload(
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Combine the latest complete scan with the freshest NiuOne context."""
+
+    payload: dict[str, Any] = {}
+    for path in (MULTI_STRATEGY_CACHE_FILE, B1_CACHE_FILE):
+        candidate = read_json_cache(path, None)
+        if not isinstance(candidate, dict):
+            continue
+        if not payload or str(candidate.get("generated_at") or "") > str(
+            payload.get("generated_at") or ""
+        ):
+            payload = dict(candidate)
+    complete_context = payload.get("niuone_context")
+    niuone_payload = load_niuone_mainline_cache_payload()
+    niuone_context = niuone_payload.get("niuone_context")
+    if isinstance(niuone_context, dict):
+        complete_generated_at = str(payload.get("generated_at") or "")[:19]
+        operational_generated_at = str(
+            niuone_payload.get("generated_at") or ""
+        )[:19]
+        complete_date = complete_generated_at[:10]
+        operational_date = operational_generated_at[:10]
+        current_date = (now or current_cn_datetime()).strftime("%Y-%m-%d")
+        complete_is_current = bool(
+            isinstance(complete_context, Mapping)
+            and complete_date == operational_date == current_date
+        )
+        payload["niuone_context"] = merge_niuone_holding_cycle_context(
+            complete_context if complete_is_current else {},
+            niuone_context,
+        )
+        payload["niuone_context_generated_at"] = str(
+            niuone_payload.get("generated_at") or ""
+        )
+        payload["niuone_stock_profiles_generated_at"] = (
+            complete_generated_at if complete_is_current else ""
+        )
+    return payload
+
+
+def run_practice_fast_cycle_once(
+    now: datetime | None = None,
+    *,
+    trader: Any | None = None,
+    payload_builder: Callable[..., dict[str, Any]] = build_holding_cycle_payload,
+) -> dict[str, Any]:
+    """Run one holdings-only decision cycle without widening the symbol set."""
+
+    current = now or current_cn_datetime()
+    if not PRACTICE_FAST_CYCLE_ENABLED:
+        return {"skipped": True, "reason": "practice_fast_cycle_disabled"}
+    trader = trader or get_trader_module()
+    trade_allowed, trade_reason = trader.is_a_share_execution_time(current)
+    if not trade_allowed:
+        return {
+            "skipped": True,
+            "reason": "outside_a_share_execution_time",
+            "trade_reason": trade_reason,
+        }
+    state = trader.load_state()
+    holdings: list[dict[str, Any]] = []
+    for code, position in (state.get("positions") or {}).items():
+        if not isinstance(position, dict):
+            continue
+        quantity = (
+            trader.position_qty(position)
+            if hasattr(trader, "position_qty")
+            else int(position.get("qty") or position.get("quantity") or 0)
+        )
+        if quantity <= 0:
+            continue
+        holdings.append({
+            **position,
+            "code": str(position.get("code") or code),
+            "qty": quantity,
+        })
+    if not holdings:
+        return {"skipped": True, "reason": "no_open_positions"}
+
+    payload = payload_builder(
+        holdings,
+        practice_fast_cycle_context_payload(),
+        now=current,
+    )
+    if not isinstance(payload, dict):
+        raise TypeError("持仓快周期评分结果必须为字典")
+    payload["holding_cycle_only"] = True
+    payload["holding_cycle_codes"] = sorted(
+        str(holding.get("code") or "")
+        for holding in holdings
+        if str(holding.get("code") or "")
+    )
+    payload["decision_cycle_kind"] = HOLDING_CYCLE_KIND
+    payload["schedule_run_kind"] = HOLDING_CYCLE_KIND
+    payload["schedule_triggered_at"] = current.strftime("%Y-%m-%d %H:%M:%S")
+    result = run_practice_decision_logged(
+        payload,
+        record_start=True,
+        refresh_market_summary=True,
+        decision_blocking=False,
+    )
+    if result.get("reason") != "practice_decision_busy":
+        invalidate_api_cache(
+            "niuniu_practice",
+            PRACTICE_FAST_CACHE_KEY,
+            "practice_benchmarks",
+        )
+    return {
+        **result,
+        "decision_cycle_kind": HOLDING_CYCLE_KIND,
+        "holding_cycle_data_status": payload.get(
+            "holding_cycle_data_status",
+            "",
+        ),
+    }
+
+
+def practice_fast_cycle_loop(
+    *,
+    stop_event: threading.Event | None = None,
+    poll_seconds: float = 5.0,
+) -> None:
+    """Poll the hot-applied switch and run at the configured bounded cadence."""
+
+    stop_event = stop_event or threading.Event()
+    last_attempt = 0.0
+    while not stop_event.is_set():
+        now_monotonic = time.monotonic()
+        interval = float(PRACTICE_FAST_CYCLE_INTERVAL_SECONDS)
+        if (
+            PRACTICE_FAST_CYCLE_ENABLED
+            and now_monotonic - last_attempt >= interval
+        ):
+            last_attempt = now_monotonic
+            try:
+                result = run_practice_fast_cycle_once()
+                if not result.get("skipped"):
+                    print(
+                        "[practice fast cycle] "
+                        f"status={result.get('holding_cycle_data_status') or 'ready'} "
+                        f"executed={len(result.get('executed') or [])}",
+                        flush=True,
+                    )
+            except Exception as exc:
+                print(
+                    "[WARN] 持仓快周期失败: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+            finally:
+                # Keep the configured interval between completed attempts so
+                # a slow upstream/model call cannot create an immediate retry
+                # loop after it returns.
+                last_attempt = time.monotonic()
+        if stop_event.wait(max(1.0, min(float(poll_seconds), interval))):
+            return
+
+
 def pending_decision_loop() -> None:
     while True:
         try:
@@ -3913,6 +4730,7 @@ def practice_equity_heartbeat_loop(
     """Keep minute equity snapshots flowing even when no dashboard is open."""
 
     stop_event = stop_event or threading.Event()
+    refresh_practice_position_marks_on_startup()
     while not stop_event.is_set():
         record_practice_equity_heartbeat()
         if stop_event.wait(max(1.0, float(poll_seconds))):
@@ -3963,6 +4781,78 @@ def _empty_market_breadth_history(day: str) -> dict[str, Any]:
         day,
         interval_seconds=MARKET_BREADTH_SAMPLE_INTERVAL_SECONDS,
     )
+
+
+def _market_breadth_history_recovery_file() -> Path:
+    suffix = MARKET_BREADTH_HISTORY_FILE.suffix or ".json"
+    return MARKET_BREADTH_HISTORY_FILE.with_name(
+        f"{MARKET_BREADTH_HISTORY_FILE.stem}.recovery{suffix}"
+    )
+
+
+def _market_breadth_history_day(history: dict[str, Any] | None) -> str:
+    """Resolve the newest real sample day before trusting file metadata."""
+
+    source = history if isinstance(history, dict) else {}
+    sample_days = sorted({
+        compact["generated_at"][:10]
+        for raw in source.get("samples") or []
+        if (
+            compact := compact_market_breadth_sample(
+                raw if isinstance(raw, dict) else None
+            )
+        ) is not None
+    })
+    if sample_days:
+        return sample_days[-1]
+    day = str(source.get("date") or "")[:10]
+    try:
+        datetime.strptime(day, "%Y-%m-%d")
+    except ValueError:
+        return ""
+    return day
+
+
+def _market_breadth_history_for_day(
+    day: str,
+    *histories: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Merge durable samples without letting a shorter file erase real points."""
+
+    samples: list[Any] = []
+    for history in histories:
+        if not isinstance(history, dict):
+            continue
+        samples.extend(history.get("samples") or [])
+        for archive_key in ("previous_day", "previous_turnover"):
+            archive = history.get(archive_key)
+            if isinstance(archive, dict):
+                samples.extend(archive.get("samples") or [])
+    return roll_market_breadth_history(
+        {"samples": samples},
+        day,
+        interval_seconds=MARKET_BREADTH_SAMPLE_INTERVAL_SECONDS,
+    )
+
+
+def _persist_market_breadth_history(history: dict[str, Any]) -> bool:
+    """Atomically preserve a non-empty curve before updating the active file."""
+
+    day = _market_breadth_history_day(history)
+    if not day:
+        return False
+    recovery_file = _market_breadth_history_recovery_file()
+    recovery = read_json_cache(recovery_file, None)
+    current = read_json_cache(MARKET_BREADTH_HISTORY_FILE, None)
+    merged = _market_breadth_history_for_day(day, recovery, current, history)
+    changed = False
+    if merged.get("samples") and merged != recovery:
+        write_json_cache(recovery_file, merged)
+        changed = True
+    if merged != current:
+        write_json_cache(MARKET_BREADTH_HISTORY_FILE, merged)
+        changed = True
+    return changed
 
 
 def _empty_industry_flow_history(day: str) -> dict[str, Any]:
@@ -4071,14 +4961,14 @@ def reset_daily_market_histories(now: datetime | None = None) -> bool:
     changed = False
     with MARKET_BREADTH_HISTORY_LOCK:
         history = read_json_cache(MARKET_BREADTH_HISTORY_FILE, None)
-        rolled = roll_market_breadth_history(
-            history,
+        recovery = read_json_cache(_market_breadth_history_recovery_file(), None)
+        rolled = _market_breadth_history_for_day(
             day,
-            interval_seconds=MARKET_BREADTH_SAMPLE_INTERVAL_SECONDS,
+            recovery,
+            history,
         )
-        if history is not None and rolled != history:
-            write_json_cache(MARKET_BREADTH_HISTORY_FILE, rolled)
-            changed = True
+        if (history is not None or recovery is not None) and rolled != history:
+            changed = _persist_market_breadth_history(rolled) or changed
     with INDUSTRY_FLOW_HISTORY_LOCK:
         history = read_json_cache(INDUSTRY_FLOW_HISTORY_FILE, None)
         recovery = read_json_cache(_industry_flow_history_recovery_file(), None)
@@ -4183,6 +5073,38 @@ def load_previous_market_turnover_history(
         )
 
 
+def load_previous_market_breadth_samples(
+    *,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Load the newest complete breadth curve before the active display day."""
+
+    resolved_now = now or current_cn_datetime()
+    current_day = market_retention_date_key(resolved_now)
+    reset_daily_market_histories(resolved_now)
+    with MARKET_BREADTH_HISTORY_LOCK:
+        history = read_json_cache(MARKET_BREADTH_HISTORY_FILE, None) or {}
+        recovery = read_json_cache(_market_breadth_history_recovery_file(), None)
+        candidates: list[dict[str, Any]] = []
+        for raw in (
+            history.get("previous_day"),
+            recovery,
+            recovery.get("previous_day") if isinstance(recovery, dict) else None,
+        ):
+            previous = compact_previous_market_breadth_history(
+                raw if isinstance(raw, dict) else None,
+                before_date=current_day,
+            )
+            if previous is not None:
+                candidates.append(previous)
+        previous = (
+            max(candidates, key=lambda item: str(item.get("date") or ""))
+            if candidates
+            else None
+        )
+        return list((previous or {}).get("samples") or [])
+
+
 def record_market_breadth_sample(
     snapshot: dict[str, Any],
     *,
@@ -4200,14 +5122,20 @@ def record_market_breadth_sample(
     ):
         return load_market_breadth_samples(now=resolved_now)
     with MARKET_BREADTH_HISTORY_LOCK:
-        history = read_json_cache(MARKET_BREADTH_HISTORY_FILE, None) or {}
+        history = read_json_cache(MARKET_BREADTH_HISTORY_FILE, None)
+        recovery = read_json_cache(_market_breadth_history_recovery_file(), None)
+        history = _market_breadth_history_for_day(
+            market_retention_date_key(resolved_now),
+            recovery,
+            history,
+        )
         updated = append_market_breadth_sample(
             history,
             snapshot,
             interval_seconds=MARKET_BREADTH_SAMPLE_INTERVAL_SECONDS,
         )
         if updated != history and updated.get("samples"):
-            write_json_cache(MARKET_BREADTH_HISTORY_FILE, updated)
+            _persist_market_breadth_history(updated)
         return [
             sample
             for sample in (updated.get("samples") or [])
@@ -4222,6 +5150,23 @@ def _market_breadth_failure_payload(
 ) -> dict[str, Any]:
     samples = load_market_breadth_samples(now=now)
     if not samples:
+        previous_samples = load_previous_market_breadth_samples(now=now)
+        if previous_samples:
+            fallback = dict(previous_samples[-1])
+            fallback.update({
+                "stale_cache": True,
+                "error": f"{type(error).__name__}: {error}",
+            })
+            payload = build_market_breadth_payload(
+                fallback,
+                history_samples=previous_samples,
+                interval_seconds=MARKET_BREADTH_SAMPLE_INTERVAL_SECONDS,
+            )
+            payload.update({
+                "displaying_previous_trading_day": True,
+                "display_date": fallback["generated_at"][:10],
+            })
+            return payload
         return build_market_breadth_payload({
             "error": f"{type(error).__name__}: {error}",
         })
@@ -4243,7 +5188,22 @@ def _cached_market_breadth_payload(now: datetime) -> dict[str, Any] | None:
 
     samples = load_market_breadth_samples(now=now)
     if not samples:
-        return None
+        if is_market_breadth_sampling_window(now):
+            return None
+        previous_samples = load_previous_market_breadth_samples(now=now)
+        if not previous_samples:
+            return None
+        latest = previous_samples[-1]
+        payload = build_market_breadth_payload(
+            latest,
+            history_samples=previous_samples,
+            interval_seconds=MARKET_BREADTH_SAMPLE_INTERVAL_SECONDS,
+        )
+        payload.update({
+            "displaying_previous_trading_day": True,
+            "display_date": latest["generated_at"][:10],
+        })
+        return payload
     latest = samples[-1]
     try:
         latest_time = datetime.strptime(
@@ -4390,6 +5350,145 @@ def start_market_breadth_sampler() -> None:
     )
 
 
+def market_breadth_auto_recovery_state(
+    now: datetime | None = None,
+    *,
+    started_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Return whether startup recovery can run without weakening validation."""
+
+    current = now or current_cn_datetime()
+    if not is_a_share_trading_day_for_dashboard(current):
+        return {"status": "not_trading_day"}
+    if current.hour < 9:
+        return {"status": "waiting_open"}
+    samples = load_market_breadth_samples(now=current)
+    close_boundary = current.replace(hour=15, minute=1, second=0, microsecond=0)
+    if started_at is not None and current < close_boundary:
+        latest_time = max(
+            (
+                datetime.strptime(sample["generated_at"], "%Y-%m-%d %H:%M:%S")
+                for sample in samples
+                if str(sample.get("generated_at") or "")[:10]
+                == current_cn_date_key(current)
+            ),
+            default=None,
+        )
+        if latest_time is None or latest_time < started_at:
+            return {"status": "waiting_startup_sample"}
+    after_close = current >= close_boundary
+    plan = plan_market_breadth_recovery(
+        current_cn_date_key(current),
+        samples,
+        expected_through=(
+            current.replace(hour=15, minute=0, second=0, microsecond=0)
+            if after_close
+            else None
+        ),
+        allow_pre_gap_validation=after_close,
+    )
+    if (
+        plan["status"] in {"waiting_boundary", "waiting_validation"}
+        and after_close
+    ):
+        return {**plan, "status": "insufficient_validation"}
+    return plan
+
+
+def run_market_breadth_auto_recovery_process(
+    *,
+    deadline_seconds: int = MARKET_BREADTH_AUTO_RECOVERY_DEADLINE_SECONDS,
+    process_timeout_seconds: int = (
+        MARKET_BREADTH_AUTO_RECOVERY_PROCESS_TIMEOUT_SECONDS
+    ),
+) -> str:
+    """Run the validated writer in one bounded, cross-process leased child."""
+
+    lease = FileLease(
+        CRON_STATE_DIR / "market_breadth_auto_recovery.lock",
+        stale_after_seconds=process_timeout_seconds + 120,
+    )
+    if not lease.acquire():
+        return "busy"
+    try:
+        try:
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(ENTRYPOINT_DIR / "recover_market_breadth_history.py"),
+                    "--write",
+                    "--deadline-seconds",
+                    str(max(30, int(deadline_seconds))),
+                ],
+                cwd=str(PROJECT_ROOT),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=max(60, int(process_timeout_seconds)),
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return "failed"
+        return "succeeded" if completed.returncode == 0 else "failed"
+    finally:
+        lease.release()
+
+
+def market_breadth_auto_recovery_loop(
+    *,
+    stop_event: threading.Event | None = None,
+    poll_seconds: float = 30.0,
+    runner: Callable[[], str] | None = None,
+) -> None:
+    """Wait for real cross-check points, then backfill today's startup gap."""
+
+    stop_event = stop_event or threading.Event()
+    run_recovery = runner or run_market_breadth_auto_recovery_process
+    started_at = current_cn_datetime()
+    attempts = 0
+    while not stop_event.is_set():
+        state = market_breadth_auto_recovery_state(started_at=started_at)
+        status = str(state.get("status") or "")
+        if status in {"complete", "not_trading_day", "insufficient_validation"}:
+            return
+        if status == "ready":
+            outcome = str(run_recovery() or "failed")
+            if outcome == "succeeded":
+                invalidate_api_cache("market_breadth")
+                print("Market breadth startup recovery completed", flush=True)
+                return
+            if outcome == "failed":
+                attempts += 1
+                if attempts >= MARKET_BREADTH_AUTO_RECOVERY_MAX_ATTEMPTS:
+                    print(
+                        "[WARN] 市场宽度启动补齐失败: bounded retries exhausted",
+                        flush=True,
+                    )
+                    return
+                wait_seconds = MARKET_BREADTH_AUTO_RECOVERY_RETRY_SECONDS
+            else:
+                wait_seconds = poll_seconds
+        else:
+            wait_seconds = poll_seconds
+        if stop_event.wait(max(0.1, float(wait_seconds))):
+            return
+
+
+def start_market_breadth_auto_recovery() -> None:
+    global MARKET_BREADTH_AUTO_RECOVERY_THREAD
+    if (
+        MARKET_BREADTH_AUTO_RECOVERY_THREAD
+        and MARKET_BREADTH_AUTO_RECOVERY_THREAD.is_alive()
+    ):
+        return
+    MARKET_BREADTH_AUTO_RECOVERY_THREAD = threading.Thread(
+        target=market_breadth_auto_recovery_loop,
+        name="market-breadth-auto-recovery",
+        daemon=True,
+    )
+    MARKET_BREADTH_AUTO_RECOVERY_THREAD.start()
+    print("Market breadth startup recovery enabled", flush=True)
+
+
 def is_industry_flow_sampling_window(now: datetime | None = None) -> bool:
     """Return whether Beijing time is inside either fixed sampling session."""
 
@@ -4504,6 +5603,77 @@ def fetch_and_record_money_flow(
     return money_flow, record_industry_flow_sample(money_flow, now=now)
 
 
+def _money_flow_with_display_period(
+    payload: dict[str, Any],
+    *,
+    now: datetime,
+) -> dict[str, Any]:
+    generated_date = str(payload.get("generated_at") or "")[:10]
+    current_date = now.strftime("%Y-%m-%d")
+    if not generated_date or generated_date >= current_date:
+        return payload
+    try:
+        calendar = dashboard_trading_day_status(now)
+    except Exception:
+        calendar = {}
+    previous_date = str(calendar.get("previous_trading_day") or "")[:10]
+    return {
+        **payload,
+        "display_date": generated_date,
+        "displaying_historical_data": True,
+        "displaying_previous_trading_day": generated_date == previous_date,
+    }
+
+
+def load_previous_money_flow_snapshot(
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    """Rebuild the latest real fund-flow ranking from durable samples."""
+
+    resolved_now = now or current_cn_datetime()
+    reset_daily_market_histories(resolved_now)
+    with INDUSTRY_FLOW_HISTORY_LOCK:
+        primary = read_json_cache(INDUSTRY_FLOW_HISTORY_FILE, None)
+        recovery = read_json_cache(_industry_flow_history_recovery_file(), None)
+    candidates: list[dict[str, Any]] = []
+    for history in (primary, recovery):
+        if not isinstance(history, dict):
+            continue
+        for raw in history.get("samples") or []:
+            compact = compact_industry_flow_sample(
+                raw if isinstance(raw, dict) else None
+            )
+            if compact is not None:
+                candidates.append(compact)
+    if not candidates:
+        return None
+    latest = max(candidates, key=lambda item: str(item.get("generated_at") or ""))
+    rows = [row for row in latest.get("items") or [] if isinstance(row, dict)]
+    inflow = sorted(
+        (row for row in rows if float(row.get("net_flow_yi") or 0) > 0),
+        key=lambda row: (-float(row.get("net_flow_yi") or 0), str(row.get("name") or "")),
+    )
+    outflow = sorted(
+        (row for row in rows if float(row.get("net_flow_yi") or 0) < 0),
+        key=lambda row: (float(row.get("net_flow_yi") or 0), str(row.get("name") or "")),
+    )
+    if not inflow and not outflow:
+        return None
+    payload = {
+        "schema_version": 2,
+        "metric": "industry_main_net_flow",
+        "metric_label": "最近交易日主力净额",
+        "source": "本地最近交易日资金采样",
+        "generated_at": latest["generated_at"],
+        "inflow": [dict(row) for row in inflow],
+        "outflow": [dict(row) for row in outflow],
+        "count": len(rows),
+        "stale_cache": True,
+    }
+    return _money_flow_with_display_period(payload, now=resolved_now)
+
+
 def refresh_industry_flow_sample() -> bool:
     money_flow, samples = fetch_and_record_money_flow(
         force_refresh=True,
@@ -4578,6 +5748,29 @@ def start_b1_scheduler() -> None:
     B1_SCHEDULE_THREAD = threading.Thread(target=b1_schedule_loop, name="b1-scheduler", daemon=True)
     B1_SCHEDULE_THREAD.start()
     print(f"Practice schedule enabled: {', '.join(PRACTICE_SCHEDULE_TIMES)}", flush=True)
+
+
+def start_practice_fast_cycle() -> None:
+    """Keep one dormant-capable worker so the setting can hot-apply."""
+
+    global PRACTICE_FAST_CYCLE_THREAD
+    if (
+        PRACTICE_FAST_CYCLE_THREAD
+        and PRACTICE_FAST_CYCLE_THREAD.is_alive()
+    ):
+        return
+    PRACTICE_FAST_CYCLE_THREAD = threading.Thread(
+        target=practice_fast_cycle_loop,
+        name="practice-fast-cycle",
+        daemon=True,
+    )
+    PRACTICE_FAST_CYCLE_THREAD.start()
+    print(
+        "Practice holding fast cycle "
+        f"{'enabled' if PRACTICE_FAST_CYCLE_ENABLED else 'available'}: "
+        f"{PRACTICE_FAST_CYCLE_INTERVAL_SECONDS}s",
+        flush=True,
+    )
 
 
 def start_kline_prewarm_scheduler() -> None:
@@ -4656,8 +5849,10 @@ def fmt_ts(ts: float | None) -> str:
         return ""
     return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
 
-CATEGORIES = {"us_ratings": "美股机构买入评级", "x_monitor": "推特监控",
-              "market_monitor": "盘面监控", "other": "其他"}
+CATEGORIES = {
+    "market_monitor": "盘面监控",
+    "other": "其他",
+}
 
 def merge_records_from_db(limit: int | None = None, category: str | None = None, offset: int = 0) -> dict[str, Any]:
     data = push_history.query_messages(limit=limit, category=category, offset=offset)
@@ -5005,7 +6200,152 @@ def seed_api_cache_from_json_file(
         entries_lock=API_RESPONSE_LOCK,
         transform=transform,
         cacheable=cacheable,
+        stale_while_refresh_seconds=API_STALE_WHILE_REFRESH_SECONDS,
     )
+
+
+def _api_cache_entry_is_fresh(cache_key: str, ttl: int) -> bool:
+    current_time = time.time()
+    with API_RESPONSE_LOCK:
+        cached = API_RESPONSE_CACHE.get(cache_key)
+        return bool(
+            cached
+            and current_time - float(cached.get("ts") or 0) < max(0, ttl)
+        )
+
+
+def is_global_market_prewarm_window(now: datetime | None = None) -> bool:
+    """Cover the Beijing-time global trading week without weekend polling."""
+
+    current = now or current_cn_datetime()
+    weekday = current.weekday()
+    if weekday == 0:
+        return current.hour >= 6
+    if 1 <= weekday <= 4:
+        return True
+    if weekday == 5:
+        return current.hour < 6
+    return False
+
+
+def prewarm_market_api_cache(*, now: datetime | None = None) -> bool:
+    """Keep relevant market caches warm without polling closed markets."""
+
+    current = now or current_cn_datetime()
+    indices_ttl = API_TTLS["indices"]
+    sectors_ttl = API_TTLS["sectors"]
+    hot_ttl = API_TTLS["hot_stocks"]
+    sectors_snapshot = CRON_OUTPUT_DIR / "sectors_dashboard_cache.json"
+    hot_snapshot = CRON_OUTPUT_DIR / "hot_stocks_dashboard_cache.json"
+
+    seed_api_cache_from_json_file(
+        "indices",
+        INDICES_SNAPSHOT_FILE,
+        indices_ttl,
+        cacheable=market_indices_available,
+    )
+    seed_api_cache_from_json_file(
+        "sectors",
+        sectors_snapshot,
+        sectors_ttl,
+        cacheable=market_sectors_available,
+    )
+    seed_api_cache_from_json_file(
+        "hot_stocks:amount",
+        hot_snapshot,
+        hot_ttl,
+        lambda payload: apply_hot_stocks_sort(payload, "amount"),
+        cacheable=market_hot_stocks_available,
+    )
+
+    refresh_results = []
+    if is_global_market_prewarm_window(current):
+        indices = cached_json_data(
+            "indices",
+            indices_ttl,
+            produce_indices_data,
+            {"items": []},
+            cacheable=market_indices_available,
+        )
+        refresh_results.append(
+            market_indices_available(indices)
+            and _api_cache_entry_is_fresh("indices", indices_ttl)
+        )
+
+    if is_market_breadth_sampling_window(current):
+        sectors = cached_json_data(
+            "sectors",
+            sectors_ttl,
+            produce_sectors_data,
+            {"sectors": [], "items": []},
+            cacheable=market_sectors_available,
+        )
+        refresh_results.append(
+            market_sectors_available(sectors)
+            and _api_cache_entry_is_fresh("sectors", sectors_ttl)
+        )
+        hot_stocks = cached_json_data(
+            "hot_stocks:amount",
+            hot_ttl,
+            produce_hot_stocks_data,
+            {"items": []},
+            cacheable=market_hot_stocks_available,
+        )
+        refresh_results.append(
+            market_hot_stocks_available(hot_stocks)
+            and _api_cache_entry_is_fresh("hot_stocks:amount", hot_ttl)
+        )
+
+    return all(refresh_results)
+
+
+def market_api_prewarm_loop(
+    *,
+    stop_event: threading.Event | None = None,
+    poll_seconds: float = 30.0,
+    max_backoff_seconds: float = 300.0,
+    run_once=None,
+) -> None:
+    """Refresh shared market caches periodically, independent of active pages."""
+
+    stop_event = stop_event or threading.Event()
+    active_run_once = run_once or prewarm_market_api_cache
+    base_poll_seconds = max(5.0, float(poll_seconds))
+    maximum_backoff = max(base_poll_seconds, float(max_backoff_seconds))
+    retry_seconds = base_poll_seconds
+    while not stop_event.is_set():
+        succeeded = True
+        try:
+            succeeded = active_run_once() is not False
+        except Exception as exc:
+            succeeded = False
+            print(
+                f"[WARN] 行情缓存预热失败: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+        if succeeded:
+            retry_seconds = base_poll_seconds
+        else:
+            retry_seconds = min(
+                maximum_backoff,
+                max(base_poll_seconds * 2, retry_seconds * 2),
+            )
+        if stop_event.wait(retry_seconds):
+            return
+
+
+def start_market_api_prewarm() -> None:
+    global MARKET_API_PREWARM_THREAD
+    if MARKET_API_PREWARM_THREAD and MARKET_API_PREWARM_THREAD.is_alive():
+        return
+    MARKET_API_PREWARM_THREAD = threading.Thread(
+        target=market_api_prewarm_loop,
+        name="market-api-prewarm",
+        daemon=True,
+    )
+    MARKET_API_PREWARM_THREAD.start()
+    print("Market API cache prewarm enabled: 30s", flush=True)
 
 
 def invalidate_api_cache(*cache_keys: str) -> None:
@@ -5165,8 +6505,14 @@ def produce_us_sector_data() -> dict[str, Any]:
 
 
 def produce_money_flow_data() -> dict[str, Any]:
-    money_flow, _samples = fetch_and_record_money_flow(timeout=120)
-    return money_flow
+    current = current_cn_datetime()
+    money_flow, _samples = fetch_and_record_money_flow(timeout=120, now=current)
+    if money_flow.get("inflow") or money_flow.get("outflow"):
+        return _money_flow_with_display_period(money_flow, now=current)
+    previous = load_previous_money_flow_snapshot(now=current)
+    if previous is not None and money_flow.get("error"):
+        previous["error"] = str(money_flow["error"])
+    return previous or money_flow
 
 
 def produce_industry_flow_data() -> dict[str, Any]:
@@ -5199,60 +6545,6 @@ def produce_industry_flow_data() -> dict[str, Any]:
         playback_speed=INDUSTRY_FLOW_PLAYBACK_SPEED,
         sampling_windows=INDUSTRY_FLOW_SAMPLING_WINDOWS,
     )
-
-
-def is_allowed_x_media_url(url: str) -> bool:
-    try:
-        parsed = urlparse(url)
-    except Exception:
-        return False
-    if parsed.scheme != "https" or parsed.netloc.lower() != "pbs.twimg.com":
-        return False
-    return bool(re.match(r"^/(?:media|ext_tw_video_thumb|tweet_video_thumb)/", parsed.path))
-
-
-def fetch_x_media(url: str) -> tuple[bytes, str]:
-    if not is_allowed_x_media_url(url):
-        raise ValueError("unsupported_media_url")
-    now = time.time()
-    with X_MEDIA_CACHE_LOCK:
-        cached = X_MEDIA_CACHE.get(url)
-        if cached and now - float(cached.get("ts") or 0) < X_MEDIA_CACHE_TTL_SECONDS:
-            return cached["body"], cached["content_type"]
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/126 Safari/537.36",
-            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-            "Referer": "https://x.com/",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        content_type = (resp.headers.get("Content-Type") or "application/octet-stream").split(";", 1)[0].strip().lower()
-        if content_type not in X_MEDIA_ALLOWED_CONTENT_TYPES:
-            raise ValueError("upstream_not_image")
-        body = resp.read(X_MEDIA_MAX_BYTES + 1)
-    if len(body) > X_MEDIA_MAX_BYTES:
-        raise ValueError("media_too_large")
-    with X_MEDIA_CACHE_LOCK:
-        X_MEDIA_CACHE[url] = {"ts": time.time(), "body": body, "content_type": content_type}
-        if len(X_MEDIA_CACHE) > X_MEDIA_CACHE_MAX_ENTRIES:
-            oldest = sorted(X_MEDIA_CACHE.items(), key=lambda item: float(item[1].get("ts") or 0))
-            for old_key, _ in oldest[:max(1, len(X_MEDIA_CACHE) - X_MEDIA_CACHE_MAX_ENTRIES)]:
-                X_MEDIA_CACHE.pop(old_key, None)
-    return body, content_type
-
-
-def sanitize_symbols(raw_symbols: str) -> list[str]:
-    raw_symbols = (raw_symbols or "")[:800]
-    symbols = []
-    for item in raw_symbols.split(","):
-        symbol = item.strip().upper()
-        if symbol and re.fullmatch(r"[A-Z0-9.-]{1,12}", symbol):
-            symbols.append(symbol)
-        if len(symbols) >= 80:
-            break
-    return symbols
 
 
 def is_truthy_header(value: str | None) -> bool:
@@ -5335,12 +6627,6 @@ if "DASHBOARD_ADMIN_PASSWORD" not in os.environ:
     ).strip()
 
 
-def us_features_enabled(env_values: dict[str, str] | None = None) -> bool:
-    values = env_values if env_values is not None else parse_env_file()
-    raw = values.get("DASHBOARD_US_FEATURES_ENABLED") or os.environ.get("DASHBOARD_US_FEATURES_ENABLED") or "0"
-    return str(raw).strip().lower() in TRUTHY_VALUES
-
-
 def auto_version_check_enabled(env_values: dict[str, str] | None = None) -> bool:
     values = env_values if env_values is not None else parse_env_file()
     raw = (
@@ -5349,6 +6635,76 @@ def auto_version_check_enabled(env_values: dict[str, str] | None = None) -> bool
         else values.get("DASHBOARD_AUTO_VERSION_CHECK_ENABLED", "1")
     )
     return str(raw).strip().lower() in TRUTHY_VALUES
+
+
+def newsnow_config(env_values: dict[str, str] | None = None) -> NewsNowConfig:
+    """Resolve the deployment-managed endpoint before explicit process overrides."""
+
+    values = dict(env_values if env_values is not None else parse_env_file())
+    bundled_endpoint = str(os.environ.get("NIUONE_BUNDLED_NEWSNOW_URL") or "").strip()
+    if bundled_endpoint:
+        values["NEWSNOW_BASE_URL"] = bundled_endpoint
+    for name in NEWSNOW_CONFIG_NAMES:
+        if name in os.environ:
+            if name == "NEWSNOW_BASE_URL" and bundled_endpoint and not str(os.environ[name]).strip():
+                continue
+            values[name] = os.environ[name]
+    return NewsNowConfig.from_env(values)
+
+
+def newsnow_overview_important_only(env_values: dict[str, str] | None = None) -> bool:
+    """Return whether the compact overview feed should exclude ordinary items."""
+
+    values = env_values if env_values is not None else parse_env_file()
+    raw = (
+        os.environ.get("NEWSNOW_OVERVIEW_IMPORTANT_ONLY")
+        if "NEWSNOW_OVERVIEW_IMPORTANT_ONLY" in os.environ
+        else values.get("NEWSNOW_OVERVIEW_IMPORTANT_ONLY", "1")
+    )
+    return str(raw).strip().lower() in TRUTHY_VALUES
+
+
+def realtime_news_service() -> NewsNowService:
+    """Return the process-local service guarding the persistent news cache."""
+
+    global NEWSNOW_SERVICE
+    if NEWSNOW_SERVICE is not None:
+        return NEWSNOW_SERVICE
+    with NEWSNOW_SERVICE_LOCK:
+        if NEWSNOW_SERVICE is None:
+            NEWSNOW_SERVICE = shared_newsnow_service(NEWSNOW_CACHE_FILE)
+        return NEWSNOW_SERVICE
+
+
+def produce_realtime_news_data() -> dict[str, Any]:
+    """Build the public realtime-news read model without exposing its endpoint."""
+
+    overview_important_only = newsnow_overview_important_only()
+    try:
+        config = newsnow_config()
+    except NewsNowConfigurationError as exc:
+        now = datetime.now(CN_TZ)
+        return {
+            "schema_version": 1,
+            "enabled": True,
+            "available": False,
+            "status": "invalid_configuration",
+            "stale": False,
+            "source": "NewsNow",
+            "generated_at": now.isoformat(timespec="seconds"),
+            "attempted_at_ms": int(now.timestamp() * 1000),
+            "successful_source_count": 0,
+            "source_ids": [],
+            "sources": [],
+            "items": [],
+            "overview_important_only": overview_important_only,
+            "error": exc.code,
+        }
+    payload = realtime_news_service().get_news(config)
+    public_payload = dict(payload)
+    public_payload.pop("config_fingerprint", None)
+    public_payload["overview_important_only"] = overview_important_only
+    return public_payload
 
 
 def admin_visible_env_names(env_values: dict[str, str] | None = None) -> list[str]:
@@ -5397,6 +6753,10 @@ def normalize_env_update(name: str, value: str, kind: str) -> str:
         return f"{speed:g}"
     if kind in {"max_tokens", "context_length"}:
         return normalize_context_length_update(value)
+    if kind == "reasoning_effort":
+        return normalize_reasoning_effort(value)
+    if kind == "stream_mode":
+        return normalize_model_stream_mode(value)
     if kind == "api_mode":
         normalized = value.lower().replace("-", "_") or "auto"
         aliases = {
@@ -5417,8 +6777,8 @@ def normalize_env_update(name: str, value: str, kind: str) -> str:
         return normalized
     if kind == "time_list":
         return normalize_time_list_update(value)
-    if kind == "handle_list":
-        return normalize_handle_list_update(value)
+    if kind == "news_sources":
+        return ",".join(parse_newsnow_source_ids(value))
     if kind == "stock_universe":
         return normalize_stock_universe(value)
     if kind in {"strategy_multi", "strategy_single"}:
@@ -5471,7 +6831,13 @@ def _write_env_file_values_unlocked(
         kind = "secret" if schema.get("kind") == "secret" or is_secret_config_key(name) else schema.get("kind", "text")
         if kind == "secret" and not str(value or "").strip():
             continue
-        if value == "" and name not in existing and kind not in {"time_list", "stock_universe", "strategy_multi", "strategy_single"}:
+        if value == "" and name not in existing and kind not in {
+            "time_list",
+            "news_sources",
+            "stock_universe",
+            "strategy_multi",
+            "strategy_single",
+        }:
             continue
         next_value = normalize_env_update(name, value, kind)
         if existing.get(name) != next_value:
@@ -5629,7 +6995,6 @@ CRON_CONFIG_NAMES = {
     "DASHBOARD_NIUONE_FORWARD_PREFLIGHT_CRON",
     "DASHBOARD_NIUONE_EQUITY_SNAPSHOT_CRON",
     "DASHBOARD_NIUONE_FORWARD_CRON",
-    "DASHBOARD_US_RATING_CRON",
 }
 CRON_TIME_CONFIGS = {
     "IWENCAI_DRAGON_TIGER_CRON": {"day_label": "A股交易日"},
@@ -5640,18 +7005,17 @@ CRON_TIME_CONFIGS = {
     "DASHBOARD_NIUONE_FORWARD_PREFLIGHT_CRON": {"day_label": "A股交易日"},
     "DASHBOARD_NIUONE_EQUITY_SNAPSHOT_CRON": {"day_label": "A股交易日"},
     "DASHBOARD_NIUONE_FORWARD_CRON": {"day_label": "A股交易日"},
-    "DASHBOARD_US_RATING_CRON": {"day_label": "每天"},
 }
 ADMIN_GROUP_NOTES = {
-    "牛牛美股": "集中管理 X/推文监控、美股买入评级和隔夜美股盘面总结使用的 Grok 配置。长度默认：上下文 128000 tokens，最大输出 4096 tokens；关闭时隐藏 X/评级相关设置，隔夜美股总结仍会读取已配置的 Grok 参数。",
-    "消息面预检模型": "用于 A 股候选股及龙虎榜连板/连榜股票最近 3 天消息面预检，并把雪球/X公开内容单列为市场舆情；auto 会为 Grok 4.5 和 GPT-5 系列搜索模型选择 Responses API，Grok Responses 还会使用 x_search。也可显式选择 responses 或 chat。长度默认：上下文 128000 tokens，最大输出 4096 tokens。模型和密钥留空则跳过。",
-    "买卖决策模型": "推荐使用 deepseek-v4-pro；也可填写其他兼容 /chat/completions 的模型服务。长度默认：上下文 128000 tokens，最大输出 4096 tokens。",
+    "财经快讯": "通过 NewsNow 聚合财联社电报、金十数据和华尔街见闻快讯。可选择是否将重要快讯写入买卖决策证据；交易日 15:00 后及休市日信息归入下一交易日。无需 API Key 或服务地址配置；Compose 部署会随牛牛1号自动启动内置实例，来源抓取失败时继续展示最近一次成功缓存并标记陈旧。",
+    "问财数据源": "统一管理龙虎榜与可选消息面预检。问财官方公告、新闻和事件技能负责检索；最近 3 天证据经身份校验和去重后，由“买卖决策模型”判断利好、利空或中性。无有效证据直接记为中性；模型失败时标记判断不可用，不回退关键词规则。",
+    "模型配置": "买卖决策、文字策略 AI 细化、问财消息判断、A 股盘面总结和隔夜美股总结共用这一套 OpenAI 兼容模型。推荐使用 deepseek-v4-pro；已知 Qwen Responses 型号会在 auto 逻辑下自动选择 Responses API。长度默认：上下文 128000 tokens，最大输出 4096 tokens。",
     "交易规则与风控": "约束买卖决策必须遵守的交易纪律、持仓数量、仓位比例、现金缓冲与盘面控仓规则。交易纪律 Prompt 会直接写入决策模型的必须遵守段。",
     "交易通知": "模拟买入或卖出成交落盘后推送。从下拉框按需添加渠道并分块配置；每个渠道可独立启用或关闭，关闭会保留配置，移除并保存后才会清除配置。Webhook、Bot Token 和签名密钥只保存、不回显。",
     "选股与买卖设置": "配置选股范围、候选数量和北京时间交易时点；板块分类固定使用东方财富概念与行业。",
     "综合决策参考": "为买卖决策汇总指数、板块、资金流向、热门股票等参考数据。缓存秒数控制数据复用周期，单类参考数据上限可设置为 1～8。",
     "选股与交易策略": "选择一套独立策略；基础策略、Z哥、李大霄、板块潮汐、牛牛战法和预设文字策略的候选、买入、卖出、仓位与 Prompt 规则互不混用。",
-    "盘面监控生产时间点": "直接填写北京时间 HH:MM；隔夜美股总结默认交易日 08:00 生成，A 股盘面监控在交易时段触发；长度默认：上下文 128000 tokens，最大输出 4096 tokens。",
+    "盘面监控生产时间点": "直接填写北京时间 HH:MM；隔夜美股总结默认交易日 08:00 生成，并与 A 股竞价、午盘、盘后总结共用“模型配置”栏目中的模型、地址和密钥。",
     "行情与资金流设置": "统一管理公开快照、指数刷新和行业资金流动画。播放速度、每侧行业数量、采样间隔及上午/下午采样窗口均支持运行时保存后生效；时间使用北京时间 HH:MM，默认 09:25～11:31、13:00～15:01。",
     "关于": "查看项目作者、源代码仓库、开源许可和版本信息，并控制首页是否在打开或重新加载时自动检测新版本。",
 }
@@ -5669,16 +7033,16 @@ ADMIN_SETTING_GROUPS: tuple[dict[str, str], ...] = (
         "icon": "通知",
     },
     {
-        "slug": "news-precheck",
-        "name": "消息面预检模型",
-        "summary": "配置候选股消息面预检使用的模型、网关与并发参数。",
-        "icon": "预检",
+        "slug": "realtime-news",
+        "name": "财经快讯",
+        "summary": "配置财联社/金十来源、超时、重试与刷新频率；新闻服务自动管理。",
+        "icon": "新闻",
     },
     {
-        "slug": "decision-model",
-        "name": "买卖决策模型",
-        "summary": "配置交易决策模型、API 接入与输出限制。",
-        "icon": "决策",
+        "slug": "model-config",
+        "name": "模型配置",
+        "summary": "配置买卖决策与盘面总结共用的模型和 API。",
+        "icon": "模型",
     },
     {
         "slug": "trading-risk",
@@ -5709,12 +7073,6 @@ ADMIN_SETTING_GROUPS: tuple[dict[str, str], ...] = (
         "name": "选股与交易策略",
         "summary": "选择内置策略或维护自定义预设文字策略。",
         "icon": "策略",
-    },
-    {
-        "slug": "us-market",
-        "name": "牛牛美股",
-        "summary": "配置美股功能、Grok 接入、推文监控与评级任务。",
-        "icon": "美股",
     },
     {
         "slug": "market-monitoring",
@@ -5804,30 +7162,6 @@ def removed_notification_config_names(channel_ids: set[str] | list[str] | tuple[
     return clear_names
 
 
-US_FEATURE_GATED_GROUPS = {
-    "X 监控",
-}
-US_FEATURE_GATED_NAMES = {
-    "US_RATING_BASE_URL",
-    "US_RATING_API_KEY",
-    "US_RATING_CONTEXT_LENGTH",
-    "US_RATING_MAX_TOKENS",
-    "DASHBOARD_GROK_MODEL",
-    "DASHBOARD_GROK_API_MODE",
-    "DASHBOARD_GROK_CONTEXT_LENGTH",
-    "DASHBOARD_GROK_MAX_TOKENS",
-    "DASHBOARD_GROK_BASE_URL",
-    "DASHBOARD_GROK_API_KEY",
-    "X_WATCHLIST_ACCOUNTS",
-    "X_WATCHLIST_MAX_TOKENS",
-    "X_WATCHLIST_DAEMON_INTERVAL_SECONDS",
-    "X_WATCHLIST_REQUEST_TIMEOUT_SECONDS",
-    "DASHBOARD_US_RATING_CRON",
-    "US_RATING_DEADLINE_SECONDS",
-    "US_RATING_REQUEST_TIMEOUT_SECONDS",
-}
-
-
 def validate_cron_expr(expr: str) -> None:
     expr = str(expr or "").strip()
     if not expr:
@@ -5871,36 +7205,15 @@ def split_hhmm_values(value: str) -> list[str]:
     return values
 
 
-def normalize_x_handle(value: str) -> str:
-    handle = str(value or "").strip().lstrip("@").lower()
-    if not handle:
-        return ""
-    if not re.fullmatch(r"[a-z0-9_]{1,15}", handle):
-        return ""
-    return handle
-
-
-def split_handle_values(value: str) -> list[str]:
-    handles: list[str] = []
-    seen: set[str] = set()
-    for raw in re.split(r"[,，;\s]+", str(value or "")):
-        handle = normalize_x_handle(raw)
-        if not handle or handle in seen:
-            continue
-        seen.add(handle)
-        handles.append(handle)
-    return handles
-
-
-def normalize_handle_list_update(value: str) -> str:
-    handles = split_handle_values(value)
-    if not handles and str(value or "").strip():
-        raise ValueError("推文监控作者请使用 X handle，例如 wallstreet0name")
-    return ",".join(handles)
-
-
-def friendly_handle_list_text(value: str) -> str:
-    return "、".join(split_handle_values(value))
+def friendly_newsnow_sources_text(value: str) -> str:
+    try:
+        source_ids = parse_newsnow_source_ids(value)
+    except ValueError:
+        return str(value or "")
+    return "、".join(
+        str(NEWSNOW_SUPPORTED_SOURCES[source_id]["label"])
+        for source_id in source_ids
+    )
 
 
 def split_strategy_values(value: str) -> list[str]:
@@ -5923,37 +7236,6 @@ def friendly_strategy_suite_text(value: str) -> str:
     normalized = normalize_strategy_suite_update(value)
     labels = {str(item["id"]): str(item["label"]) for item in strategy_suite_options()}
     return labels.get(normalized, normalized)
-
-
-def x_watchlist_state_accounts(path: Path | None = None) -> list[str]:
-    if path is None:
-        path = Path(os.environ.get("DASHBOARD_X_WATCHLIST_STATE") or str(CRON_STATE_DIR / "x_watchlist_latest.json")).expanduser()
-    try:
-        state = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return []
-    if not isinstance(state, dict):
-        return []
-    handles: list[str] = []
-    seen: set[str] = set()
-
-    def add(value: object) -> None:
-        handle = normalize_x_handle(str(value or ""))
-        if handle and handle not in seen:
-            seen.add(handle)
-            handles.append(handle)
-
-    for key in ("latest", "seen_ids"):
-        section = state.get(key)
-        if isinstance(section, dict):
-            for handle in section:
-                add(handle)
-    sent_missing = state.get("sent_missing_context")
-    if isinstance(sent_missing, list):
-        for item in sent_missing:
-            if isinstance(item, dict):
-                add(item.get("handle"))
-    return handles
 
 
 def normalize_time_list_update(value: str) -> str:
@@ -5998,14 +7280,17 @@ def normalize_business_updates(updates: dict[str, str]) -> dict[str, str]:
     for name in list(normalized):
         if name in CRON_CONFIG_NAMES:
             normalized[name] = normalize_cron_update(name, normalized[name])
+        elif name == "NEWSNOW_BASE_URL":
+            value = str(normalized[name] or "").strip()
+            normalized[name] = normalize_newsnow_endpoint(value) if value else ""
+        elif name == "NEWSNOW_SOURCES":
+            normalized[name] = ",".join(parse_newsnow_source_ids(normalized[name]))
         elif name == "IWENCAI_BASE_URL":
             normalized[name] = normalize_iwencai_base_url(normalized[name])
         elif ENV_CONFIG_BY_NAME.get(name, {}).get("kind") == "time_list":
             normalized[name] = normalize_time_list_update(normalized[name])
         elif ENV_CONFIG_BY_NAME.get(name, {}).get("kind") == "time":
             normalized[name] = normalize_env_update(name, normalized[name], "time")
-        elif ENV_CONFIG_BY_NAME.get(name, {}).get("kind") == "handle_list":
-            normalized[name] = normalize_handle_list_update(normalized[name])
         elif ENV_CONFIG_BY_NAME.get(name, {}).get("kind") == "stock_universe":
             normalized[name] = normalize_stock_universe(normalized[name])
         elif ENV_CONFIG_BY_NAME.get(name, {}).get("kind") in {"strategy_multi", "strategy_single"}:
@@ -6020,6 +7305,10 @@ def normalize_business_updates(updates: dict[str, str]) -> dict[str, str]:
             normalized[name] = normalize_trade_discipline_text_update(normalized[name])
         elif ENV_CONFIG_BY_NAME.get(name, {}).get("kind") == "api_mode":
             normalized[name] = normalize_env_update(name, normalized[name], "api_mode")
+        elif ENV_CONFIG_BY_NAME.get(name, {}).get("kind") == "stream_mode":
+            normalized[name] = normalize_model_stream_mode(normalized[name])
+        elif ENV_CONFIG_BY_NAME.get(name, {}).get("kind") == "reasoning_effort":
+            normalized[name] = normalize_reasoning_effort(normalized[name])
         elif ENV_CONFIG_BY_NAME.get(name, {}).get("kind") == "playback_speed":
             normalized[name] = normalize_env_update(name, normalized[name], "playback_speed")
         elif ENV_CONFIG_BY_NAME.get(name, {}).get("kind") in {"max_tokens", "context_length"}:
@@ -6051,6 +7340,33 @@ def validate_business_updates(updates: dict[str, str]) -> None:
     for name, value in updates.items():
         if name in CRON_CONFIG_NAMES:
             validate_cron_expr(normalize_cron_update(name, value))
+        elif name == "NEWSNOW_BASE_URL":
+            if str(value or "").strip():
+                normalize_newsnow_endpoint(value)
+        elif name == "NEWSNOW_SOURCES":
+            parse_newsnow_source_ids(value)
+        elif name in {
+            "NEWSNOW_MAX_ITEMS",
+            "NEWSNOW_MAX_IMPORTANT_ITEMS",
+            "NEWSNOW_REFRESH_SECONDS",
+            "NEWSNOW_TIMEOUT_SECONDS",
+            "NEWSNOW_MAX_RETRIES",
+            "NEWSNOW_MAX_CONCURRENCY",
+        } and str(value or "").strip():
+            number = int(value)
+            minimum, maximum = {
+                "NEWSNOW_MAX_ITEMS": (NEWSNOW_MAX_ITEMS_MIN, NEWSNOW_MAX_ITEMS_MAX),
+                "NEWSNOW_MAX_IMPORTANT_ITEMS": (
+                    NEWSNOW_MAX_IMPORTANT_ITEMS_MIN,
+                    NEWSNOW_MAX_IMPORTANT_ITEMS_MAX,
+                ),
+                "NEWSNOW_REFRESH_SECONDS": (15, 1800),
+                "NEWSNOW_TIMEOUT_SECONDS": (2, 30),
+                "NEWSNOW_MAX_RETRIES": (0, 2),
+                "NEWSNOW_MAX_CONCURRENCY": (1, 3),
+            }[name]
+            if number < minimum or number > maximum:
+                raise ValueError(f"{name} 必须在 {minimum} 到 {maximum} 之间")
         elif name == "IWENCAI_BASE_URL":
             normalize_iwencai_base_url(value)
         elif name in {
@@ -6115,6 +7431,16 @@ def validate_business_updates(updates: dict[str, str]) -> None:
             }[name]
             if number < minimum or number > maximum:
                 raise ValueError(f"{name} 必须在 {minimum} 到 {maximum} 之间")
+        elif name == PRACTICE_FAST_CYCLE_INTERVAL_ENV and str(value or "").strip():
+            number = int(value)
+            if (
+                number < MIN_PRACTICE_FAST_CYCLE_INTERVAL_SECONDS
+                or number > MAX_PRACTICE_FAST_CYCLE_INTERVAL_SECONDS
+            ):
+                raise ValueError(
+                    f"{name} 必须在 {MIN_PRACTICE_FAST_CYCLE_INTERVAL_SECONDS} 到 "
+                    f"{MAX_PRACTICE_FAST_CYCLE_INTERVAL_SECONDS} 之间"
+                )
         elif (
             name == "DASHBOARD_MARKET_BREADTH_SAMPLE_INTERVAL_SECONDS"
             and str(value or "").strip()
@@ -6122,8 +7448,6 @@ def validate_business_updates(updates: dict[str, str]) -> None:
             number = int(value)
             if number < 30 or number > 600:
                 raise ValueError(f"{name} 必须在 30 到 600 之间")
-        elif name == "X_WATCHLIST_ACCOUNTS":
-            normalize_handle_list_update(value)
         elif name == STOCK_UNIVERSE_ENV:
             normalize_stock_universe(value)
         elif name == STRATEGY_SOURCE_ENV:
@@ -6137,7 +7461,6 @@ def validate_business_updates(updates: dict[str, str]) -> None:
         elif name == TRADE_DISCIPLINE_TEXT_ENV:
             normalize_trade_discipline_text_update(value)
         elif name in {
-            "X_WATCHLIST_DAEMON_INTERVAL_SECONDS",
             "DASHBOARD_INDICES_TTL_SECONDS",
             "DASHBOARD_DECISION_INTELLIGENCE_TTL_SECONDS",
             "DASHBOARD_DECISION_INTELLIGENCE_MAX_ITEMS",
@@ -6145,9 +7468,13 @@ def validate_business_updates(updates: dict[str, str]) -> None:
             "DASHBOARD_MORNING_MAX_OPEN_POSITIONS",
             "DASHBOARD_DISPLAY_CANDIDATE_LIMIT",
             "DASHBOARD_TRADE_CANDIDATE_LIMIT",
+            "DASHBOARD_PRESET_STRATEGY_CANDIDATE_LIMIT",
         } and str(value or "").strip():
-            if int(value) <= 0:
+            number = int(value)
+            if number <= 0:
                 raise ValueError(f"{name} 必须大于 0")
+            if name == "DASHBOARD_PRESET_STRATEGY_CANDIDATE_LIMIT" and not 10 <= number <= 100:
+                raise ValueError("文字策略中性候选数量必须在 10 到 100 之间")
         elif name == "DASHBOARD_INDUSTRY_FLOW_PLAYBACK_SPEED":
             normalize_env_update(name, value, "playback_speed")
         elif name == "DASHBOARD_INDUSTRY_FLOW_SIDE_LIMIT" and str(value or "").strip():
@@ -6165,10 +7492,6 @@ def validate_business_updates(updates: dict[str, str]) -> None:
             timeout = int(value)
             if timeout < 1 or timeout > 30:
                 raise ValueError(f"{name} 必须在 1 到 30 之间")
-        elif name == "X_WATCHLIST_REQUEST_TIMEOUT_SECONDS" and str(value or "").strip():
-            timeout = int(value)
-            if timeout < 8 or timeout > 120:
-                raise ValueError(f"{name} 必须在 8 到 120 之间")
         elif name in {
             "DASHBOARD_MAX_SINGLE_POSITION_PCT",
             "DASHBOARD_MAX_TOTAL_POSITION_PCT",
@@ -6182,17 +7505,66 @@ def validate_business_updates(updates: dict[str, str]) -> None:
         elif name == "DASHBOARD_CRON_RETRY_DELAY_SECONDS" and str(value or "").strip():
             if int(value) < 0:
                 raise ValueError(f"{name} 必须大于等于 0")
-        elif name in {"US_RATING_DEADLINE_SECONDS", "US_RATING_REQUEST_TIMEOUT_SECONDS"} and str(value or "").strip():
-            if int(value) <= 0:
-                raise ValueError(f"{name} 必须大于 0")
         elif ENV_CONFIG_BY_NAME.get(name, {}).get("kind") in {"max_tokens", "context_length"}:
             normalize_context_length_update(value)
+        elif ENV_CONFIG_BY_NAME.get(name, {}).get("kind") == "reasoning_effort":
+            normalize_reasoning_effort(value)
+        elif ENV_CONFIG_BY_NAME.get(name, {}).get("kind") == "stream_mode":
+            normalize_model_stream_mode(value)
+    _validate_reasoning_effort_updates(updates)
     if set(updates) & set(INDUSTRY_FLOW_WINDOW_CONFIG_NAMES):
         _industry_flow_sampling_windows_value(
             updates,
             fallback=INDUSTRY_FLOW_SAMPLING_WINDOWS,
             strict=True,
         )
+    newsnow_limit_names = {"NEWSNOW_MAX_ITEMS", "NEWSNOW_MAX_IMPORTANT_ITEMS"}
+    if set(updates) & newsnow_limit_names:
+        current = parse_env_file()
+        max_items = int(
+            updates.get("NEWSNOW_MAX_ITEMS")
+            or current.get("NEWSNOW_MAX_ITEMS")
+            or DEFAULT_NEWSNOW_MAX_ITEMS
+        )
+        max_important_items = int(
+            updates.get("NEWSNOW_MAX_IMPORTANT_ITEMS")
+            or current.get("NEWSNOW_MAX_IMPORTANT_ITEMS")
+            or DEFAULT_NEWSNOW_MAX_IMPORTANT_ITEMS
+        )
+        if max_important_items > max_items:
+            raise ValueError("NEWSNOW_MAX_IMPORTANT_ITEMS 不能大于 NEWSNOW_MAX_ITEMS")
+
+
+def _validate_reasoning_effort_updates(updates: dict[str, str]) -> None:
+    """Validate known model/effort combinations without restricting aliases."""
+
+    touched_names = set(updates)
+    relevant = [
+        (effort_name, model_names)
+        for effort_name, model_names in REASONING_EFFORT_MODEL_NAMES.items()
+        if touched_names & {effort_name, *model_names}
+    ]
+    if not relevant:
+        return
+
+    saved = parse_env_file()
+
+    def configured_value(name: str) -> str:
+        if name in updates:
+            return str(updates[name] or "").strip()
+        if name in os.environ:
+            return str(os.environ.get(name) or "").strip()
+        if name in saved:
+            return str(saved.get(name) or "").strip()
+        return str(ENV_CONFIG_BY_NAME.get(name, {}).get("default") or "").strip()
+
+    for effort_name, model_names in relevant:
+        effort = configured_value(effort_name)
+        model = next(
+            (value for name in model_names if (value := configured_value(name))),
+            "",
+        )
+        resolve_model_reasoning_effort(model, effort)
 
 
 def sync_business_runtime_settings(
@@ -6201,6 +7573,7 @@ def sync_business_runtime_settings(
     sync_names: list[str] | set[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     global ADMIN_PASSWORD, B1_CANDIDATE_REFRESH_LAST_TS, PRACTICE_SCHEDULE_TIMES
+    global PRACTICE_FAST_CYCLE_ENABLED, PRACTICE_FAST_CYCLE_INTERVAL_SECONDS
     global INDUSTRY_FLOW_PLAYBACK_SPEED, INDUSTRY_FLOW_SAMPLE_INTERVAL_SECONDS, INDUSTRY_FLOW_SIDE_LIMIT
     global INDUSTRY_FLOW_SAMPLING_WINDOWS
     global TRADER_MODULE, TRADER_MODULE_MTIME, TRADER_SELL_SIGNALS_MTIME
@@ -6211,7 +7584,8 @@ def sync_business_runtime_settings(
     runtime_names = set(sync_names) if sync_names is not None else set(changed_names)
     env_values = parse_env_file()
     visible_names = admin_visible_env_names(env_values)
-    for name in visible_names:
+    syncable_names = set(visible_names) | set(LEGACY_SUMMARY_MODEL_ENV_NAMES)
+    for name in syncable_names:
         if name not in runtime_names:
             continue
         if name in env_values:
@@ -6229,6 +7603,22 @@ def sync_business_runtime_settings(
         )
         applied.append("practice_schedule_times")
         start_b1_scheduler()
+    fast_cycle_names = {
+        PRACTICE_FAST_CYCLE_ENABLED_ENV,
+        PRACTICE_FAST_CYCLE_INTERVAL_ENV,
+    }
+    if changed_names & fast_cycle_names:
+        PRACTICE_FAST_CYCLE_ENABLED = str(
+            env_values.get(PRACTICE_FAST_CYCLE_ENABLED_ENV, "0") or "0"
+        ).strip().lower() not in {"0", "false", "no", "off"}
+        PRACTICE_FAST_CYCLE_INTERVAL_SECONDS = _bounded_int_value(
+            env_values.get(PRACTICE_FAST_CYCLE_INTERVAL_ENV),
+            DEFAULT_PRACTICE_FAST_CYCLE_INTERVAL_SECONDS,
+            MIN_PRACTICE_FAST_CYCLE_INTERVAL_SECONDS,
+            MAX_PRACTICE_FAST_CYCLE_INTERVAL_SECONDS,
+        )
+        applied.append("practice_fast_cycle")
+        start_practice_fast_cycle()
 
     if "DASHBOARD_INDICES_TTL_SECONDS" in changed_names:
         try:
@@ -6266,8 +7656,26 @@ def sync_business_runtime_settings(
         invalidate_api_cache("industry_flow")
         applied.append("industry_flow")
 
+    newsnow_names = {
+        "NEWSNOW_ENABLED",
+        "NEWSNOW_DECISION_ENABLED",
+        "NEWSNOW_OVERVIEW_IMPORTANT_ONLY",
+        "NEWSNOW_BASE_URL",
+        "NEWSNOW_SOURCES",
+        "NEWSNOW_MAX_ITEMS",
+        "NEWSNOW_MAX_IMPORTANT_ITEMS",
+        "NEWSNOW_REFRESH_SECONDS",
+        "NEWSNOW_TIMEOUT_SECONDS",
+        "NEWSNOW_MAX_RETRIES",
+        "NEWSNOW_MAX_CONCURRENCY",
+    }
+    if changed_names & newsnow_names:
+        invalidate_api_cache("realtime_news:v1")
+        applied.append("realtime_news")
+
     iwencai_names = {
         "IWENCAI_ENABLED",
+        "IWENCAI_NEWS_PRECHECK_ENABLED",
         "IWENCAI_BASE_URL",
         "IWENCAI_API_KEY",
         "IWENCAI_TIMEOUT_SECONDS",
@@ -6293,6 +7701,7 @@ def sync_business_runtime_settings(
         PRESET_STRATEGY_TEXT_ENV,
         "DASHBOARD_DISPLAY_CANDIDATE_LIMIT",
         "DASHBOARD_TRADE_CANDIDATE_LIMIT",
+        "DASHBOARD_PRESET_STRATEGY_CANDIDATE_LIMIT",
         STOCK_UNIVERSE_ENV,
     }:
         B1_CANDIDATE_REFRESH_LAST_TS = 0.0
@@ -6323,15 +7732,32 @@ def persist_and_sync_business_updates(
 ) -> dict[str, Any]:
     """Persist and hot-apply one validated update set as a single operation."""
 
+    migrated_updates = dict(updates)
     migrated_clear_names = set(clear_names or set())
     if PRACTICE_SCHEDULE_TIMES_ENV in updates:
         migrated_clear_names.add(LEGACY_B1_SCHEDULE_TIMES_ENV)
     with ENV_FILE_WRITE_LOCK:
+        existing = parse_env_file(include_container_overrides=False)
+        if set(migrated_updates) & set(SHARED_MODEL_ENV_NAMES):
+            for name, value in legacy_summary_migration_values(existing).items():
+                if not str(migrated_updates.get(name) or existing.get(name) or "").strip():
+                    migrated_updates[name] = value
+            prospective = dict(existing)
+            prospective.update(
+                (name, value)
+                for name, value in migrated_updates.items()
+                if str(value or "").strip()
+            )
+            if (
+                str(prospective.get(SHARED_MODEL_NAMES["base_url"]) or "").strip()
+                and str(prospective.get(SHARED_MODEL_NAMES["api_key"]) or "").strip()
+            ):
+                migrated_clear_names.update(LEGACY_SUMMARY_MODEL_ENV_NAMES)
         result = _write_env_file_values_unlocked(
-            updates,
+            migrated_updates,
             clear_names=migrated_clear_names,
         )
-        sync_names = set(updates) | migrated_clear_names
+        sync_names = set(migrated_updates) | migrated_clear_names
         result["runtime"] = sync_business_runtime_settings(
             result.get("changed_names") or [],
             sync_names=sync_names,
@@ -6367,7 +7793,6 @@ def model_test_provider_fallbacks() -> dict[str, dict[str, str]]:
     providers = cfg.get("custom_providers", []) if isinstance(cfg, dict) else []
     providers = providers if isinstance(providers, list) else []
     crossdesk: dict[str, str] = {}
-    grok: dict[str, str] = {}
     for raw_provider in providers:
         if not isinstance(raw_provider, dict):
             continue
@@ -6385,25 +7810,11 @@ def model_test_provider_fallbacks() -> dict[str, dict[str, str]]:
         ).lower()
         if not crossdesk and "crossdesk" in identity:
             crossdesk = provider
-        if not grok and (
-            "grok" in str(raw_provider.get("name") or "").lower()
-            or "crossdesk.ccwu.cc" in provider["base_url"].lower()
-        ):
-            grok = provider
-
-    raw_model = cfg.get("model", {}) if isinstance(cfg, dict) else {}
-    model_provider = {
-        "base_url": str(raw_model.get("base_url") or "").strip(),
-        "api_key": str(raw_model.get("api_key") or "").strip(),
-    } if isinstance(raw_model, dict) else {}
-    if not all(model_provider.values()):
-        model_provider = {}
 
     return {
+        "shared-model": crossdesk,
         "decision-model": crossdesk,
-        "grok-model": crossdesk,
-        "us-rating-model": crossdesk or model_provider,
-        "a-share-summary-model": grok or crossdesk or model_provider,
+        "a-share-summary-model": crossdesk,
     }
 
 
@@ -6469,6 +7880,501 @@ def send_model_connection_test(
         MODEL_TEST_SEMAPHORE.release()
 
 
+def prompt_strategy_store() -> PromptStrategyStore:
+    return PromptStrategyStore()
+
+
+def build_prompt_strategy_admin_payload() -> dict[str, Any]:
+    store = prompt_strategy_store()
+    return {
+        "active_version": store.active_version(),
+        "runtime_enabled": active_strategy_suite() == STRATEGY_SOURCE_PRESET_TEXT,
+        "versions": store.list_versions(limit=50),
+        "drafts": store.list_drafts(limit=50),
+        "capabilities": DEFAULT_FEATURE_REGISTRY.capability_catalog(),
+    }
+
+
+def create_prompt_strategy_draft(raw_prompt: str) -> dict[str, Any]:
+    return prompt_strategy_store().create_draft(raw_prompt)
+
+
+def _prompt_refinement_config() -> ResolvedModelTestConfig:
+    settings, fallback = model_test_settings_snapshot("shared-model")
+    config = resolve_model_test_config(
+        "shared-model",
+        settings,
+        provider_fallback=fallback,
+    )
+    missing = []
+    if not config.model:
+        missing.append("模型")
+    if not config.base_url:
+        missing.append("API 地址")
+    if not config.api_key:
+        missing.append("API Key")
+    if missing:
+        raise ValueError("请先配置共享模型的" + "、".join(missing))
+    return config
+
+
+def _prompt_refinement_timeout_seconds() -> int:
+    """Use the decision model's existing timeout instead of a parallel setting."""
+
+    return _bounded_int_value(
+        os.environ.get("DASHBOARD_DECISION_TIMEOUT", "180"),
+        180,
+        10,
+        1800,
+    )
+
+
+class PromptRefinementStreamError(RuntimeError):
+    """Safe, classified upstream failure for one refinement stream attempt."""
+
+    def __init__(self, message: str, *, code: str, retryable: bool) -> None:
+        super().__init__(message)
+        self.code = str(code or "stream_failed")
+        self.retryable = bool(retryable)
+
+
+def _classify_prompt_refinement_stream_error(
+    exc: Exception,
+) -> PromptRefinementStreamError:
+    if isinstance(exc, urllib.error.HTTPError):
+        status = int(exc.code)
+        retryable = status in {408, 409, 425, 429} or 500 <= status <= 599
+        message = (
+            f"文字策略模型服务暂时不可用（HTTP {status}）"
+            if retryable
+            else f"文字策略模型请求被拒绝（HTTP {status}）"
+        )
+        return PromptRefinementStreamError(
+            message,
+            code=f"http_{status}",
+            retryable=retryable,
+        )
+    if isinstance(exc, TimeoutError):
+        return PromptRefinementStreamError(
+            "文字策略模型响应超时",
+            code="timeout",
+            retryable=True,
+        )
+    if isinstance(exc, ValueError):
+        if str(exc) == "模型未返回可用文字策略":
+            return PromptRefinementStreamError(
+                "文字策略模型没有返回可用文本",
+                code="empty_response",
+                retryable=True,
+            )
+        return PromptRefinementStreamError(
+            "文字策略模型流式连接在输出完成前中断",
+            code="stream_interrupted",
+            retryable=True,
+        )
+    if isinstance(exc, (OSError, urllib.error.URLError)):
+        return PromptRefinementStreamError(
+            "文字策略模型连接中断",
+            code="connection_interrupted",
+            retryable=True,
+        )
+    return PromptRefinementStreamError(
+        f"文字策略模型细化失败（{type(exc).__name__}）",
+        code="unexpected_stream_error",
+        retryable=False,
+    )
+
+
+def _stream_prompt_refinement(messages: list[dict[str, str]]) -> Iterator[str]:
+    if not PROMPT_REFINEMENT_SEMAPHORE.acquire(blocking=False):
+        raise RuntimeError("当前有文字策略正在细化，请稍后重试")
+    try:
+        config = _prompt_refinement_config()
+        try:
+            yielded = False
+            # Prompt refinement is an interactive browser flow, so ``auto``
+            # keeps the historical incremental output.  Users can still force
+            # a complete response when their gateway does not support SSE.
+            if config.stream_mode != "non_stream":
+                request = build_model_request(
+                    config.base_url,
+                    config.model,
+                    messages,
+                    max_tokens=7000,
+                    api_mode=config.api_mode,
+                    reasoning_effort=config.reasoning_effort,
+                    stream=True,
+                    extra_payload={"stream": True},
+                )
+                contents: Iterable[str] = stream_model_response(
+                    request,
+                    config.api_key,
+                    timeout=_prompt_refinement_timeout_seconds(),
+                )
+            else:
+                request = build_model_request(
+                    config.base_url,
+                    config.model,
+                    messages,
+                    max_tokens=7000,
+                    api_mode=config.api_mode,
+                    reasoning_effort=config.reasoning_effort,
+                    stream=False,
+                    extra_payload={"stream": False},
+                )
+                parsed = request_model_complete(
+                    request,
+                    config.api_key,
+                    timeout=_prompt_refinement_timeout_seconds(),
+                    stream_mode=config.stream_mode,
+                )
+                contents = (parsed.content,)
+            for content in contents:
+                text = str(content or "")
+                if not text:
+                    continue
+                yielded = True
+                yield text
+            if not yielded:
+                raise ValueError("模型未返回可用文字策略")
+        except Exception as exc:
+            raise _classify_prompt_refinement_stream_error(exc) from exc
+    finally:
+        PROMPT_REFINEMENT_SEMAPHORE.release()
+
+
+def _complete_prompt_refinement(messages: list[dict[str, str]]) -> str:
+    """Collect one complete answer as a fallback for a broken browser stream."""
+
+    if not PROMPT_REFINEMENT_SEMAPHORE.acquire(blocking=False):
+        raise RuntimeError("当前有文字策略正在细化，请稍后重试")
+    try:
+        config = _prompt_refinement_config()
+        try:
+            request = build_model_request(
+                config.base_url,
+                config.model,
+                messages,
+                max_tokens=7000,
+                api_mode=config.api_mode,
+                reasoning_effort=config.reasoning_effort,
+                stream=False,
+                extra_payload={"stream": False},
+            )
+            parsed = request_model_complete(
+                request,
+                config.api_key,
+                timeout=_prompt_refinement_timeout_seconds(),
+                stream_mode=config.stream_mode,
+            )
+            content = str(parsed.content or "").strip()
+            if not content:
+                raise ValueError("模型未返回可用文字策略")
+            return content
+        except Exception as exc:
+            raise _classify_prompt_refinement_stream_error(exc) from exc
+    finally:
+        PROMPT_REFINEMENT_SEMAPHORE.release()
+
+
+def _request_prompt_refinement(messages: list[dict[str, str]]) -> str:
+    last_error: Exception | None = None
+    for attempt in range(PROMPT_REFINEMENT_MAX_ATTEMPTS):
+        try:
+            response = (
+                "".join(_stream_prompt_refinement(messages)).strip()
+                if attempt == 0
+                else _complete_prompt_refinement(messages)
+            )
+            if response:
+                return response
+        except PromptRefinementStreamError as exc:
+            last_error = exc
+            if not exc.retryable or attempt + 1 >= PROMPT_REFINEMENT_MAX_ATTEMPTS:
+                break
+    if last_error is not None:
+        raise RuntimeError(f"{last_error}；已自动重试一次") from last_error
+    raise RuntimeError("文字策略模型没有返回可用文本；已自动重试一次")
+
+
+def _prompt_refinement_identity(*, injected: bool) -> tuple[str, str]:
+    if injected:
+        return "injected-requester", "test"
+    return _prompt_refinement_config().model, "shared-model"
+
+
+def _prompt_refinement_stream_event(event: str, payload: Mapping[str, Any]) -> str:
+    data = json.dumps(dict(payload), ensure_ascii=False, separators=(",", ":"))
+    return f"event: {event}\ndata: {data}\n\n"
+
+
+def _prompt_refinement_public_error(exc: Exception) -> str:
+    if isinstance(exc, PromptRefinementParseError):
+        return str(exc).strip()
+    if isinstance(exc, TimeoutError):
+        return "文字策略模型响应超时，请重试"
+    if isinstance(exc, (ValueError, RuntimeError)) and str(exc).strip():
+        return str(exc).strip()
+    return f"文字策略细化失败（{type(exc).__name__}）"
+
+
+def stream_refine_prompt_strategy_draft(
+    draft_id: str,
+    *,
+    requester=None,
+) -> Iterator[str]:
+    """Stream one model refinement, then compile and persist the complete output."""
+
+    store = prompt_strategy_store()
+    claimed = False
+    try:
+        draft = store.claim_refinement(draft_id)
+        claimed = True
+        messages = build_refinement_messages(str(draft.get("raw_prompt") or ""))
+        yield _prompt_refinement_stream_event(
+            "started",
+            {"draft_id": str(draft.get("draft_id") or draft_id)},
+        )
+        stream_request = requester or _stream_prompt_refinement
+        max_attempts = PROMPT_REFINEMENT_MAX_ATTEMPTS if requester is None else 1
+        result = None
+        last_error: Exception | None = None
+        attempt_messages = messages
+        for attempt in range(max_attempts):
+            if attempt:
+                retry_message = (
+                    "模型上一次遗漏了可执行条件，正在要求模型完整重写一次…"
+                    if isinstance(last_error, PromptRefinementCoverageError)
+                    else "模型上一次输出的结构不符合规则，正在要求模型修正一次…"
+                    if isinstance(last_error, PromptRefinementContractError)
+                    else "模型流式输出未完整结束，正在自动重试一次…"
+                )
+                yield _prompt_refinement_stream_event(
+                    "reset",
+                    {
+                        "attempt": attempt + 1,
+                        "message": retry_message,
+                    },
+                )
+            parts: list[str] = []
+            try:
+                use_complete_fallback = (
+                    requester is None
+                    and attempt > 0
+                    and not isinstance(
+                        last_error,
+                        (
+                            PromptRefinementCoverageError,
+                            PromptRefinementContractError,
+                        ),
+                    )
+                )
+                contents = (
+                    (_complete_prompt_refinement(attempt_messages),)
+                    if use_complete_fallback
+                    else stream_request(attempt_messages)
+                )
+                for content in contents:
+                    text = str(content or "")
+                    if not text:
+                        continue
+                    parts.append(text)
+                    yield _prompt_refinement_stream_event("delta", {"text": text})
+                complete_response = "".join(parts).strip()
+                if not complete_response:
+                    raise PromptRefinementStreamError(
+                        "文字策略模型没有返回可用文本",
+                        code="empty_response",
+                        retryable=True,
+                    )
+                candidate_result = finalize_prompt_refinement(
+                    attempt_messages,
+                    complete_response,
+                )
+                try:
+                    compile_strategy_spec(candidate_result.refined_spec)
+                except ValueError as exc:
+                    if attempt + 1 < max_attempts:
+                        validation_errors = list(
+                            getattr(exc, "errors", ()) or (str(exc),)
+                        )
+                        raise PromptRefinementContractError(
+                            "模型结构化规则未通过本地编译："
+                            + "；".join(validation_errors)[:1200]
+                        ) from exc
+                result = candidate_result
+                break
+            except Exception as exc:
+                last_error = exc
+                retryable = (
+                    isinstance(
+                        exc,
+                        (
+                            PromptRefinementParseError,
+                            PromptRefinementCoverageError,
+                            PromptRefinementContractError,
+                        ),
+                    )
+                    or (
+                        isinstance(exc, PromptRefinementStreamError)
+                        and exc.retryable
+                    )
+                )
+                if (
+                    isinstance(
+                        exc,
+                        (
+                            PromptRefinementCoverageError,
+                            PromptRefinementContractError,
+                        ),
+                    )
+                    and attempt + 1 < max_attempts
+                ):
+                    correction = (
+                        "上一次结果遗漏了 capability_catalog 已支持的明确条件。"
+                        if isinstance(exc, PromptRefinementCoverageError)
+                        else "上一次结果未通过本地结构校验。"
+                    )
+                    attempt_messages = [
+                        *messages,
+                        {
+                            "role": "user",
+                            "content": (
+                                correction
+                                + "请重新输出一个完整 JSON；selection 与 entry 必须保留"
+                                "用户要求的全部今日/昨日 OHLCV 比较，使用 market.value "
+                                "和 offset_bars=0/1，且 position 必须使用 type/value/allow_add 格式。"
+                                "上一次本地校验结果："
+                                + str(exc)[:1200]
+                            ),
+                        },
+                    ]
+                if retryable and attempt + 1 >= max_attempts and max_attempts > 1:
+                    raise RuntimeError(
+                        f"{_prompt_refinement_public_error(exc)}；自动重试后仍失败"
+                    ) from exc
+                if not retryable or attempt + 1 >= max_attempts:
+                    raise
+        if result is None:
+            raise last_error or RuntimeError("文字策略模型细化未完成")
+        model, provider = _prompt_refinement_identity(injected=requester is not None)
+        saved = store.save_refinement(
+            draft_id,
+            result.refined_spec,
+            model=model,
+            provider=provider,
+            refinement_prompt_sha256=result.refinement_prompt_sha256,
+        )
+        claimed = False
+        yield _prompt_refinement_stream_event("complete", {"draft": saved})
+    except Exception as exc:
+        if claimed:
+            store.release_refinement_claim(draft_id)
+            claimed = False
+        yield _prompt_refinement_stream_event(
+            "error",
+            {"error": _prompt_refinement_public_error(exc)},
+        )
+    finally:
+        if claimed:
+            store.release_refinement_claim(draft_id)
+
+
+def refine_prompt_strategy_draft(
+    draft_id: str,
+    *,
+    requester=None,
+) -> dict[str, Any]:
+    store = prompt_strategy_store()
+    draft = store.claim_refinement(draft_id)
+    request_func = requester or _request_prompt_refinement
+    try:
+        result = refine_prompt_once(
+            str(draft.get("raw_prompt") or ""),
+            request_func,
+        )
+        model, provider = _prompt_refinement_identity(injected=requester is not None)
+        return store.save_refinement(
+            draft_id,
+            result.refined_spec,
+            model=model,
+            provider=provider,
+            refinement_prompt_sha256=result.refinement_prompt_sha256,
+        )
+    except Exception:
+        store.release_refinement_claim(draft_id)
+        raise
+
+
+def activate_prompt_strategy_draft(
+    draft_id: str,
+    *,
+    confirmed_plan_sha256: str,
+) -> dict[str, Any]:
+    store = prompt_strategy_store()
+    draft = store.get_draft(draft_id)
+    if draft is None:
+        raise ValueError("文字策略草案不存在")
+    expected = str(draft.get("plan_sha256") or "")
+    if not expected or str(confirmed_plan_sha256 or "") != expected:
+        raise ValueError("确认的文字策略计划指纹与待激活版本不一致")
+    if str(draft.get("status") or "") == "activated":
+        existing = store.get_version(str(draft.get("activated_version_id") or ""))
+        if existing is not None and str(existing.get("status") or "") == "active":
+            return {
+                **existing,
+                "runtime_activation": {
+                    "ok": True,
+                    "changed": False,
+                    "idempotent": True,
+                },
+            }
+        raise ValueError("该文字策略草案已激活且对应版本已退休")
+    previous_suite = active_strategy_suite()
+    prepared = store.prepare_activation(draft_id)
+    version_id = str(prepared.get("version_id") or "")
+    try:
+        runtime = persist_and_sync_business_updates({
+            ACTIVE_STRATEGY_ENV: STRATEGY_SOURCE_PRESET_TEXT,
+        })
+    except Exception as exc:
+        store.fail_activation(version_id)
+        raise RuntimeError(
+            f"文字策略运行配置写入失败：{type(exc).__name__}"
+        ) from exc
+    try:
+        version = store.commit_activation(version_id)
+    except Exception as activation_exc:
+        store.fail_activation(version_id)
+        try:
+            persist_and_sync_business_updates({ACTIVE_STRATEGY_ENV: previous_suite})
+        except Exception as rollback_exc:
+            raise RuntimeError(
+                "文字策略版本提交失败，且运行策略配置回滚失败："
+                f"{type(rollback_exc).__name__}"
+            ) from activation_exc
+        raise RuntimeError(
+            f"文字策略版本提交失败：{type(activation_exc).__name__}"
+        ) from activation_exc
+    return {**version, "runtime_activation": runtime}
+
+
+def prompt_strategy_evaluations(
+    version_id: str,
+    *,
+    code: str = "",
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    version = prompt_strategy_store().get_version(version_id)
+    if version is None:
+        raise ValueError("文字策略版本不存在")
+    return prompt_strategy_store().list_evaluations(
+        version_id,
+        code=code,
+        limit=limit,
+    )
+
+
 def iwencai_test_settings_snapshot(
     overrides: dict[str, str] | None = None,
 ) -> dict[str, str]:
@@ -6510,22 +8416,38 @@ def business_config_fallback_value(
     name: str,
     *,
     crossdesk_provider: dict[str, str] | None = None,
+    shared_model: Any | None = None,
 ) -> tuple[str, str]:
-    if name in {"DASHBOARD_GROK_BASE_URL", "DASHBOARD_DECISION_BASE_URL"}:
+    if name in SHARED_MODEL_ENV_NAMES and shared_model is not None:
+        field = next(
+            (key for key, configured_name in SHARED_MODEL_NAMES.items() if configured_name == name),
+            "",
+        )
+        value = str(getattr(shared_model, field, "") or "")
+        if getattr(shared_model, "source", "") == "legacy_summary":
+            return value, "legacy summary settings"
+        if getattr(shared_model, "source", "") == "provider" and field in {"base_url", "api_key"}:
+            return value, "config.yaml"
+    if name == "DASHBOARD_DECISION_BASE_URL":
         provider = crossdesk_provider if crossdesk_provider is not None else crossdesk_provider_values()
         return provider.get("base_url", ""), "config.yaml" if provider.get("base_url") else "default"
-    if name in {"DASHBOARD_GROK_API_KEY", "DASHBOARD_DECISION_API_KEY"}:
+    if name == "DASHBOARD_DECISION_API_KEY":
         provider = crossdesk_provider if crossdesk_provider is not None else crossdesk_provider_values()
         return provider.get("api_key", ""), "config.yaml" if provider.get("api_key") else "default"
-    if name == "X_WATCHLIST_ACCOUNTS":
-        handles = x_watchlist_state_accounts()
-        return ",".join(handles), "x_watchlist_state" if handles else "default"
     return "", "default"
 
 
 def build_admin_config_payload() -> dict[str, Any]:
     env_values = parse_env_file()
     crossdesk_provider = crossdesk_provider_values()
+    shared_values = dict(env_values)
+    for name in set(SHARED_MODEL_ENV_NAMES) | set(LEGACY_SUMMARY_MODEL_ENV_NAMES):
+        if name in os.environ:
+            shared_values[name] = str(os.environ[name])
+    shared_model = resolve_shared_model_config(
+        shared_values,
+        provider_fallback=crossdesk_provider,
+    )
     visible_names = admin_visible_env_names(env_values)
     names = set(visible_names)
     items = []
@@ -6535,6 +8457,7 @@ def build_admin_config_payload() -> dict[str, Any]:
         fallback_value, fallback_source = business_config_fallback_value(
             name,
             crossdesk_provider=crossdesk_provider,
+            shared_model=shared_model,
         )
         if name == ACTIVE_STRATEGY_ENV and name not in env_values and name not in os.environ:
             fallback_value = active_strategy_suite(
@@ -6574,7 +8497,13 @@ def build_admin_config_payload() -> dict[str, Any]:
                 effective = fallback_value or default_value
             file_value = env_values.get(name)
             if file_value is None:
-                file_value = "" if schema.get("kind") == "secret" else default_value
+                file_value = (
+                    ""
+                    if schema.get("kind") == "secret"
+                    else fallback_value
+                    if fallback_source == "legacy summary settings"
+                    else default_value
+                )
             source = "process env" if name in os.environ else ("dashboard.env" if name in env_values else fallback_source)
         secret = schema.get("kind") == "secret" or is_secret_config_key(name)
         item = {
@@ -6585,6 +8514,10 @@ def build_admin_config_payload() -> dict[str, Any]:
             "file_state": display_secret(env_values.get(name) or fallback_value or default_value) if secret else file_value,
             "source": source,
         }
+        if schema.get("kind") == "reasoning_effort":
+            item["reasoning_model_names"] = list(
+                REASONING_EFFORT_MODEL_NAMES.get(name, ())
+            )
         if name in CRON_TIME_CONFIGS and not secret:
             stored_file_value = str(file_value or "")
             item.update({
@@ -6607,17 +8540,18 @@ def build_admin_config_payload() -> dict[str, Any]:
                 "default": friendly_time_list_text(default_value),
                 "time_values": split_hhmm_values(str(file_value or "")),
             })
-        if schema.get("kind") == "handle_list" and not secret:
-            edit_value = str(file_value or "")
-            if name not in env_values and name not in os.environ and fallback_value:
-                edit_value = fallback_value
+        if schema.get("kind") == "news_sources" and not secret:
+            edit_source = str(file_value or default_value)
+            edit_value = ",".join(parse_newsnow_source_ids(edit_source))
             state_value = env_values.get(name) if name in env_values else (fallback_value or default_value)
             item.update({
-                "effective": friendly_handle_list_text(effective),
-                "file_value": normalize_handle_list_update(edit_value),
-                "file_state": friendly_handle_list_text(state_value),
-                "default": friendly_handle_list_text(default_value),
-                "handle_values": split_handle_values(edit_value),
+                "effective": friendly_newsnow_sources_text(str(effective)),
+                "file_value": edit_value,
+                "file_state": friendly_newsnow_sources_text(str(state_value)),
+                "default": friendly_newsnow_sources_text(default_value),
+                "news_source_values": list(parse_newsnow_source_ids(edit_value)),
+                "news_source_default_values": list(DEFAULT_NEWSNOW_SOURCE_IDS),
+                "news_source_options": newsnow_source_options(),
             })
         if schema.get("kind") == "stock_universe" and not secret:
             edit_source = env_values.get(name) if name in env_values else (fallback_value or default_value)
@@ -6714,10 +8648,9 @@ def build_admin_config_payload() -> dict[str, Any]:
         ],
         "notification_general_names": list(NOTIFICATION_GENERAL_CONFIG_NAMES),
         "model_tests": model_test_metadata(),
+        "reasoning_effort_capabilities": reasoning_effort_capability_catalog(),
         "iwencai_test": iwencai_test_metadata(),
         "ui": {
-            "us_feature_toggle_name": "DASHBOARD_US_FEATURES_ENABLED",
-            "us_feature_gated_names": sorted(US_FEATURE_GATED_NAMES),
             "strategy_suite_name": ACTIVE_STRATEGY_ENV,
             "strategy_preset_name": PRESET_STRATEGY_TEXT_ENV,
             "strategy_preset_value": "preset_text",
@@ -6785,11 +8718,10 @@ def send_notification_test(
 
         notification = Notification(
             event_type="notification.test",
-            title="牛牛1号通知测试",
+            title="通知渠道测试",
             text=(
-                f"{label} 渠道配置验证消息。\n模拟成交，非实盘。\n"
-                f"发送时间：{datetime.now(CN_TZ).strftime('%Y-%m-%d %H:%M:%S')}（北京时间）\n"
-                "这是一条测试通知，不代表真实买卖或成交。"
+                f"{label} 渠道配置验证消息。\n"
+                f"发送时间：{datetime.now(CN_TZ).strftime('%Y-%m-%d %H:%M:%S')}（北京时间）"
             ),
             metadata={"channel": normalized_id, "test": True},
         )
@@ -6933,144 +8865,6 @@ def public_snapshot_publisher() -> Any:
 
         PUBLIC_SNAPSHOT_PUBLISHER = SnapshotPublisher(PUBLIC_DATA_DIR)
     return PUBLIC_SNAPSHOT_PUBLISHER
-
-
-SINA_US_QUOTE_URL = "https://hq.sinajs.cn/list="
-NASDAQ_COMPANY_PROFILE_URL = "https://api.nasdaq.com/api/company/{symbol}/company-profile"
-US_QUOTE_SYMBOL_MAP: dict[str, list[str]] = {}  # populated from config or known list
-US_SECTOR_LABELS = {
-    "Basic Materials": "基础材料",
-    "Communication Services": "通信服务",
-    "Communications": "通信服务",
-    "Consumer Cyclical": "可选消费",
-    "Consumer Defensive": "必需消费",
-    "Consumer Discretionary": "可选消费",
-    "Consumer Staples": "必需消费",
-    "Energy": "能源",
-    "Financial Services": "金融服务",
-    "Financials": "金融",
-    "Healthcare": "医疗保健",
-    "Health Care": "医疗保健",
-    "Industrials": "工业",
-    "Real Estate": "房地产",
-    "Technology": "科技",
-    "Utilities": "公用事业",
-}
-
-
-def localized_us_sector(value: Any) -> str:
-    raw = str(value or "").strip()
-    if not raw:
-        return ""
-    label = US_SECTOR_LABELS.get(raw)
-    return f"{label}（{raw}）" if label else raw
-
-
-def fetch_us_company_profile(symbol: str) -> dict[str, str]:
-    safe_symbol = re.sub(r"[^A-Za-z0-9.\-]", "", str(symbol or "").upper())
-    if not safe_symbol:
-        return {}
-    url = NASDAQ_COMPANY_PROFILE_URL.format(symbol=safe_symbol)
-    try:
-        req = urllib.request.Request(
-            url,
-            headers={
-                "Accept": "application/json",
-                "User-Agent": "Mozilla/5.0",
-                "Origin": "https://www.nasdaq.com",
-                "Referer": f"https://www.nasdaq.com/market-activity/stocks/{safe_symbol.lower()}",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=6) as resp:
-            payload = json.loads(resp.read().decode("utf-8", "ignore"))
-    except Exception:
-        return {}
-    data = payload.get("data") if isinstance(payload, dict) else {}
-    if not isinstance(data, dict):
-        return {}
-
-    def profile_value(key: str) -> str:
-        item = data.get(key)
-        if isinstance(item, dict):
-            return str(item.get("value") or "").strip()
-        return str(item or "").strip()
-
-    sector = localized_us_sector(profile_value("Sector"))
-    industry = profile_value("Industry")
-    profile: dict[str, str] = {}
-    if sector:
-        profile["sector"] = sector
-    if industry:
-        profile["industry"] = industry
-    return profile
-
-
-def fetch_us_company_profiles(symbols: list[str]) -> dict[str, dict[str, str]]:
-    unique_symbols = list(dict.fromkeys(s for s in symbols if s))
-    if not unique_symbols:
-        return {}
-    max_workers = min(6, len(unique_symbols))
-    profiles: dict[str, dict[str, str]] = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        for symbol, profile in zip(unique_symbols, executor.map(fetch_us_company_profile, unique_symbols)):
-            if profile:
-                profiles[symbol] = profile
-    return profiles
-
-
-def fetch_us_profiles(symbols: list[str]) -> dict[str, Any]:
-    """Fetch optional company classification independently from live quotes."""
-    return {
-        "items": fetch_us_company_profiles(symbols),
-        "symbols": symbols,
-        "error": None,
-    }
-
-
-def fetch_us_quotes(symbols: list[str]) -> dict[str, Any]:
-    """Fetch live US prices without waiting for optional company profiles."""
-    result: dict[str, Any] = {"items": {}, "symbols": symbols, "error": None}
-    if not symbols:
-        return result
-    # Map tickers to Sina codes: gb_<ticker.lower()>
-    codes = [f"gb_{s.lower()}" for s in symbols]
-    url = SINA_US_QUOTE_URL + ",".join(codes)
-    try:
-        req = urllib.request.Request(url, headers={"Referer": "https://finance.sina.com.cn"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            raw = resp.read().decode("gbk", "ignore")
-    except Exception as e:
-        result["error"] = f"quote fetch error: {e}"
-        return result
-    # Parse: var hq_str_gb_ticker="name,price,pct,..."  per line
-    for line in raw.split("\n"):
-        line = line.strip()
-        if not line or "=" not in line:
-            continue
-        try:
-            var_part, val_part = line.split("=", 1)
-            val = val_part.strip().strip('"')
-            code = var_part.replace("var hq_str_", "").strip()
-            ticker = code.replace("gb_", "").upper()
-            parts = val.split(",")
-            if len(parts) >= 4:
-                name = parts[0]
-                price = _safe_float(parts[1])
-                pct = _safe_float(parts[2])
-                change = _safe_float(parts[4]) if len(parts) > 4 else None
-                result["items"][ticker] = {
-                    "name": name, "price": price, "pct": pct, "change": change,
-                }
-        except (ValueError, IndexError):
-            continue
-    return result
-
-
-def _safe_float(v: str) -> float | None:
-    try:
-        return float(str(v).strip())
-    except (ValueError, TypeError):
-        return None
 
 
 def main() -> None:

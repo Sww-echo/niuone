@@ -41,7 +41,7 @@ class BacktestReplayCacheTests(unittest.TestCase):
     def _key(self, bar: HistoricalBar):
         return build_replay_cache_key(
             {"sh600519": (bar,)},
-            protocol_version="niuone-backtest-v32",
+            protocol_version="niuone-backtest-v33",
             selector_id="niuone",
             strategy_ids=("niu_leader",),
             signal_start_date="2026-01-05",
@@ -104,7 +104,7 @@ class BacktestReplayCacheTests(unittest.TestCase):
 
         alternate_source_order = build_replay_cache_key(
             {"sh600519": (_bar(),)},
-            protocol_version="niuone-backtest-v32",
+            protocol_version="niuone-backtest-v33",
             selector_id="niuone",
             strategy_ids=("niu_leader",),
             signal_start_date="2026-01-05",
@@ -116,6 +116,23 @@ class BacktestReplayCacheTests(unittest.TestCase):
         )
         self.assertNotEqual(baseline.digest, alternate_source_order.digest)
 
+    def test_key_reuses_preindexed_bar_mapping_without_changing_identity(self):
+        bar = _bar()
+        mapped = build_replay_cache_key(
+            {"sh600519": {bar.date: bar}},
+            protocol_version="niuone-backtest-v33",
+            selector_id="niuone",
+            strategy_ids=("niu_leader",),
+            signal_start_date="2026-01-05",
+            signal_end_date="2026-01-31",
+            sources=("eastmoney", "tencent"),
+            adjustment="qfq",
+            stock_pool=("sh600519",),
+            source_by_symbol={"sh600519": "eastmoney"},
+        )
+
+        self.assertEqual(mapped.digest, self._key(bar).digest)
+
     def test_build_lock_serializes_same_cache_key(self):
         key = self._key(_bar())
         with tempfile.TemporaryDirectory(prefix="niuone-replay-cache-") as tmp:
@@ -126,6 +143,34 @@ class BacktestReplayCacheTests(unittest.TestCase):
                     self.assertFalse(second_acquired)
             with cache.build_lock(key, timeout_seconds=0) as acquired_after_release:
                 self.assertTrue(acquired_after_release)
+
+    def test_usage_and_clear_only_manage_cache_owned_files(self):
+        key = self._key(_bar())
+        tape = SelectionReplayTape(frames={}, diagnostics={})
+        with tempfile.TemporaryDirectory(prefix="niuone-replay-cache-") as tmp:
+            cache = ReplayTapeCache(Path(tmp) / "replay-cache")
+            self.assertTrue(cache.store(key, tape))
+            target = cache.path_for(key)
+            lock = target.with_suffix(target.suffix + ".lock")
+            temporary = target.with_name(
+                f".{target.name}.123.456.tmp"
+            )
+            unknown = target.parent / "keep.txt"
+            lock.write_text("123\n", encoding="utf-8")
+            temporary.write_bytes(b"partial")
+            unknown.write_text("preserve", encoding="utf-8")
+
+            usage = cache.usage()
+            self.assertEqual(usage["entry_count"], 1)
+            self.assertEqual(usage["file_count"], 3)
+            self.assertEqual(usage["temporary_file_count"], 1)
+            self.assertGreater(usage["byte_count"], 0)
+
+            cleared = cache.clear()
+            self.assertEqual(cleared["removed_file_count"], 3)
+            self.assertEqual(cleared["entry_count"], 0)
+            self.assertEqual(cleared["file_count"], 0)
+            self.assertTrue(unknown.exists())
 
 
 if __name__ == "__main__":

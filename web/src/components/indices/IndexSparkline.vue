@@ -26,6 +26,20 @@ function tradeMinuteOfDay(timeText) {
   return minutes <= morningEnd ? minutes - morningStart : 120 + minutes - afternoonStart
 }
 
+function boundedTradeMinuteOfDay(timeText) {
+  const minutes = clockMinuteOfDay(timeText)
+  if (minutes == null) return null
+  const morningStart = 9 * 60 + 30
+  const morningEnd = 11 * 60 + 30
+  const afternoonStart = 13 * 60
+  const afternoonEnd = 15 * 60
+  if (minutes <= morningStart) return 0
+  if (minutes <= morningEnd) return minutes - morningStart
+  if (minutes < afternoonStart) return 120
+  if (minutes <= afternoonEnd) return 120 + minutes - afternoonStart
+  return 240
+}
+
 function sessionElapsed(clockMinute, sessionStartMinute) {
   if (clockMinute == null || sessionStartMinute == null) return null
   let elapsed = clockMinute - sessionStartMinute
@@ -56,7 +70,7 @@ function compressedGlobalProgresses(minuteLine, sessionStartMinute) {
 
 function pointProgress(point, item, fallback, sessionStartMinute) {
   const marketType = String(item.market_type || '')
-  if (marketType === 'a_index') {
+  if (marketType === 'a_index' || marketType === 'a_stock') {
     const explicitMinute = Number(point.minute)
     const minute = Number.isFinite(explicitMinute) ? explicitMinute : tradeMinuteOfDay(point.time)
     if (minute != null) return clamp01(minute / 240)
@@ -81,7 +95,7 @@ const chart = computed(() => {
       .map(point => clockMinuteOfDay(point.time))
       .find(minute => minute != null) ?? null
     const marketType = String(props.item.market_type || '')
-    const compressed = marketType && !['a_index', 'us_index'].includes(marketType)
+    const compressed = marketType && !['a_index', 'a_stock', 'us_index'].includes(marketType)
       ? compressedGlobalProgresses(minuteLine, sessionStartMinute)
       : new Map()
     points = minuteLine.map((point, index) => {
@@ -132,12 +146,33 @@ const chart = computed(() => {
   const zeroY = y(0).toFixed(1)
   const firstX = coordinates[0][0].toFixed(1)
   const lastX = coordinates.at(-1)[0].toFixed(1)
+  const markers = (Array.isArray(props.item.markers) ? props.item.markers : [])
+    .map((marker) => {
+      const minute = boundedTradeMinuteOfDay(marker?.time)
+      if (minute == null) return null
+      const targetX = clamp01(minute / 240) * width
+      const nearest = coordinates.reduce((best, point) => (
+        Math.abs(point[0] - targetX) < Math.abs(best[0] - targetX) ? point : best
+      ))
+      const markerY = nearest[1]
+      const kind = marker?.kind === 'missed' ? 'missed' : 'qualified'
+      return {
+        x: nearest[0].toFixed(1),
+        y: markerY.toFixed(1),
+        y1: Math.max(1, markerY - 7).toFixed(1),
+        y2: Math.min(height - 1, markerY + 7).toFixed(1),
+        kind,
+        label: String(marker?.label || `${marker?.time || ''} 达标`).trim(),
+      }
+    })
+    .filter(Boolean)
   return {
     width,
     height,
     zeroY,
     line,
     area: `${line} L${lastX} ${zeroY} L${firstX} ${zeroY} Z`,
+    markers,
   }
 })
 </script>
@@ -160,5 +195,80 @@ const chart = computed(() => {
     </line>
     <path class="sparkline-area" :d="chart.area" />
     <path class="sparkline-line" :d="chart.line" />
+    <g
+      v-for="marker in chart.markers"
+      :key="`${marker.x}-${marker.label}`"
+      class="sparkline-marker"
+      :class="marker.kind"
+    >
+      <line
+        class="sparkline-marker-stem"
+        :x1="marker.x"
+        :x2="marker.x"
+        :y1="marker.y1"
+        :y2="marker.y2"
+      />
+      <ellipse
+        class="sparkline-marker-halo"
+        :cx="marker.x"
+        :cy="marker.y"
+        rx="4.2"
+        ry="6.2"
+      />
+      <ellipse
+        class="sparkline-marker-dot"
+        :cx="marker.x"
+        :cy="marker.y"
+        rx="1.7"
+        ry="4.2"
+      />
+      <title>{{ marker.label }}</title>
+    </g>
   </svg>
 </template>
+
+<style scoped>
+.sparkline-marker {
+  color: var(--sparkline-qualified-marker-color, var(--accent));
+  pointer-events: auto;
+}
+
+.sparkline-marker-stem {
+  stroke: currentColor;
+  stroke-opacity: .72;
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+}
+
+.sparkline-marker-halo {
+  fill: currentColor;
+  fill-opacity: .18;
+  stroke: none;
+}
+
+.sparkline-marker-dot {
+  fill: var(--sparkline-marker-fill, var(--panel));
+  stroke: var(--sparkline-marker-stroke, currentColor);
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+}
+
+.sparkline-marker.qualified .sparkline-marker-dot {
+  fill: var(--sparkline-qualified-marker-fill, currentColor);
+  stroke: var(--sparkline-qualified-marker-stroke, var(--text));
+}
+
+.sparkline-marker.qualified .sparkline-marker-stem {
+  stroke-opacity: 1;
+  stroke-width: 2;
+}
+
+.sparkline-marker.missed {
+  color: var(--sparkline-missed-marker-color, var(--green));
+}
+
+.sparkline-marker.missed .sparkline-marker-dot {
+  fill: var(--sparkline-missed-marker-fill, var(--panel));
+  stroke: var(--sparkline-missed-marker-stroke, currentColor);
+}
+</style>

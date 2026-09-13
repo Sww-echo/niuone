@@ -185,6 +185,35 @@ class MultiStrategyRuleTests(unittest.TestCase):
         self.assertEqual(rows[-1]["close"], 11.5)
         self.assertIn("ema20", rows[-1])
 
+    def test_prompt_only_preparation_skips_legacy_indicator_enrichment(self):
+        historical = [
+            {
+                "date": f"2026-07-{index + 1:02d}",
+                "open": 10.0,
+                "high": 10.5,
+                "low": 9.5,
+                "close": 10.0,
+                "volume": 1000,
+            }
+            for index in range(30)
+        ]
+        original = screen.enrich_rows
+        calls = []
+        screen.enrich_rows = lambda rows: calls.append(len(rows))
+        try:
+            rows = screen.prepare_strategy_rows(
+                "600001",
+                "sh600001",
+                historical_rows=historical,
+                enrich_legacy_indicators=False,
+            )
+        finally:
+            screen.enrich_rows = original
+
+        self.assertIsNotNone(rows)
+        self.assertEqual(calls, [])
+        self.assertEqual(rows[-1]["symbol_code"], "600001")
+
     def test_prepare_strategy_rows_fills_cache_only_after_network_fallback(self):
         historical = [
             {
@@ -332,6 +361,13 @@ class MultiStrategyRuleTests(unittest.TestCase):
                 screen.PRACTICE_CANDIDATES_CACHE = root / "practice_candidates_latest.json"
                 screen.B1_HISTORY_DIR = root / "b1_history"
                 screen.MULTI_STRATEGY_HISTORY = root / "multi_strategy_history"
+                legacy_archive = (
+                    screen.B1_HISTORY_DIR
+                    / "2026-08-03"
+                    / "2026-08-03_14-50-00.json"
+                )
+                legacy_archive.parent.mkdir(parents=True)
+                legacy_archive.write_text("{}\n", encoding="utf-8")
                 screen.write_outputs(
                     {
                         "generated_at": "2026-08-04 10:00:00",
@@ -346,6 +382,20 @@ class MultiStrategyRuleTests(unittest.TestCase):
                 compact = json.loads(
                     screen.PRACTICE_CANDIDATES_CACHE.read_text(encoding="utf-8")
                 )
+                primary_archive = (
+                    screen.MULTI_STRATEGY_HISTORY
+                    / "2026-08-04"
+                    / "2026-08-04_10-00-00.json"
+                )
+                self.assertTrue(primary_archive.exists())
+                self.assertFalse(legacy_archive.exists())
+                self.assertFalse(
+                    (
+                        screen.B1_HISTORY_DIR
+                        / "2026-08-04"
+                        / "2026-08-04_10-00-00.json"
+                    ).exists()
+                )
             finally:
                 for name, value in originals.items():
                     setattr(screen, name, value)
@@ -353,6 +403,52 @@ class MultiStrategyRuleTests(unittest.TestCase):
         self.assertEqual(compact["items"], [{"code": "600001"}])
         self.assertEqual(compact["trade_items"], [])
         self.assertNotIn("niuone_context", compact)
+
+    def test_scan_history_cleanup_retires_legacy_and_bounds_primary(self):
+        with tempfile.TemporaryDirectory(prefix="niuone-scan-history-") as directory:
+            root = Path(directory)
+            legacy = root / "b1_history"
+            primary = root / "multi_strategy_history"
+
+            def archive(base: Path, date: str, time_value: str) -> Path:
+                path = base / date / f"{date}_{time_value}.json"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}\n", encoding="utf-8")
+                return path
+
+            archive(legacy, "2026-08-03", "10-00-00")
+            archive(legacy, "2026-08-04", "09-25-00")
+            legacy_unknown = legacy / "2026-08-04" / "keep.txt"
+            legacy_unknown.write_text("preserve\n", encoding="utf-8")
+
+            archive(primary, "2026-08-03", "10-00-00")
+            archive(primary, "2026-08-03", "14-50-00")
+            archive(primary, "2026-08-04", "09-25-00")
+            archive(primary, "2026-08-04", "10-00-00")
+            archive(primary, "2026-08-04", "10-30-00")
+            archive(primary, "2026-08-04", "11-00-00")
+            primary_unknown = primary / "2026-08-03" / "manual-note.json"
+            primary_unknown.write_text("{}\n", encoding="utf-8")
+
+            result = screen.cleanup_scan_history(
+                "2026-08-04",
+                legacy_history_dir=legacy,
+                primary_history_dir=primary,
+                retention_dates=1,
+                max_files_per_date=2,
+            )
+
+            self.assertEqual(result["legacy_removed"], 2)
+            self.assertEqual(result["primary_removed"], 4)
+            self.assertTrue(legacy_unknown.exists())
+            self.assertTrue(primary_unknown.exists())
+            self.assertEqual(
+                sorted(path.name for path in (primary / "2026-08-04").glob("*.json")),
+                [
+                    "2026-08-04_10-30-00.json",
+                    "2026-08-04_11-00-00.json",
+                ],
+            )
 
     @staticmethod
     def _tencent_quote_response():
@@ -1198,7 +1294,7 @@ class MultiStrategyRuleTests(unittest.TestCase):
             else:
                 os.environ[screen.ACTIVE_STRATEGY_ENV] = old
 
-    def test_preset_text_suite_uses_only_neutral_base_scorers(self):
+    def test_preset_text_suite_uses_only_independent_prompt_scorer(self):
         old = os.environ.get(screen.ACTIVE_STRATEGY_ENV)
         try:
             os.environ[screen.ACTIVE_STRATEGY_ENV] = "preset_text"
@@ -1206,13 +1302,54 @@ class MultiStrategyRuleTests(unittest.TestCase):
 
             self.assertNotIn("li_daxiao_bottom", active)
             self.assertNotIn("shaofu_b1", active)
-            self.assertIn("trend_pullback", active)
-            self.assertIn("breakout", active)
+            self.assertNotIn("trend_pullback", active)
+            self.assertNotIn("breakout", active)
+            self.assertEqual(set(active), {"preset_text"})
         finally:
             if old is None:
                 os.environ.pop(screen.ACTIVE_STRATEGY_ENV, None)
             else:
                 os.environ[screen.ACTIVE_STRATEGY_ENV] = old
+
+    def test_preset_text_scorer_exposes_neutral_facts_without_base_entry_gates(self):
+        rows = []
+        for index in range(40):
+            close = 10.0 + index * 0.05
+            rows.append({
+                "date": f"2026-06-{index + 1:02d}",
+                "open": close - 0.02,
+                "high": close + 0.12,
+                "low": close - 0.10,
+                "close": close,
+                "volume": 1000 + index * 20,
+            })
+        screen.enrich_rows(rows)
+        rows[-1].update({
+            "quote_amount": 1_500_000_000,
+            "quote_turnover": 3.2,
+            "quote_change_pct": 1.1,
+        })
+
+        scored = screen.STRATEGY_SCORERS["preset_text"](rows)
+
+        self.assertEqual(scored["strategy_id"], "preset_text")
+        self.assertTrue(scored["actionable"])
+        self.assertEqual(scored["hard_blockers"], [])
+        self.assertEqual(scored["entry_threshold"], 0.0)
+        self.assertIsNone(scored["distance_pct"])
+        self.assertIsNotNone(scored["return_20d_pct"])
+        self.assertIsNotNone(scored["distance_ema20_pct"])
+        self.assertIsNotNone(scored["volume_ratio_5d"])
+        selected = screen.select_trade_candidates([
+            {
+                "code": "600000",
+                "name": "测试股",
+                "best_strategy": "preset_text",
+                "best_score": scored["score"],
+                **scored,
+            }
+        ], limit=1)
+        self.assertEqual([item["code"] for item in selected], ["600000"])
 
     def test_active_strategy_suites_are_isolated(self):
         old = os.environ.get(screen.ACTIVE_STRATEGY_ENV)
@@ -1222,7 +1359,7 @@ class MultiStrategyRuleTests(unittest.TestCase):
                 "zettaranc": {"b3_accelerate", "b2_confirm", "shaofu_b1", "super_b1"},
                 "li_daxiao_bottom": {"li_daxiao_bottom"},
                 "niuone": {"niu_emerging", "niu_leader", "niu_pullback", "niu_reversal_probe"},
-                "preset_text": {"breakout", "trend_pullback"},
+                "preset_text": {"preset_text"},
             }
             for suite, scorer_ids in expected.items():
                 os.environ[screen.ACTIVE_STRATEGY_ENV] = suite

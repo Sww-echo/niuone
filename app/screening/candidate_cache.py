@@ -11,7 +11,7 @@ except ModuleNotFoundError:  # Standalone entrypoints add app/ directly to sys.p
     from core.json_cache import write_json_cache
 
 
-PRACTICE_CANDIDATES_CACHE_SCHEMA_VERSION = 1
+PRACTICE_CANDIDATES_CACHE_SCHEMA_VERSION = 2
 
 _CANDIDATE_METADATA_FIELDS = (
     "generated_at",

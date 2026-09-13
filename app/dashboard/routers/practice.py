@@ -58,6 +58,30 @@ def create_practice_router(
     for path in services.PRACTICE_CANDIDATES_API_PATHS:
         router.add_api_route(path, practice_candidates_response, methods=["GET", "HEAD"])
 
+    @router.api_route("/api/today_candidates", methods=["GET", "HEAD"])
+    async def today_candidates(request: Request) -> Response:
+        ttl = services.API_TTLS["today_candidates"]
+        return await cached_response(
+            request,
+            cache_key=services.TODAY_CANDIDATES_CACHE_KEY,
+            ttl=ttl,
+            producer=services.load_today_candidates_cache,
+            edge_ttl=ttl,
+            browser_ttl=10,
+        )
+
+    @router.api_route("/api/today_candidates/intraday", methods=["GET", "HEAD"])
+    async def today_candidate_intraday(request: Request) -> Response:
+        ttl = services.API_TTLS["today_candidate_intraday"]
+        return await cached_response(
+            request,
+            cache_key=services.TODAY_CANDIDATE_INTRADAY_CACHE_KEY,
+            ttl=ttl,
+            producer=services.load_today_candidate_intraday,
+            edge_ttl=ttl,
+            browser_ttl=10,
+        )
+
     @router.api_route("/api/niuone/mainline", methods=["GET", "HEAD"])
     async def niuone_mainline(request: Request) -> Response:
         ttl = services.API_TTLS["niuone_mainline"]
@@ -192,7 +216,11 @@ def create_practice_router(
 
         def refresh() -> dict[str, Any]:
             payload = services.trigger_b1_scan(force=True)
-            services.invalidate_api_cache(services.PRACTICE_CANDIDATES_CACHE_KEY)
+            services.invalidate_api_cache(
+                services.PRACTICE_CANDIDATES_CACHE_KEY,
+                services.TODAY_CANDIDATES_CACHE_KEY,
+                services.TODAY_CANDIDATE_INTRADAY_CACHE_KEY,
+            )
             return payload
 
         payload = await run_in_threadpool(refresh)

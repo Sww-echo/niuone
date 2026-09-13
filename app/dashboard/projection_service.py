@@ -14,6 +14,7 @@ from app.dashboard.public_snapshots import SnapshotPublisher
 class DashboardSources(Protocol):
     def practice(self) -> dict[str, Any]: ...
     def candidates(self) -> dict[str, Any]: ...
+    def today_candidates(self) -> dict[str, Any]: ...
     def benchmarks(self) -> dict[str, Any]: ...
     def messages(self) -> dict[str, Any]: ...
     def market_summary(self) -> dict[str, Any]: ...
@@ -31,6 +32,9 @@ class LegacyDashboardSources:
 
     def candidates(self) -> dict[str, Any]:
         return self.legacy.load_practice_candidates_cache()
+
+    def today_candidates(self) -> dict[str, Any]:
+        return self.legacy.load_today_candidates_cache()
 
     def benchmarks(self) -> dict[str, Any]:
         return self.legacy.get_practice_benchmarks()
@@ -66,9 +70,15 @@ class ProjectionService:
             practice = self.sources.practice()
             failures: set[str] = set()
             niuone_mainline_reader = getattr(self.sources, "niuone_mainline", lambda: {})
+            today_candidates_reader = getattr(self.sources, "today_candidates", lambda: {})
             sections = build_public_sections(
                 practice,
                 candidates=self._read_optional("candidates", self.sources.candidates, failures),
+                today_candidates=self._read_optional(
+                    "today_candidates",
+                    today_candidates_reader,
+                    failures,
+                ),
                 benchmarks=self._read_optional("benchmarks", self.sources.benchmarks, failures),
                 messages=self._read_optional("messages", self.sources.messages, failures),
                 market_summary=self._read_optional("market_summary", self.sources.market_summary, failures),

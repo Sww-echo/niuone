@@ -52,7 +52,7 @@ TURNOVER_ESTIMATE_OUTPUT_KEYS = (
 )
 DEFAULT_HISTORY_LIMIT = 600
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 30
-HISTORY_SCHEMA_VERSION = 4
+HISTORY_SCHEMA_VERSION = 5
 PREVIOUS_TURNOVER_MATCH_TOLERANCE_SECONDS = 90
 SAMPLING_WINDOWS = ((9 * 60 + 30, 11 * 60 + 30), (13 * 60, 15 * 60))
 
@@ -274,6 +274,37 @@ def compact_previous_turnover_history(
     return result
 
 
+def compact_previous_market_breadth_history(
+    payload: dict[str, Any] | None,
+    *,
+    before_date: str = "",
+    max_points: int = DEFAULT_HISTORY_LIMIT,
+) -> dict[str, Any] | None:
+    """Validate one retained prior trading day's complete breadth curve."""
+
+    source = payload if isinstance(payload, dict) else {}
+    day = str(source.get("date") or "").strip()
+    if _sample_time(f"{day} 00:00:00") is None or (before_date and day >= before_date):
+        return None
+    by_time: dict[str, dict[str, Any]] = {}
+    for raw in source.get("samples") or []:
+        sample = compact_market_breadth_sample(
+            raw if isinstance(raw, dict) else None
+        )
+        if (
+            sample is None
+            or sample["generated_at"][:10] != day
+            or not is_market_breadth_session_timestamp(sample["generated_at"])
+        ):
+            continue
+        by_time[sample["generated_at"]] = sample
+    limit = max(2, min(600, int(max_points)))
+    samples = [by_time[key] for key in sorted(by_time)][-limit:]
+    if not samples:
+        return None
+    return {"date": day, "samples": samples}
+
+
 def _archive_actual_turnover_samples(
     samples: list[Any],
     *,
@@ -300,6 +331,34 @@ def _archive_actual_turnover_samples(
     )
 
 
+def _archive_market_breadth_samples(
+    samples: list[Any],
+    *,
+    before_date: str,
+    max_points: int,
+) -> dict[str, Any] | None:
+    by_day: dict[str, list[dict[str, Any]]] = {}
+    for raw in samples:
+        sample = compact_market_breadth_sample(
+            raw if isinstance(raw, dict) else None
+        )
+        if sample is None:
+            continue
+        day = sample["generated_at"][:10]
+        if day < before_date and is_market_breadth_session_timestamp(
+            sample["generated_at"]
+        ):
+            by_day.setdefault(day, []).append(sample)
+    if not by_day:
+        return None
+    day = max(by_day)
+    return compact_previous_market_breadth_history(
+        {"date": day, "samples": by_day[day]},
+        before_date=before_date,
+        max_points=max_points,
+    )
+
+
 def roll_market_breadth_history(
     history: dict[str, Any] | None,
     current_day: str,
@@ -307,7 +366,7 @@ def roll_market_breadth_history(
     max_points: int = DEFAULT_HISTORY_LIMIT,
     interval_seconds: int = DEFAULT_SAMPLE_INTERVAL_SECONDS,
 ) -> dict[str, Any]:
-    """Retain current-day breadth plus one prior actual-turnover curve."""
+    """Retain current breadth plus one complete prior-day curve."""
 
     if _sample_time(f"{current_day} 00:00:00") is None:
         raise ValueError(f"Invalid market-breadth history date: {current_day!r}")
@@ -327,6 +386,29 @@ def roll_market_breadth_history(
     current_samples = [
         current_by_time[key] for key in sorted(current_by_time)
     ][-limit:]
+
+    previous_day_candidates = [
+        compact_previous_market_breadth_history(
+            existing.get("previous_day")
+            if isinstance(existing.get("previous_day"), dict)
+            else None,
+            before_date=current_day,
+            max_points=limit,
+        ),
+        _archive_market_breadth_samples(
+            list(existing.get("samples") or []),
+            before_date=current_day,
+            max_points=limit,
+        ),
+    ]
+    valid_previous_days = [
+        candidate for candidate in previous_day_candidates if candidate
+    ]
+    previous_day = (
+        max(valid_previous_days, key=lambda item: item["date"])
+        if valid_previous_days
+        else None
+    )
 
     previous_candidates = [
         compact_previous_turnover_history(
@@ -350,6 +432,8 @@ def roll_market_breadth_history(
         "interval_seconds": max(30, min(600, int(interval_seconds))),
         "samples": current_samples,
     }
+    if previous_day is not None:
+        result["previous_day"] = previous_day
     if previous is not None:
         result["previous_turnover"] = previous
     return result
@@ -362,7 +446,7 @@ def append_market_breadth_sample(
     max_points: int = DEFAULT_HISTORY_LIMIT,
     interval_seconds: int = DEFAULT_SAMPLE_INTERVAL_SECONDS,
 ) -> dict[str, Any]:
-    """Append one current-day observation and retain one prior turnover curve."""
+    """Append one current observation and retain one prior trading day."""
 
     sample = compact_market_breadth_sample(payload)
     existing = history if isinstance(history, dict) else {}
@@ -634,6 +718,7 @@ __all__ = [
     "append_market_breadth_sample",
     "build_market_breadth_payload",
     "compact_market_breadth_sample",
+    "compact_previous_market_breadth_history",
     "compact_previous_turnover_history",
     "is_market_breadth_session_timestamp",
     "roll_market_breadth_history",

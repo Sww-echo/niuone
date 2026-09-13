@@ -1,6 +1,8 @@
 """Shared notification models, protocols, errors, and configuration constants."""
 from __future__ import annotations
 
+import html
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Protocol
 
@@ -58,6 +60,11 @@ def _truncate_utf8(value: str, max_bytes: int) -> str:
     return suffix.decode("utf-8")
 
 
+def _escape_markdown(value: Any) -> str:
+    text = html.escape(str(value or ""), quote=False)
+    return re.sub(r"([\\`*_\[\]~#])", r"\\\1", text)
+
+
 @dataclass(frozen=True)
 class Notification:
     """Channel-neutral notification content."""
@@ -66,12 +73,37 @@ class Notification:
     title: str
     text: str
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    markdown: str = ""
+    html: str = ""
+    card_sections: tuple[Mapping[str, Any], ...] = ()
 
     def plain_text(self) -> str:
         title = str(self.title or "").strip()
         body = str(self.text or "").strip()
         rendered = "\n".join(part for part in (title, body) if part)
         return _truncate_utf8(rendered, MAX_MESSAGE_BYTES)
+
+    def markdown_text(self, *, include_title: bool = True) -> str:
+        """Return bounded rich content, or blank when plain text is safer."""
+
+        body = str(self.markdown or "").strip()
+        if not body:
+            return ""
+        title = str(self.title or "").strip()
+        parts = ([f"### {_escape_markdown(title)}"] if include_title and title else []) + [body]
+        rendered = "\n\n".join(parts)
+        return rendered if len(rendered.encode("utf-8")) <= MAX_MESSAGE_BYTES else ""
+
+    def html_text(self) -> str:
+        """Return bounded Telegram-safe HTML, or blank to request plain text."""
+
+        body = str(self.html or "").strip()
+        if not body:
+            return ""
+        title = str(self.title or "").strip()
+        parts = ([f"<b>{html.escape(title, quote=False)}</b>"] if title else []) + [body]
+        rendered = "\n\n".join(parts)
+        return rendered if len(rendered.encode("utf-8")) <= MAX_MESSAGE_BYTES else ""
 
 
 @dataclass(frozen=True)

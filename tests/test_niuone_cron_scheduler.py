@@ -27,6 +27,41 @@ def load_scheduler_module():
 
 
 class NiuoneCronSchedulerTests(unittest.TestCase):
+    def test_scheduler_log_rotates_at_a_bounded_size(self):
+        scheduler = load_scheduler_module()
+        original_values = (
+            scheduler.LOG_DIR,
+            scheduler.LOG_PATH,
+            scheduler.LOG_MAX_BYTES,
+            scheduler.LOG_BACKUP_COUNT,
+        )
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix="niuone-scheduler-log-"
+            ) as directory:
+                scheduler.LOG_DIR = Path(directory)
+                scheduler.LOG_PATH = scheduler.LOG_DIR / "scheduler.log"
+                scheduler.LOG_MAX_BYTES = 96
+                scheduler.LOG_BACKUP_COUNT = 2
+                for index in range(12):
+                    scheduler.log(f"bounded scheduler message {index}")
+
+                self.assertTrue(scheduler.LOG_PATH.is_file())
+                self.assertTrue(Path(f"{scheduler.LOG_PATH}.1").is_file())
+                self.assertTrue(Path(f"{scheduler.LOG_PATH}.2").is_file())
+                self.assertFalse(Path(f"{scheduler.LOG_PATH}.3").exists())
+                self.assertLessEqual(
+                    sum(path.stat().st_size for path in scheduler.LOG_DIR.iterdir()),
+                    scheduler.LOG_MAX_BYTES * (scheduler.LOG_BACKUP_COUNT + 1),
+                )
+        finally:
+            (
+                scheduler.LOG_DIR,
+                scheduler.LOG_PATH,
+                scheduler.LOG_MAX_BYTES,
+                scheduler.LOG_BACKUP_COUNT,
+            ) = original_values
+
     def test_scheduler_state_is_atomic_and_corruption_fails_closed(self):
         scheduler = load_scheduler_module()
         original_path = scheduler.STATE_PATH
@@ -128,17 +163,10 @@ class NiuoneCronSchedulerTests(unittest.TestCase):
         self.assertEqual(attempts, 2)
         self.assertEqual(delay, 0)
 
-    def test_us_feature_gate_controls_us_rating_job(self):
+    def test_us_rating_job_is_not_registered(self):
         scheduler = load_scheduler_module()
-        us_job = next(job for job in scheduler.JOBS if job.env_name == "DASHBOARD_US_RATING_CRON")
-        cn_job = next(job for job in scheduler.JOBS if job.env_name == "DASHBOARD_MARKET_AUCTION_CRON")
-
-        self.assertFalse(scheduler.us_features_enabled({}))
-        self.assertFalse(scheduler.job_enabled(us_job, {}))
-        self.assertTrue(scheduler.job_enabled(us_job, {"DASHBOARD_US_FEATURES_ENABLED": "1"}))
-        self.assertTrue(scheduler.job_enabled(us_job, {"DASHBOARD_US_FEATURES_ENABLED": "true"}))
-        self.assertTrue(scheduler.job_enabled(cn_job, {}))
-        self.assertEqual(us_job.command, ("us_rating_report.py", "--store-only"))
+        self.assertNotIn("DASHBOARD_US_RATING_CRON", {job.env_name for job in scheduler.JOBS})
+        self.assertFalse(hasattr(scheduler, "us_features_enabled"))
 
     def test_us_market_summary_runs_at_8_on_weekdays(self):
         scheduler = load_scheduler_module()
@@ -152,12 +180,19 @@ class NiuoneCronSchedulerTests(unittest.TestCase):
     def test_iwencai_dragon_tiger_runs_at_18_on_weekdays_when_enabled(self):
         scheduler = load_scheduler_module()
         job = next(job for job in scheduler.JOBS if job.env_name == "IWENCAI_DRAGON_TIGER_CRON")
-
-        self.assertEqual(job.default_expr, "0 18 * * 1-5")
-        self.assertEqual(job.command, ("iwencai_dragon_tiger_snapshot.py",))
-        self.assertEqual(scheduler.normalize_job_expr(job, "18:00"), "0 18 * * 1-5")
-        self.assertFalse(scheduler.job_enabled(job, {}))
-        self.assertTrue(scheduler.job_enabled(job, {"IWENCAI_ENABLED": "1"}))
+        original_enabled = scheduler.os.environ.get("IWENCAI_ENABLED")
+        try:
+            scheduler.os.environ["IWENCAI_ENABLED"] = "1"
+            self.assertEqual(job.default_expr, "0 18 * * 1-5")
+            self.assertEqual(job.command, ("iwencai_dragon_tiger_snapshot.py",))
+            self.assertEqual(scheduler.normalize_job_expr(job, "18:00"), "0 18 * * 1-5")
+            self.assertFalse(scheduler.job_enabled(job, {}))
+            self.assertTrue(scheduler.job_enabled(job, {"IWENCAI_ENABLED": "1"}))
+        finally:
+            if original_enabled is None:
+                scheduler.os.environ.pop("IWENCAI_ENABLED", None)
+            else:
+                scheduler.os.environ["IWENCAI_ENABLED"] = original_enabled
 
     def test_iwencai_startup_catch_up_runs_only_when_source_is_enabled(self):
         scheduler = load_scheduler_module()

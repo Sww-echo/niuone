@@ -1,6 +1,4 @@
-<img width="1200" alt="NiuOne logo" src="docs/assets/readme/niuone.webp" />
-
-# NiuOne · 牛牛1号
+<img width="1200" alt="NiuOne 牛牛1号" src="docs/assets/readme/niuone.webp" />
 
 [简体中文](README.md) | English
 
@@ -13,7 +11,7 @@
 
 ## Introduction
 
-NiuOne is a local-first market research and simulated trading system. Its main focus is China's A-share market, with additional coverage of overnight U.S. markets, institutional ratings, and selected Twitter/X sources. Market data, news, strategies, and simulated portfolios come together in a single web dashboard, with optional LLM support for research and trading decisions.
+NiuOne is a local-first market research and simulated trading system. Its main focus is China's A-share market, with additional coverage of overnight U.S. markets. Market data, news, strategies, and simulated portfolios come together in a single web dashboard, with optional LLM support for research and trading decisions.
 
 Scheduled jobs collect pre-open auction data, intraday and post-market activity, capital flows, sector performance, and overseas market information. When a model service is enabled, NiuOne can retrieve news, analyze the market, and make simulated buy and sell decisions within user-defined strategy rules. Portfolio state, trade records, and decision rationale remain local, while execution alerts can be sent through Feishu, DingTalk, WeCom, or Telegram.
 
@@ -28,6 +26,16 @@ NiuOne runs on a personal computer or server, and its configuration and research
 ## Product Tour
 
 Click an animation to open the corresponding live page.
+
+### Market Overview
+
+<p align="center">
+  <a href="https://niuone.cn/">
+    <img width="1200" alt="Market-overview interaction: inspect breadth, turnover, indices, theme opportunities, candidates, market flashes, and sector capital flows" src="docs/assets/readme/overview.gif" />
+  </a>
+</p>
+
+<p align="center"><sub>Market regime, breadth, limit-up/down counts, major industry flows, and portfolio exposure form a decision summary linked to the core market and opportunity views.</sub></p>
 
 ### Simulated Trading and Portfolio Review
 
@@ -79,25 +87,15 @@ Click an animation to open the corresponding live page.
 
 <p align="center"><sub>Pre-open, midday, and post-market reports cover the main view, capital flows, leading sectors, risks, and next-session watchlist.</sub></p>
 
-### Twitter/X Monitoring
+### Live Market Flashes
 
 <p align="center">
-  <a href="https://niuone.cn/x-monitor">
-    <img width="1200" alt="Twitter monitoring interaction: expand text and media posts and open the image viewer" src="docs/assets/readme/twitter-monitor.gif" />
+  <a href="https://niuone.cn/realtime-news">
+    <img width="1200" alt="Market-flash interaction: filter important items, switch NewsNow sources, and browse the aggregated feed" src="docs/assets/readme/realtime-news.gif" />
   </a>
 </p>
 
-<p align="center"><sub>Posts, replies, quotes, and media from watched accounts are collected in a chronological feed.</sub></p>
-
-### U.S. Institutional Ratings
-
-<p align="center">
-  <a href="https://niuone.cn/us-ratings">
-    <img width="1200" alt="U.S. institutional-ratings interaction: expand a stock rating and switch historical dates" src="docs/assets/readme/us-ratings.gif" />
-  </a>
-</p>
-
-<p align="center"><sub>Review current and target prices, implied upside, institutional views, catalysts, and risks.</sub></p>
+<p align="center"><sub>Aggregate selectable sources such as CLS, Jin10, and Wallstreetcn, filter by source or importance, and retain a local cached feed when upstream sources fail.</sub></p>
 
 ### Local Configuration Center
 
@@ -107,13 +105,13 @@ Click an animation to open the corresponding live page.
 
 <p align="center"><sub>Manage data sources, models, strategies, notifications, and runtime options from the local settings page.</sub></p>
 
-> Market and simulated-portfolio values in these animations are for interface demonstration only and are not investment advice.
+> Every animation shows real page interactions in the light theme. Market, news, and simulated-portfolio values are for interface demonstration only and are not investment advice.
 
 ## Feature Overview
 
-- **Market dashboard**: View theme strength, indices, sectors, market breadth, industry capital flows, Dragon-Tiger data, and historical news in one place.
+- **Market dashboard**: View theme strength, indices, sectors, market breadth, industry capital flows, important market flashes, Dragon-Tiger data, and historical news in one place.
 - **Theme and strategy research**: Compare today's theme strength with cross-session structural rankings, using full-market quotes, theme attribution, and Eastmoney rankings as context. NiuOne includes Base, Z-ge, Li Daxiao, Sector Tide, and NiuOne strategies, and also accepts natural-language rules for candidates, entries, exits, position sizing, and timing.
-- **Information and model-assisted analysis**: Collect A-share auction, midday, and close reports alongside overnight U.S. markets, institutional ratings, Twitter/X watchlists, and iWencai Dragon-Tiger data. Compatible model services can support retrieval, summarization, and structured analysis.
+- **Information and model-assisted analysis**: Aggregate live CLS and Jin10 flashes through NewsNow, alongside A-share auction, midday, and close reports, overnight U.S. markets, and iWencai Dragon-Tiger data. Compatible model services can support retrieval, summarization, and structured analysis.
 - **Simulated trading**: Track candidates, decisions, positions, P&L, equity curves, and trade logs without connecting to a brokerage or using real funds.
 - **Automation and notifications**: Schedule data collection, report generation, database ingestion, and monitoring. Simulated execution alerts can be sent to Feishu, DingTalk, WeCom, and Telegram.
 - **Local data management**: Configuration, databases, logs, and task output stay in a separate runtime directory. The settings page supports connection tests and update checks, but never installs updates automatically.
@@ -125,9 +123,9 @@ Primary pages and dependencies:
 | `/practice` | Simulated account, candidates, market summary, model decisions, equity curve, and trading calendar | Model decisions require `DASHBOARD_DECISION_*` |
 | `/niuone-mainline` | Full-market today/structural theme rankings, cross-session mainlines, effective coverage, representative stocks, and an Eastmoney live cross-check | No key; market sources must be reachable |
 | `/indices`, `/industry-flow` | Indices, sectors, active stocks, industry main-fund flow, market sentiment, and turnover | No key; market sources must be reachable |
-| `/dragon-tiger` | Dated Dragon-Tiger seats, limit-up/consecutive-list signals, and news prechecks | Enable and configure iWencai; news-precheck model is optional |
+| `/dragon-tiger` | Dated Dragon-Tiger seats, limit-up/consecutive-list signals, and news prechecks | Enable iWencai retrieval and configure the trading-decision model for judgment |
 | `/market-monitor` | A-share auction/midday/close and overnight U.S. summaries | Keep the scheduler running; model enhancement is optional |
-| `/x-monitor`, `/us-ratings` | Twitter/X watchlists and U.S. institutional ratings | Enable “NiuNiu U.S. Stocks” and configure the relevant model |
+| `/realtime-news` | NewsNow aggregation for selectable financial-news sources; Overview shows five items with an important-only option | No API key; Compose bundles NewsNow and the admin page exposes finance and business sources as searchable multi-select options |
 | `/admin` | Configuration, connection tests, version, and runtime status | Administrator authentication is always required |
 
 See the [Strategy Research Guide](docs/strategies/README_EN.md) for methodology and the [app module architecture](docs/APP_ARCHITECTURE.md) for code structure and extension points.
@@ -153,6 +151,16 @@ Clone the project:
 git clone https://github.com/kunkundi/niuone.git
 cd niuone
 ```
+
+Choose and retain one deployment method and data location for every instance whose history must persist:
+
+| Use case | Recommended method | Runtime data location |
+|---|---|---|
+| Long-running service, server, or consistent dependencies | Docker Compose | Named volume `niuone-data` |
+| Direct use on one computer without containers | Native launcher | `.local-data/`, or the directory set by `NIUONE_LOCAL_DATA_DIR` |
+| Development, debugging, and acceptance testing | Isolated instance | Separate Compose project and port, or a temporary directory such as `/tmp/niuone-*` |
+
+Docker and native deployments do not synchronize their data automatically. Do not alternate between them for the same production instance, or the page may expose a different and older account, configuration, and trading calendar. Developers may run isolated instances in parallel when each one has a distinct port and data location.
 
 macOS / Linux:
 
@@ -219,7 +227,7 @@ NIUONE_LOCAL_DATA_DIR=/path/to/private-data ./run.sh
 
 ## Container Deployment
 
-The project provides a single image and a Compose setup. Compose starts the dashboard, scheduled-task runner, and X followed-source daemon, and persists configuration, databases, logs, and task output in the shared `niuone-data` volume.
+The project provides one NiuOne image and a Compose setup. Compose starts the dashboard, scheduled-task runner, X followed-source daemon, and an official NewsNow instance. NiuOne configuration, databases, logs, and task output use the `niuone-data` volume, while NewsNow keeps its own data in `newsnow-data`.
 
 Build and start from source:
 
@@ -228,17 +236,62 @@ docker compose up -d --build
 docker compose ps
 ```
 
-By default, the service is available at `127.0.0.1:8787`; the public page and password-protected `/admin` page share that port. To view logs or stop the service:
+### Routine Docker Startup and Restart
+
+After restarting the computer or container engine, first ensure Docker Engine is running, then restore the services from the original deployment directory:
+
+```bash
+docker compose up -d
+```
+
+When only the existing containers need a restart, restart every service or just the NiuOne Dashboard and scheduler:
+
+```bash
+docker compose restart
+docker compose restart dashboard scheduler
+```
+
+`docker compose restart` does not apply changes to Compose configuration, environment variables, ports, or images. Use `docker compose up -d` after those configuration changes, and rebuild after source changes. A Docker Hub deployment should pull its pinned image before recreating containers:
+
+```bash
+# Source build
+docker compose up -d --build
+
+# Docker Hub image
+docker compose pull
+docker compose up -d --no-build
+```
+
+Check every startup or restart:
+
+```bash
+docker compose ps
+docker compose port dashboard 8787
+curl -s -o /dev/null -w 'healthz=%{http_code}\n' http://127.0.0.1:8787/healthz
+curl -s -o /dev/null -w 'readyz=%{http_code}\n' http://127.0.0.1:8787/readyz
+```
+
+The `dashboard` service should be `healthy`, and `healthz` should return `200`. During first-time initialization, `readyz` may temporarily return `503` and should change to `200` once required data is ready. See the [Standalone Operation Guide](docs/STANDALONE_EN.md#docker-startup-restart-and-data-volumes) for cross-platform port checks and troubleshooting.
+
+Compose already sets `restart: unless-stopped`, but the container engine itself must be running. Docker Desktop users may enable launch at sign-in, while Linux administrators should ensure that the Docker service starts at boot.
+
+The Compose project name contributes to the physical volume name and may come from the working-directory name, `-p`, or `COMPOSE_PROJECT_NAME`. Keep the project name and original deployment directory stable after the first deployment. Changing either may create a new empty volume and make existing history appear to be missing. Use `docker compose ls` and `docker compose ps` to confirm the active project.
+
+Never use `docker compose down -v` or `docker volume rm` for routine restarts, upgrades, or troubleshooting. `niuone-data` is the logical Compose volume name; its physical name usually has a project prefix. Deleting it removes the simulated account, configuration, and history. Ordinary `docker compose down`, `restart`, and `up -d` operations preserve named volumes.
+
+By default, the service is available at `127.0.0.1:8787`; the public page and password-protected `/admin` page share that port. NewsNow listens only at `newsnow:4444` on the Compose network and publishes no additional host port; the Dashboard selects it automatically. To view logs or stop the service:
 
 ```bash
 docker compose logs -f
 docker compose down
 ```
 
+`docker compose down` stops NewsNow together with NiuOne and preserves both volumes. Users do not start NewsNow, enter a service URL, or maintain extra configuration; the next NiuOne startup restores it automatically. Operators may optionally set `NEWSNOW_IMAGE` to pin the upstream version.
+
 Deploy a specific version from Docker Hub:
 
 ```bash
-export NIUONE_IMAGE=kunkundi/niuone:v0.0.7
+export NIUONE_IMAGE=kunkundi/niuone:v0.0.12
 docker compose pull
 docker compose up -d --no-build
 ```
@@ -255,7 +308,7 @@ NIUONE_BIND_ADDRESS=0.0.0.0 NIUONE_PORT=8877 docker compose up -d
 
 The basic pages can start without a model key. Information retrieval, intelligent summaries, and some automated workflows require additional external services.
 
-After startup, use the settings entry in the page to configure NiuOne. First authenticate with the configured administrator password or the local bootstrap administrator key. Configuration is written to the local `.local-data/` directory, so there is no need to modify the source code. For first-time setup, we recommend completing the following steps in order:
+After startup, use the settings entry in the page to configure NiuOne. First authenticate with the configured administrator password or bootstrap administrator key. Native deployments write configuration to `.local-data/`, while Docker deployments write it to the `niuone-data` volume; the two are not synchronized automatically, and neither requires source changes. For first-time setup, we recommend completing the following steps in order:
 
 1. Select the data sources and automated tasks to enable;
 2. Configure a compatible model service URL, model name, and API key as needed;

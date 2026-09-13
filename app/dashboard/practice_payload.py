@@ -12,6 +12,11 @@ import math
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
+try:
+    from trading.accounting import trade_counts_for_account
+except ModuleNotFoundError:  # package import when only the repository root is on sys.path
+    from app.trading.accounting import trade_counts_for_account
+
 
 TradingDayPredicate = Callable[[datetime], bool]
 TimestampParser = Callable[[str], datetime | None]
@@ -282,11 +287,14 @@ def compact_trade_markers(
     """Keep the compact fill fields needed to annotate equity charts."""
     fields = (
         "time", "action", "code", "name", "shares", "price", "pnl", "pnl_pct",
+        "cumulative_realized_pnl", "realized_return_pct", "realized_return_status",
         "position_after_trade_pct", "position_after_trade_qty",
     )
     source_rows: list[dict[str, Any]] = []
     for item in entries or []:
         if not isinstance(item, dict):
+            continue
+        if not trade_counts_for_account(item):
             continue
         action = str(item.get("action") or "").upper()
         time_text = str(item.get("time") or "")

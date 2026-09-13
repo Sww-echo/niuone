@@ -18,6 +18,10 @@ const strategy = computed(() => props.strategyMeta[strategyName.value] || {
   label: strategyName.value || '综合',
   color: '#94a3b8',
 })
+const compactStrategyLabel = computed(() => {
+  const parts = String(strategy.value.label || '').split(' · ')
+  return parts.at(-1) || strategy.value.label
+})
 const tideStrategy = computed(() => ['tide_leader', 'tide_rotation', 'tide_recovery'].includes(strategyName.value))
 const niuoneStrategy = computed(() => ['niu_leader', 'niu_pullback', 'niu_emerging', 'niu_reversal_probe'].includes(strategyName.value))
 const reversalStrategy = computed(() => strategyName.value === 'niu_reversal_probe')
@@ -113,17 +117,37 @@ function toggleCandidateDetails() {
           <span class="candidate-stock-name">{{ item.code }} {{ item.name }}</span>
           <span
             class="candidate-strategy-badge"
+            :aria-label="strategy.label"
             :style="{
               '--candidate-strategy-bg': `${strategy.color}22`,
               '--candidate-strategy-border': `${strategy.color}44`,
               '--candidate-strategy-text': strategy.color,
             }"
-          >{{ strategy.label }}</span>
+          >
+            <span class="candidate-strategy-label-full" aria-hidden="true">{{ strategy.label }}</span>
+            <span class="candidate-strategy-label-compact" aria-hidden="true">{{ compactStrategyLabel }}</span>
+          </span>
         </div>
       </div>
       <div v-if="industryLabel || signalThemeLabel" class="candidate-industry">
-        <span v-if="signalThemeLabel" class="candidate-industry-badge candidate-theme-badge">题材 · {{ signalThemeLabel }}</span>
-        <span v-if="industryLabel" class="candidate-industry-badge">行业 · {{ industryLabel }}</span>
+        <span
+          v-if="signalThemeLabel"
+          class="candidate-industry-badge candidate-theme-badge"
+          :aria-label="`题材 ${signalThemeLabel}`"
+        >
+          <span class="candidate-context-label-full" aria-hidden="true">题材 · </span>
+          <span class="candidate-context-label-compact" aria-hidden="true">题 · </span>
+          {{ signalThemeLabel }}
+        </span>
+        <span
+          v-if="industryLabel"
+          class="candidate-industry-badge"
+          :aria-label="`行业 ${industryLabel}`"
+        >
+          <span class="candidate-context-label-full" aria-hidden="true">行业 · </span>
+          <span class="candidate-context-label-compact" aria-hidden="true">行 · </span>
+          {{ industryLabel }}
+        </span>
       </div>
       <span class="candidate-tier" :class="tier">{{ tierLabel }}</span>
     </div>
@@ -203,6 +227,14 @@ function toggleCandidateDetails() {
             <div class="niuone-fact">
               <span>龙头梯队</span>
               <strong>#{{ item.stock_leader_rank ?? '--' }} · 强度 {{ formatPracticeNumber(item.stock_strong_score) }}</strong>
+            </div>
+            <div class="niuone-fact">
+              <span>个股资金活跃度</span>
+              <strong>{{ formatPracticeNumber(item.stock_activity_score) }} · {{ item.stock_activity_confirmed ? '已确认' : '未确认' }}</strong>
+            </div>
+            <div class="niuone-fact">
+              <span>成交额分位</span>
+              <strong>全市场 {{ formatPracticeNumber(item.stock_market_amount_percentile) }} · 题材内 {{ formatPracticeNumber(item.stock_theme_amount_percentile) }}</strong>
             </div>
             <div v-if="reversalStrategy" class="niuone-fact">
               <span>日线V型区间</span>
@@ -388,6 +420,11 @@ function toggleCandidateDetails() {
   background: var(--candidate-niuone-bg, var(--candidate-strategy-bg));
   border-color: var(--candidate-niuone-border, var(--candidate-strategy-border));
   color: var(--candidate-niuone-text, var(--candidate-strategy-text));
+}
+
+.candidate-strategy-label-compact,
+.candidate-context-label-compact {
+  display: none;
 }
 
 .candidate-industry {

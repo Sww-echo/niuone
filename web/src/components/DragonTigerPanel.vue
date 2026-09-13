@@ -190,11 +190,12 @@ function rawContinuousNewsSummary(item) {
   const record = item?.news_precheck
   const summary = String(record?.summary || '').trim()
   if (record?.available === true && summary) return summary
-  if (record?.error === 'news_precheck_not_configured') return '消息面预检模型尚未配置，连板/连榜标记不受影响。'
-  if (record?.error === 'news_precheck_incomplete') return '消息面预检模型配置不完整，连板/连榜标记不受影响。'
+  if (record?.error === 'news_precheck_not_configured') return '消息面预检数据源尚未配置，连板/连榜标记不受影响。'
+  if (record?.error === 'news_precheck_incomplete') return '消息面预检数据源配置不完整，连板/连榜标记不受影响。'
+  if (record?.error === 'news_precheck_disabled') return '消息面预检未开启，连板/连榜标记不受影响。'
   if (record?.error === 'pending_news_precheck') return '该股票尚待消息面检索，将在本次龙虎榜拉取流程中处理。'
   if (record?.error === 'daily_query_limit') return '本次达到消息面查询上限，将在后续快照中补充。'
-  if (record?.checked === true) return '消息面预检模型本次未返回可用摘要。'
+  if (record?.checked === true) return '消息面预检数据源本次未返回可用摘要。'
   return '暂无消息面预检摘要。'
 }
 
@@ -279,9 +280,10 @@ function continuousNewsSource(item) {
   const sourceScope = Array.isArray(item?.news_precheck?.source_scope)
     ? item.news_precheck.source_scope
     : []
-  return sourceScope.includes('xueqiu') && sourceScope.includes('x')
-    ? '公开检索：公告/财经媒体 · 雪球 · X · 最近 3 天'
-    : '公开检索：最近 3 天'
+  if (sourceScope.includes('announcement-search') || sourceScope.includes('news-search')) {
+    return '同花顺问财：公告 · 新闻 · 事件 · 最近 3 天'
+  }
+  return '同花顺问财：最近 3 天'
 }
 
 function hideContinuousTooltip() {
@@ -384,6 +386,14 @@ function seatRank(record, side) {
   return recordSide === side || recordSide === 'both'
     ? Math.max(0, Math.trunc(Number(record?.rank) || 0))
     : 0
+}
+
+function reasonRank(index) {
+  return String(Math.max(0, Number(index)) + 1).padStart(2, '0')
+}
+
+function shortCode(value) {
+  return String(value || '--').split('.')[0] || '--'
 }
 
 function seatCategory(record) {
@@ -646,6 +656,7 @@ onBeforeUnmount(() => {
         >
           <summary>
             <span class="dragon-tiger-list-name">
+              <small class="dragon-tiger-list-code">{{ shortCode(item.code) }}</small>
               <span
                 :class="{'dragon-tiger-name-has-limit-up-reason': limitUpReason(item)}"
                 :aria-label="limitUpReason(item) ? `${item.name || '--'}，涨停原因：${limitUpReason(item)}` : undefined"
@@ -672,7 +683,6 @@ onBeforeUnmount(() => {
                 @focus="showContinuousTooltip($event, item)"
                 @blur="hideContinuousTooltip"
               >
-                <span aria-hidden="true">{{ directionalNewsTone(item) === 'positive' ? '✦' : '▼' }}</span>
                 {{ directionalNewsTone(item) === 'positive' ? '利好' : '利空' }}
               </small>
             </span>
@@ -695,54 +705,56 @@ onBeforeUnmount(() => {
               <span><small>上榜明细</small><b>{{ detailsFor(item).length }} 条</b></span>
             </div>
 
-            <section
-              v-if="item.limit_up_reason || item.limit_up_reason_category"
-              class="dragon-tiger-reasons dragon-tiger-limit-up-reason"
-              aria-label="涨停原因"
-            >
-              <div class="dragon-tiger-reasons-head">
-                <b>涨停原因</b>
-                <span
-                  v-if="item.limit_up_reason_category && item.limit_up_reason_category !== item.limit_up_reason"
-                >{{ item.limit_up_reason_category }}</span>
-              </div>
-              <p>{{ item.limit_up_reason || item.limit_up_reason_category }}</p>
-              <small>同花顺问财归纳，仅供研究参考</small>
-            </section>
+            <div class="dragon-tiger-analysis-grid">
+              <section
+                v-if="item.limit_up_reason || item.limit_up_reason_category"
+                class="dragon-tiger-reasons dragon-tiger-limit-up-reason"
+                aria-label="涨停原因"
+              >
+                <div class="dragon-tiger-reasons-head">
+                  <b>涨停原因</b>
+                  <span
+                    v-if="item.limit_up_reason_category && item.limit_up_reason_category !== item.limit_up_reason"
+                  >{{ item.limit_up_reason_category }}</span>
+                </div>
+                <p>{{ item.limit_up_reason || item.limit_up_reason_category }}</p>
+                <small>同花顺问财归纳，仅供研究参考</small>
+              </section>
 
-            <section
-              v-if="newsPrecheckEligible(item)"
-              class="dragon-tiger-reasons dragon-tiger-continuous-news"
-              aria-label="消息面预检"
-            >
-              <div class="dragon-tiger-reasons-head">
-                <b>{{ newsTriggerLabel(item) }} · 消息面预检</b>
-                <span v-if="item.news_precheck?.tone_label">{{ item.news_precheck.tone_label }}</span>
-              </div>
-              <small class="dragon-tiger-continuous-news-label">核心消息</small>
-              <p>{{ continuousNewsSummary(item) }}</p>
-              <template v-if="continuousNewsContent(item).impact">
-                <small class="dragon-tiger-continuous-news-label">直接影响</small>
-                <p>{{ continuousNewsContent(item).impact }}</p>
-              </template>
-              <template v-if="continuousNewsContent(item).sentiment">
-                <small class="dragon-tiger-continuous-news-label">市场舆情</small>
-                <p>{{ continuousNewsContent(item).sentiment }}</p>
-              </template>
-              <small class="dragon-tiger-continuous-news-source">{{ continuousNewsSource(item) }}</small>
-            </section>
+              <section
+                v-if="newsPrecheckEligible(item)"
+                class="dragon-tiger-reasons dragon-tiger-continuous-news"
+                aria-label="消息面预检"
+              >
+                <div class="dragon-tiger-reasons-head">
+                  <b>{{ newsTriggerLabel(item) }} · 消息面预检</b>
+                  <span v-if="item.news_precheck?.tone_label">{{ item.news_precheck.tone_label }}</span>
+                </div>
+                <small class="dragon-tiger-continuous-news-label">核心消息</small>
+                <p>{{ continuousNewsSummary(item) }}</p>
+                <template v-if="continuousNewsContent(item).impact">
+                  <small class="dragon-tiger-continuous-news-label">直接影响</small>
+                  <p>{{ continuousNewsContent(item).impact }}</p>
+                </template>
+                <template v-if="continuousNewsContent(item).sentiment">
+                  <small class="dragon-tiger-continuous-news-label">市场舆情</small>
+                  <p>{{ continuousNewsContent(item).sentiment }}</p>
+                </template>
+                <small class="dragon-tiger-continuous-news-source">{{ continuousNewsSource(item) }}</small>
+              </section>
 
-            <section class="dragon-tiger-reasons" aria-label="上榜理由">
-              <div class="dragon-tiger-reasons-head">
-                <b>上榜理由</b><span>{{ reasonsFor(item).length ? `${reasonsFor(item).length} 条` : '暂无' }}</span>
-              </div>
-              <ol v-if="reasonsFor(item).length" class="dragon-tiger-reason-list">
-                <li v-for="(reason, index) in reasonsFor(item)" :key="reason">
-                  <b>{{ index + 1 }}</b><span>{{ reason }}</span>
-                </li>
-              </ol>
-              <div v-else class="dragon-tiger-reason-empty">暂无上榜理由</div>
-            </section>
+              <section class="dragon-tiger-reasons" aria-label="上榜理由">
+                <div class="dragon-tiger-reasons-head">
+                  <b>上榜理由</b><span>{{ reasonsFor(item).length ? `${reasonsFor(item).length} 条` : '暂无' }}</span>
+                </div>
+                <ol v-if="reasonsFor(item).length" class="dragon-tiger-reason-list">
+                  <li v-for="(reason, index) in reasonsFor(item)" :key="reason">
+                    <b>{{ reasonRank(index) }}</b><span>{{ reason }}</span>
+                  </li>
+                </ol>
+                <div v-else class="dragon-tiger-reason-empty">暂无上榜理由</div>
+              </section>
+            </div>
 
             <section class="dragon-tiger-funds" aria-label="榜单资金">
               <div class="dragon-tiger-funds-head"><b>榜单资金</b><span>{{ detailsFor(item).length }} 条</span></div>

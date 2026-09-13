@@ -8,6 +8,7 @@ const props = defineProps({
   soldStocks: { type: Array, default: () => [] },
   totalEquity: { type: Number, default: 0 },
   strategyMeta: { type: Object, default: () => ({}) },
+  currentDate: { type: String, default: '' },
 })
 
 const params = new URLSearchParams(location.search)
@@ -78,6 +79,7 @@ onBeforeUnmount(() => window.removeEventListener('popstate', restoreFromUrl))
         :total-equity="totalEquity"
         :brief="brief"
         :strategy-meta="strategyMeta"
+        :current-date="currentDate"
       />
       <div v-if="!positions.length" class="empty" style="padding:18px;font-size:13px">暂无持仓，等待模型决策建仓</div>
     </div>

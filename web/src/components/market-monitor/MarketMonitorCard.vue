@@ -42,7 +42,7 @@ function handleKey(event) {
     @keydown="handleKey"
   >
     <div class="market-card-head">
-      <div>
+      <div class="market-card-main">
         <div class="market-card-title-row">
           <span class="market-card-title">{{ summary.title }}</span>
           <span v-if="summary.time" class="market-card-time">{{ summary.time }}</span>
@@ -54,7 +54,7 @@ function handleKey(event) {
       </div>
       <div class="market-card-side">
         <span class="market-type">{{ summary.type }}</span>
-        <span class="market-chevron">›</span>
+        <span class="market-chevron" aria-hidden="true">›</span>
       </div>
     </div>
     <div v-if="expanded" class="market-card-detail">

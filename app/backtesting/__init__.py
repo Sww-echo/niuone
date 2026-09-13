@@ -7,8 +7,10 @@ from .historical_data import (
     DEFAULT_HISTORICAL_SOURCE_PRIORITY,
     HistoricalDataError,
     HistoricalDataResult,
+    HistoricalDataSummary,
     HistoricalFetchConfig,
     HistoricalSeries,
+    HistoricalSeriesSummary,
     SUPPORTED_ADJUSTMENTS,
     SUPPORTED_HISTORICAL_SOURCES,
     fetch_historical_data,
@@ -44,6 +46,13 @@ from .selection import (
 )
 from .replay_cache import ReplayCacheKey, ReplayTapeCache, build_replay_cache_key
 from .niuone_exits import NiuOneDailyExitStrategy, NiuOneStrategyBacktestPolicy
+from .prompt_strategy import (
+    PROMPT_BACKTEST_PROTOCOL_VERSION,
+    PromptStrategyBacktestPolicy,
+    PromptStrategyHistoricalSelector,
+    prompt_backtest_version_snapshot,
+    validate_prompt_backtest_version,
+)
 from .service import (
     HistoricalSelectionBacktestRun,
     IndustryAnnotationQuality,
@@ -60,19 +69,24 @@ __all__ = [
     "HistoricalBar",
     "HistoricalDataError",
     "HistoricalDataResult",
+    "HistoricalDataSummary",
     "HistoricalFetchConfig",
     "HistoricalFlowProvider",
     "HistoricalSelectionBacktestRun",
     "HistoricalSeries",
+    "HistoricalSeriesSummary",
     "IndustryAnnotationQuality",
     "IndustryMapLoader",
     "ThemeMapLoader",
     "NiuOneHistoricalContextProvider",
     "NiuOneDailyExitStrategy",
     "NiuOneStrategyBacktestPolicy",
+    "PROMPT_BACKTEST_PROTOCOL_VERSION",
     "PortfolioEntryDecision",
     "PositionExitSignal",
     "PositionExitStrategy",
+    "PromptStrategyBacktestPolicy",
+    "PromptStrategyHistoricalSelector",
     "RegisteredScorerSelector",
     "ReplaySelectionStrategy",
     "ReplayCacheKey",
@@ -101,6 +115,8 @@ __all__ = [
     "load_current_industry_map",
     "load_current_theme_map",
     "normalize_a_share_symbol",
+    "prompt_backtest_version_snapshot",
     "run_historical_selection_backtest",
     "run_selection_backtest",
+    "validate_prompt_backtest_version",
 ]

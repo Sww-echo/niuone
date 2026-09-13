@@ -39,22 +39,16 @@ class _Response:
 
 
 class ModelConnectivityTests(unittest.TestCase):
-    def test_all_model_setting_sections_publish_test_metadata(self):
+    def test_one_shared_model_setting_section_publishes_test_metadata(self):
         metadata = model_test_metadata()
 
         self.assertEqual(
             [item["id"] for item in metadata],
-            [
-                "news-precheck",
-                "decision-model",
-                "grok-model",
-                "us-rating-model",
-                "a-share-summary-model",
-            ],
+            ["shared-model"],
         )
         self.assertEqual(
             {item["group_slug"] for item in metadata},
-            {"news-precheck", "decision-model", "us-market", "market-monitoring"},
+            {"model-config"},
         )
         self.assertTrue(all("API_KEY" in " ".join(item["field_names"]) for item in metadata))
 
@@ -67,11 +61,13 @@ class ModelConnectivityTests(unittest.TestCase):
 
         ticks = iter((10.0, 10.125))
         result = run_model_connection_test(
-            "decision-model",
+            "shared-model",
             {
                 "DASHBOARD_DECISION_MODEL": "decision-test-model",
                 "DASHBOARD_DECISION_BASE_URL": "https://model.example/v1/",
                 "DASHBOARD_DECISION_API_KEY": "private-key",
+                "DASHBOARD_DECISION_REASONING_EFFORT": "MAX",
+                "DASHBOARD_DECISION_STREAM_MODE": "non_stream",
             },
             timeout=90,
             opener=opener,
@@ -90,8 +86,13 @@ class ModelConnectivityTests(unittest.TestCase):
         payload = json.loads(request.data.decode("utf-8"))
         self.assertEqual(payload["model"], "decision-test-model")
         self.assertEqual(payload["max_tokens"], 256)
+        self.assertEqual(payload["reasoning_effort"], "max")
+        self.assertFalse(payload["stream"])
+        self.assertIn("网关已接受当前配置", result["message"])
+        self.assertIn("思考强度 max", result["message"])
+        self.assertIn("强制非流式", result["message"])
 
-    def test_news_test_uses_operational_responses_mode_and_search_tool(self):
+    def test_connection_test_force_stream_uses_sse_and_reports_transport(self):
         requests = []
 
         def opener(request, timeout=0):
@@ -99,25 +100,23 @@ class ModelConnectivityTests(unittest.TestCase):
             return _Response()
 
         result = run_model_connection_test(
-            "news-precheck",
+            "shared-model",
             {
-                "DASHBOARD_NEWS_MODEL": "gpt-5-search",
-                "DASHBOARD_NEWS_BASE_URL": "https://search.example/v1",
-                "DASHBOARD_NEWS_API_KEY": "search-key",
-                "DASHBOARD_NEWS_API_MODE": "auto",
+                "DASHBOARD_DECISION_BASE_URL": "https://model.example/v1",
+                "DASHBOARD_DECISION_API_KEY": "private-key",
+                "DASHBOARD_DECISION_STREAM_MODE": "stream",
             },
             opener=opener,
         )
 
         self.assertTrue(result["ok"])
-        self.assertEqual(result["api_mode"], "responses")
         payload = json.loads(requests[0].data.decode("utf-8"))
-        self.assertEqual(payload["tools"], [{"type": "web_search"}])
-        self.assertNotIn("messages", payload)
+        self.assertTrue(payload["stream"])
+        self.assertIn("强制流式", result["message"])
 
     def test_complete_provider_fallback_is_not_mixed_with_partial_override(self):
         config = resolve_model_test_config(
-            "decision-model",
+            "shared-model",
             {
                 "DASHBOARD_DECISION_MODEL": "decision-test-model",
                 "DASHBOARD_DECISION_BASE_URL": "https://partial.example/v1",
@@ -131,7 +130,7 @@ class ModelConnectivityTests(unittest.TestCase):
         self.assertEqual(config.base_url, "https://provider.example/v1")
         self.assertEqual(config.api_key, "provider-key")
 
-    def test_summary_and_rating_targets_reuse_grok_values(self):
+    def test_shared_target_ignores_legacy_grok_values(self):
         values = {
             "DASHBOARD_GROK_MODEL": "shared-grok",
             "DASHBOARD_GROK_BASE_URL": "https://grok.example/v1",
@@ -139,20 +138,100 @@ class ModelConnectivityTests(unittest.TestCase):
             "DASHBOARD_GROK_API_MODE": "responses",
         }
 
-        summary = resolve_model_test_config("a-share-summary-model", values)
-        rating = resolve_model_test_config("us-rating-model", values)
+        summary = resolve_model_test_config("shared-model", values)
 
-        self.assertEqual((summary.model, summary.base_url, summary.api_key, summary.api_mode), (
-            "shared-grok", "https://grok.example/v1", "grok-key", "chat",
-        ))
-        self.assertEqual((rating.model, rating.base_url, rating.api_key, rating.api_mode), (
-            "shared-grok", "https://grok.example/v1", "grok-key", "responses",
-        ))
+        self.assertEqual(
+            (summary.model, summary.base_url, summary.api_key, summary.api_mode),
+            ("deepseek-v4-pro", "", "", "auto"),
+        )
+        self.assertEqual(summary.reasoning_effort, "")
+        self.assertEqual(summary.stream_mode, "auto")
+
+    def test_known_model_typo_is_rejected_locally_without_network_request(self):
+        calls = []
+
+        result = run_model_connection_test(
+            "shared-model",
+            {
+                "DASHBOARD_DECISION_MODEL": "deepseek-v4-pro",
+                "DASHBOARD_DECISION_BASE_URL": "https://model.example/v1",
+                "DASHBOARD_DECISION_API_KEY": "private-key",
+                "DASHBOARD_DECISION_REASONING_EFFORT": "highh",
+            },
+            opener=lambda *_args, **_kwargs: calls.append(True),
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_code"], "invalid_reasoning_effort")
+        self.assertIn("允许值", result["error"])
+        self.assertEqual(calls, [])
+
+    def test_documented_compatibility_mapping_is_visible_in_success_message(self):
+        ticks = iter((3.0, 3.01))
+        result = run_model_connection_test(
+            "shared-model",
+            {
+                "DASHBOARD_DECISION_MODEL": "deepseek-v4-pro",
+                "DASHBOARD_DECISION_BASE_URL": "https://model.example/v1",
+                "DASHBOARD_DECISION_API_KEY": "private-key",
+                "DASHBOARD_DECISION_REASONING_EFFORT": "low",
+            },
+            opener=lambda *_args, **_kwargs: _Response(),
+            monotonic=lambda: next(ticks),
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertIn("low（按官方规则映射为 high）", result["message"])
+
+    def test_invalid_and_unsupported_reasoning_effort_errors_are_actionable(self):
+        def invalid_value(request, timeout=0):
+            raise urllib.error.HTTPError(
+                request.full_url,
+                400,
+                "Bad Request",
+                {},
+                io.BytesIO(b'{"error":{"message":"reasoning_effort must be one of low, high"}}'),
+            )
+
+        invalid = run_model_connection_test(
+            "shared-model",
+            {
+                "DASHBOARD_DECISION_BASE_URL": "https://model.example/v1",
+                "DASHBOARD_DECISION_API_KEY": "private-key",
+                "DASHBOARD_DECISION_REASONING_EFFORT": "max",
+            },
+            opener=invalid_value,
+        )
+
+        self.assertEqual(invalid["error_code"], "invalid_reasoning_effort")
+        self.assertIn("不接受思考强度“max”", invalid["error"])
+
+        def unsupported_parameter(request, timeout=0):
+            raise urllib.error.HTTPError(
+                request.full_url,
+                422,
+                "Unprocessable Entity",
+                {},
+                io.BytesIO(b'{"error":{"message":"unknown parameter: reasoning_effort"}}'),
+            )
+
+        unsupported = run_model_connection_test(
+            "shared-model",
+            {
+                "DASHBOARD_DECISION_BASE_URL": "https://model.example/v1",
+                "DASHBOARD_DECISION_API_KEY": "private-key",
+                "DASHBOARD_DECISION_REASONING_EFFORT": "max",
+            },
+            opener=unsupported_parameter,
+        )
+
+        self.assertEqual(unsupported["error_code"], "unsupported_reasoning_effort")
+        self.assertIn("请留空后重试", unsupported["error"])
 
     def test_failures_are_actionable_and_do_not_expose_provider_bodies(self):
-        missing = run_model_connection_test("news-precheck", {})
+        missing = run_model_connection_test("shared-model", {})
         self.assertFalse(missing["ok"])
-        self.assertIn("模型", missing["error"])
+        self.assertIn("API 地址", missing["error"])
         self.assertIn("API Key", missing["error"])
 
         def unauthorized(request, timeout=0):
@@ -165,7 +244,7 @@ class ModelConnectivityTests(unittest.TestCase):
             )
 
         failed = run_model_connection_test(
-            "decision-model",
+            "shared-model",
             {
                 "DASHBOARD_DECISION_BASE_URL": "https://model.example/v1",
                 "DASHBOARD_DECISION_API_KEY": "private-key",

@@ -13,20 +13,52 @@ ENTRYPOINTS = SRC / "entrypoints"
 sys.path.insert(0, str(SRC))
 sys.path.insert(0, str(COMPAT))
 MODULE_PATH = COMPAT / "a_share_grok_summary.py"
+MODEL_ENV_KEYS = {
+    "DASHBOARD_ENV_FILE",
+    "DASHBOARD_CONFIG",
+    "DASHBOARD_DECISION_MODEL",
+    "DASHBOARD_DECISION_BASE_URL",
+    "DASHBOARD_DECISION_API_KEY",
+    "DASHBOARD_DECISION_STREAM_MODE",
+    "DASHBOARD_DECISION_REASONING_EFFORT",
+    "DASHBOARD_DECISION_CONTEXT_LENGTH",
+    "DASHBOARD_DECISION_MAX_TOKENS",
+    "A_SHARE_MODEL_SUMMARY_MODEL",
+    "A_SHARE_MODEL_SUMMARY_BASE_URL",
+    "A_SHARE_MODEL_SUMMARY_API_KEY",
+    "A_SHARE_MODEL_SUMMARY_STREAM_MODE",
+    "A_SHARE_MODEL_SUMMARY_REASONING_EFFORT",
+    "A_SHARE_MODEL_SUMMARY_CONTEXT_LENGTH",
+    "A_SHARE_MODEL_SUMMARY_MAX_TOKENS",
+}
+ISOLATED_MODEL_ENV = {
+    "DASHBOARD_ENV_FILE": str(ROOT / ".missing-test-dashboard.env"),
+    "DASHBOARD_CONFIG": str(ROOT / ".missing-test-model-config.yaml"),
+    "DASHBOARD_DECISION_MODEL": "summary-test",
+    "DASHBOARD_DECISION_BASE_URL": "https://model.example/v1",
+    "DASHBOARD_DECISION_API_KEY": "test-key",
+}
 
 
-def load_module():
+def _load_module():
     spec = importlib.util.spec_from_file_location("a_share_grok_summary_under_test", MODULE_PATH)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
 
 
+def load_module():
+    return load_module_with_env({})
+
+
 def load_module_with_env(updates: dict[str, str]):
-    original = {key: os.environ.get(key) for key in updates}
+    original = {key: os.environ.get(key) for key in MODEL_ENV_KEYS}
     try:
+        for key in MODEL_ENV_KEYS:
+            os.environ.pop(key, None)
+        os.environ.update(ISOLATED_MODEL_ENV)
         os.environ.update(updates)
-        return load_module()
+        return _load_module()
     finally:
         for key, value in original.items():
             if value is None:
@@ -37,7 +69,7 @@ def load_module_with_env(updates: dict[str, str]):
 
 class AShareGrokSummaryTests(unittest.TestCase):
     def test_context_length_does_not_set_model_summary_max_tokens_default(self):
-        mod = load_module_with_env({"A_SHARE_MODEL_SUMMARY_CONTEXT_LENGTH": "256K"})
+        mod = load_module_with_env({"DASHBOARD_DECISION_CONTEXT_LENGTH": "256K"})
 
         self.assertEqual(mod.A_SHARE_MODEL_SUMMARY_CONTEXT_LENGTH, 256000)
         self.assertEqual(mod.A_SHARE_MODEL_SUMMARY_MAX_TOKENS, 4096)
@@ -45,8 +77,8 @@ class AShareGrokSummaryTests(unittest.TestCase):
 
     def test_max_tokens_env_sets_model_summary_output_tokens(self):
         mod = load_module_with_env({
-            "A_SHARE_MODEL_SUMMARY_CONTEXT_LENGTH": "256K",
-            "A_SHARE_MODEL_SUMMARY_MAX_TOKENS": "4096",
+            "DASHBOARD_DECISION_CONTEXT_LENGTH": "256K",
+            "DASHBOARD_DECISION_MAX_TOKENS": "4096",
         })
 
         self.assertEqual(mod.A_SHARE_MODEL_SUMMARY_CONTEXT_LENGTH, 256000)
@@ -54,7 +86,7 @@ class AShareGrokSummaryTests(unittest.TestCase):
         self.assertEqual(mod.call_grok_api.__kwdefaults__["max_tokens"], 4096)
 
     def test_call_grok_api_omits_temperature_by_default(self):
-        mod = load_module()
+        mod = load_module_with_env({"DASHBOARD_DECISION_MODEL": "summary-test"})
         captured = {}
 
         class Resp:
@@ -87,6 +119,123 @@ class AShareGrokSummaryTests(unittest.TestCase):
         self.assertNotIn("temperature", captured["payload"])
         self.assertEqual(captured["headers"]["User-agent"], "NiuOne/1.0")
         self.assertEqual(captured["headers"]["Accept"], "application/json")
+
+    def test_call_grok_api_sends_configured_reasoning_effort(self):
+        mod = load_module_with_env({
+            "DASHBOARD_DECISION_MODEL": "summary-test",
+            "DASHBOARD_DECISION_REASONING_EFFORT": "high",
+        })
+        captured = {}
+
+        class Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b'{"choices":[{"message":{"content":"ok"}}]}'
+
+        mod._get_grok_credentials = lambda: ("https://ashare.example/v1", "secret")
+
+        def fake_urlopen(req, timeout=0, context=None):
+            captured["payload"] = json.loads(req.data.decode("utf-8"))
+            return Resp()
+
+        mod.urlopen = fake_urlopen
+        mod.call_grok_api([{"role": "user", "content": "hello"}], max_tokens=123)
+
+        self.assertEqual(captured["payload"]["reasoning_effort"], "high")
+
+    def test_call_grok_api_can_force_stream_transport(self):
+        mod = load_module_with_env({
+            "DASHBOARD_DECISION_MODEL": "summary-test",
+            "DASHBOARD_DECISION_STREAM_MODE": "stream",
+        })
+        captured = {}
+
+        class Resp:
+            headers = {"Content-Type": "text/event-stream"}
+
+            def __init__(self):
+                self.lines = iter((
+                    b'data: {"choices":[{"delta":{"content":"o"}}]}\n',
+                    b'data: {"choices":[{"delta":{"content":"k"}}]}\n',
+                    b'data: [DONE]\n',
+                ))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def readline(self):
+                return next(self.lines, b"")
+
+        mod._get_grok_credentials = lambda: ("https://ashare.example/v1", "secret")
+
+        def fake_urlopen(req, timeout=0, context=None):
+            captured["payload"] = json.loads(req.data.decode("utf-8"))
+            captured["accept"] = req.get_header("Accept")
+            return Resp()
+
+        mod.urlopen = fake_urlopen
+        result = mod.call_grok_api([{"role": "user", "content": "hello"}])
+
+        self.assertEqual(result, "ok")
+        self.assertTrue(captured["payload"]["stream"])
+        self.assertIn("text/event-stream", captured["accept"])
+
+    def test_call_grok_api_auto_selects_qwen_responses(self):
+        mod = load_module_with_env({
+            "DASHBOARD_DECISION_MODEL": "qwen3.7-plus",
+            "DASHBOARD_DECISION_REASONING_EFFORT": "max",
+        })
+        captured = {}
+
+        class Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b'{"output_text":"ok","status":"completed"}'
+
+        mod._get_grok_credentials = lambda: ("https://dashscope.example/v1", "secret")
+
+        def fake_urlopen(req, timeout=0, context=None):
+            captured["url"] = req.full_url
+            captured["payload"] = json.loads(req.data.decode("utf-8"))
+            return Resp()
+
+        mod.urlopen = fake_urlopen
+        result = mod.call_grok_api([{"role": "user", "content": "hello"}], max_tokens=123)
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(captured["url"], "https://dashscope.example/v1/responses")
+        self.assertEqual(captured["payload"]["reasoning"], {"effort": "max"})
+
+    def test_model_summary_does_not_fall_back_to_legacy_grok_settings(self):
+        mod = load_module_with_env({
+            "DASHBOARD_DECISION_MODEL": "",
+            "DASHBOARD_DECISION_BASE_URL": "",
+            "DASHBOARD_DECISION_API_KEY": "",
+            "A_SHARE_MODEL_SUMMARY_MODEL": "",
+            "A_SHARE_MODEL_SUMMARY_BASE_URL": "",
+            "A_SHARE_MODEL_SUMMARY_API_KEY": "",
+            "DASHBOARD_CONFIG": "/tmp/niuone-missing-model-config.yaml",
+            "A_SHARE_GROK_SUMMARY_MODEL": "legacy-summary",
+            "DASHBOARD_GROK_MODEL": "legacy-grok",
+            "DASHBOARD_GROK_BASE_URL": "https://legacy.example/v1",
+            "DASHBOARD_GROK_API_KEY": "legacy-key",
+        })
+
+        self.assertEqual(mod.A_SHARE_MODEL_SUMMARY_MODEL, "deepseek-v4-pro")
+        self.assertEqual(mod._get_grok_credentials(), ("", ""))
 
     def test_parse_accepts_json_fence(self):
         mod = load_module()

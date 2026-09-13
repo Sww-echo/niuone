@@ -1,31 +1,40 @@
 #!/usr/bin/env python3
 import importlib.util
-import json
 import os
 import sys
-import time
 import unittest
 from pathlib import Path
+
+from app.market_data.news_precheck import IWENCAI_NEWS_SOURCE_VERSION
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "app"
 COMPAT = SRC / "compat"
-ENTRYPOINTS = SRC / "entrypoints"
 NEWS_ENV_KEYS = {
     "DASHBOARD_ENV_FILE",
+    "IWENCAI_NEWS_PRECHECK_ENABLED",
+    "IWENCAI_ENABLED",
+    "IWENCAI_BASE_URL",
+    "IWENCAI_API_KEY",
+    "IWENCAI_TIMEOUT_SECONDS",
+    "IWENCAI_MAX_RETRIES",
+    "IWENCAI_MAX_CONCURRENCY",
+    "DASHBOARD_DECISION_MODEL",
+    "DASHBOARD_DECISION_BASE_URL",
+    "DASHBOARD_DECISION_API_KEY",
+    "DASHBOARD_DECISION_STREAM_MODE",
+    "DASHBOARD_DECISION_REASONING_EFFORT",
+    "DASHBOARD_DECISION_TIMEOUT",
+    "DASHBOARD_DECISION_MAX_TOKENS",
+    "CROSSDESK_BASE_URL",
+    "CROSSDESK_API_KEY",
+    "DASHBOARD_CONFIG",
+    # Old values are included only to prove they no longer activate model prechecks.
+    "DASHBOARD_NEWS_SOURCE",
     "DASHBOARD_NEWS_MODEL",
-    "DASHBOARD_NEWS_API_MODE",
-    "DASHBOARD_NEWS_CONTEXT_LENGTH",
-    "DASHBOARD_NEWS_MAX_TOKENS",
     "DASHBOARD_NEWS_BASE_URL",
     "DASHBOARD_NEWS_API_KEY",
-    "DASHBOARD_NEWS_TIMEOUT",
-    "DASHBOARD_NEWS_MAX_RETRIES",
-    "DASHBOARD_NEWS_CONCURRENCY",
-    "DASHBOARD_GROK_MODEL",
-    "DASHBOARD_GROK_BASE_URL",
-    "DASHBOARD_GROK_API_KEY",
 }
 
 
@@ -58,380 +67,180 @@ class NewsPrecheckConfigTests(unittest.TestCase):
             else:
                 os.environ[key] = value
 
-    def test_news_precheck_skips_when_unconfigured(self):
-        module = import_trader_with_env({})
+    def test_switch_off_skips_precheck_and_legacy_model_config(self):
+        module = import_trader_with_env({
+            "DASHBOARD_NEWS_SOURCE": "model",
+            "DASHBOARD_NEWS_BASE_URL": "https://news.example/v1",
+            "DASHBOARD_NEWS_API_KEY": "legacy-secret",
+            "DASHBOARD_NEWS_MODEL": "legacy-model",
+        })
 
         self.assertIsNone(module.load_news_precheck_config())
-        self.assertEqual(module.check_candidate_news_precheck([{"code": "000001", "name": "平安银行"}]), "")
-
-    def test_news_precheck_reuses_structured_scanner_cache(self):
-        module = import_trader_with_env({})
-        candidates = [
-            {
+        self.assertEqual(
+            module.check_candidate_news_precheck([{
                 "code": "000001",
                 "name": "平安银行",
                 "news_precheck": {
-                    "code": "000001",
-                    "name": "平安银行",
                     "checked": True,
                     "available": True,
-                    "tone": "positive",
-                    "tone_label": "利好",
-                    "summary": "- 000001 平安银行：重大项目落地（利好）",
-                    "fetched_at": "2026-07-17T09:30:00+08:00",
+                    "provider": "消息面预检模型",
+                    "source_mode": "model",
+                    "summary": "旧模型摘要（利好）",
                 },
-            }
-        ]
-        module.load_news_precheck_config = lambda: self.fail("不应再次加载消息面配置")
+            }]),
+            "",
+        )
 
-        result = module.check_candidate_news_precheck(candidates)
-
-        self.assertIn("扫描阶段缓存", result)
-        self.assertIn("重大项目落地（利好）", result)
-
-    def test_news_precheck_only_fetches_candidates_missing_from_scanner_cache(self):
+    def test_enabled_precheck_fetches_through_iwencai_and_uses_decision_config(self):
         module = import_trader_with_env({
-            "DASHBOARD_NEWS_BASE_URL": "https://news.example/v1",
-            "DASHBOARD_NEWS_API_KEY": "news-secret",
-            "DASHBOARD_NEWS_MODEL": "search-model",
+            "IWENCAI_NEWS_PRECHECK_ENABLED": "1",
+            "IWENCAI_ENABLED": "1",
+            "IWENCAI_API_KEY": "iwencai-secret",
+            "DASHBOARD_DECISION_MODEL": "decision-test-model",
+            "DASHBOARD_DECISION_BASE_URL": "https://model.example/v1",
+            "DASHBOARD_DECISION_API_KEY": "decision-secret",
+        })
+        captured = {}
+
+        def fake_fetcher(candidates, config, **kwargs):
+            captured["candidates"] = candidates
+            captured["config"] = config
+            captured["kwargs"] = kwargs
+            return [{
+                "code": candidates[0]["code"],
+                "name": candidates[0]["name"],
+                "checked": True,
+                "available": True,
+                "tone": "neutral",
+                "tone_label": "中性",
+                "summary": "问财结构化结果（中性）",
+                "provider": "同花顺问财",
+                "source_mode": "iwencai",
+                "source_version": IWENCAI_NEWS_SOURCE_VERSION,
+                "judgment_provider": "decision_model",
+                "judgment_model": "decision-test-model",
+            }]
+
+        module.fetch_candidate_news_records = fake_fetcher
+        result = module.check_candidate_news_precheck([
+            {"code": "000001", "name": "平安银行"},
+        ])
+
+        self.assertEqual(captured["config"].source_mode, "iwencai")
+        self.assertEqual(captured["config"].model, "decision-test-model")
+        self.assertEqual(captured["kwargs"]["max_candidates"], 1)
+        self.assertIn("【消息面预检（同花顺问财）】", result)
+        self.assertIn("问财结构化结果", result)
+
+    def test_enabled_precheck_replaces_legacy_model_cache(self):
+        module = import_trader_with_env({
+            "IWENCAI_NEWS_PRECHECK_ENABLED": "1",
+            "IWENCAI_ENABLED": "1",
+            "IWENCAI_API_KEY": "iwencai-secret",
+            "DASHBOARD_DECISION_MODEL": "decision-test-model",
+            "DASHBOARD_DECISION_BASE_URL": "https://model.example/v1",
+            "DASHBOARD_DECISION_API_KEY": "decision-secret",
         })
         calls = []
 
-        def fake_request(candidate, **_kwargs):
-            calls.append(candidate["code"])
-            return f"- {candidate['code']} {candidate['name']}：最近3天无明确重大消息（中性）"
-
-        module.request_single_candidate_news_precheck = fake_request
-        result = module.check_candidate_news_precheck([
-            {
+        def fake_fetcher(candidates, _config, **_kwargs):
+            calls.extend(candidate["code"] for candidate in candidates)
+            return [{
                 "code": "000001",
                 "name": "平安银行",
-                "news_precheck": {
-                    "code": "000001",
-                    "name": "平安银行",
-                    "checked": True,
-                    "available": True,
-                    "summary": "- 000001 平安银行：重大项目落地（利好）",
-                },
+                "checked": True,
+                "available": True,
+                "summary": "问财新结果（中性）",
+                "provider": "同花顺问财",
+                "source_mode": "iwencai",
+                "source_version": IWENCAI_NEWS_SOURCE_VERSION,
+                "judgment_provider": "decision_model",
+                "judgment_model": "decision-test-model",
+            }]
+
+        module.fetch_candidate_news_records = fake_fetcher
+        result = module.check_candidate_news_precheck([{
+            "code": "000001",
+            "name": "平安银行",
+            "news_precheck": {
+                "checked": True,
+                "available": True,
+                "summary": "旧模型雪球舆情（利好）",
+                "provider": "消息面预检模型",
+                "source_mode": "model",
             },
-            {"code": "000002", "name": "万科A"},
-        ])
+        }])
 
-        self.assertEqual(calls, ["000002"])
-        self.assertIn("扫描缓存 + 实时补齐", result)
-        self.assertLess(result.index("000001"), result.index("000002"))
+        self.assertEqual(calls, ["000001"])
+        self.assertIn("问财新结果", result)
+        self.assertNotIn("雪球", result)
 
-    def test_news_precheck_requires_complete_config(self):
+    def test_failed_precheck_has_zero_decision_weight(self):
         module = import_trader_with_env({
-            "DASHBOARD_NEWS_BASE_URL": "https://news.example/v1",
-            "DASHBOARD_NEWS_MODEL": "search-model",
+            "IWENCAI_NEWS_PRECHECK_ENABLED": "1",
+            "IWENCAI_ENABLED": "1",
+            "IWENCAI_API_KEY": "iwencai-secret",
+            "DASHBOARD_DECISION_MODEL": "decision-test-model",
+            "DASHBOARD_DECISION_BASE_URL": "https://model.example/v1",
+            "DASHBOARD_DECISION_API_KEY": "decision-secret",
         })
 
-        with self.assertRaisesRegex(RuntimeError, "DASHBOARD_NEWS_API_KEY"):
-            module.load_news_precheck_config()
-
-    def test_news_precheck_uses_independent_config(self):
-        module = import_trader_with_env({
-            "DASHBOARD_GROK_BASE_URL": "https://grok.example/v1",
-            "DASHBOARD_GROK_API_KEY": "grok-secret",
-            "DASHBOARD_GROK_MODEL": "grok-model",
-            "DASHBOARD_NEWS_BASE_URL": "https://news.example/v1",
-            "DASHBOARD_NEWS_API_KEY": "news-secret",
-            "DASHBOARD_NEWS_MODEL": "search-model",
-        })
-        captured = {}
-
-        def fake_request(base_url, api_key, payload, model_name, max_retries=3, timeout=60, **kwargs):
-            captured.update({
-                "base_url": base_url,
-                "api_key": api_key,
-                "payload": payload,
-                "model_name": model_name,
-                "max_retries": max_retries,
-                "timeout": timeout,
-                "kwargs": kwargs,
-            })
-            return "- 000001 平安银行：无重大消息（中性）"
-
-        module.request_chat_content = fake_request
-        result = module.check_candidate_news_precheck([{"code": "000001", "name": "平安银行"}])
-
-        self.assertEqual(captured["base_url"], "https://news.example/v1")
-        self.assertEqual(captured["api_key"], "news-secret")
-        self.assertEqual(captured["payload"]["model"], "search-model")
-        self.assertNotIn("temperature", captured["payload"])
-        self.assertEqual(captured["model_name"], "search-model")
-        self.assertEqual(captured["max_retries"], 1)
-        self.assertEqual(captured["timeout"], 45)
-        self.assertEqual(captured["kwargs"]["api_mode"], "auto")
-        self.assertEqual(captured["kwargs"]["tools"], [{"type": "web_search"}])
-        self.assertEqual(captured["kwargs"]["reasoning"], {"effort": "low"})
-        self.assertIn("【消息面预检（实时搜索", result)
-        self.assertNotIn("Grok", result)
-
-    def test_request_chat_content_sends_compatible_user_agent(self):
-        module = import_trader_with_env({})
-        captured = {}
-
-        class Resp:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-            def read(self):
-                return b'{"choices":[{"message":{"content":"ok"}}]}'
-
-        original_urlopen = module.urllib.request.urlopen
-        try:
-            def fake_urlopen(req, timeout=0):
-                captured["headers"] = dict(req.header_items())
-                captured["payload"] = json.loads(req.data.decode("utf-8"))
-                return Resp()
-
-            module.urllib.request.urlopen = fake_urlopen
-            result = module.request_chat_content(
-                "https://news.example/v1",
-                "secret",
-                {"messages": [{"role": "user", "content": "hello"}]},
-                "search-model",
-                max_retries=1,
-                timeout=3,
-            )
-        finally:
-            module.urllib.request.urlopen = original_urlopen
-
-        self.assertEqual(result, "ok")
-        self.assertEqual(captured["payload"]["model"], "search-model")
-        self.assertEqual(captured["headers"]["User-agent"], "NiuOne/1.0")
-        self.assertEqual(captured["headers"]["Accept"], "application/json")
-
-    def test_gpt_news_precheck_uses_responses_search_and_parses_forced_sse(self):
-        module = import_trader_with_env({})
-        captured = {}
-
-        class Resp:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-            def read(self):
-                return (
-                    'event: response.web_search_call.searching\n'
-                    'data: {"type":"response.web_search_call.searching"}\n\n'
-                    'event: response.output_text.delta\n'
-                    'data: {"type":"response.output_text.delta","delta":"搜索结果正常"}\n\n'
-                    'event: response.completed\n'
-                    'data: {"type":"response.completed","response":{"status":"completed"}}\n\n'
-                ).encode("utf-8")
-
-        original_urlopen = module.urllib.request.urlopen
-        try:
-            def fake_urlopen(req, timeout=0):
-                captured["url"] = req.full_url
-                captured["payload"] = json.loads(req.data.decode("utf-8"))
-                return Resp()
-
-            module.urllib.request.urlopen = fake_urlopen
-            result = module.request_chat_content(
-                "https://news.example/v1",
-                "secret",
-                {
-                    "model": "gpt-5.6-sol",
-                    "messages": [{"role": "user", "content": "search"}],
-                    "max_tokens": 4096,
-                },
-                "gpt-5.6-sol",
-                max_retries=1,
-                timeout=3,
-                api_mode="auto",
-                tools=[{"type": "web_search"}],
-                reasoning={"effort": "low"},
-            )
-        finally:
-            module.urllib.request.urlopen = original_urlopen
-
-        self.assertEqual(result, "搜索结果正常")
-        self.assertEqual(captured["url"], "https://news.example/v1/responses")
-        self.assertEqual(captured["payload"]["tools"], [{"type": "web_search"}])
-        self.assertNotIn("max_output_tokens", captured["payload"])
-        self.assertNotIn("max_tokens", captured["payload"])
-
-    def test_api_call_with_retry_sends_compatible_user_agent(self):
-        module = import_trader_with_env({})
-        captured = {}
-
-        class Resp:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-            def read(self):
-                return b'{"ok":true}'
-
-        original_urlopen = module.urllib.request.urlopen
-        try:
-            def fake_urlopen(req, timeout=0):
-                captured["headers"] = dict(req.header_items())
-                captured["payload"] = json.loads(req.data.decode("utf-8"))
-                return Resp()
-
-            module.urllib.request.urlopen = fake_urlopen
-            result = module.api_call_with_retry(
-                "https://decision.example/v1",
-                "secret",
-                {"model": "decision-model", "messages": [{"role": "user", "content": "hello"}]},
-                max_retries=1,
-                timeout=3,
-            )
-        finally:
-            module.urllib.request.urlopen = original_urlopen
-
-        self.assertEqual(result, {"ok": True})
-        self.assertEqual(captured["payload"]["model"], "decision-model")
-        self.assertEqual(captured["headers"]["User-agent"], "NiuOne/1.0")
-        self.assertEqual(captured["headers"]["Accept"], "application/json")
-
-    def test_news_precheck_honors_timeout_overrides(self):
-        module = import_trader_with_env({
-            "DASHBOARD_NEWS_BASE_URL": "https://news.example/v1",
-            "DASHBOARD_NEWS_API_KEY": "news-secret",
-            "DASHBOARD_NEWS_MODEL": "search-model",
-            "DASHBOARD_NEWS_TIMEOUT": "30",
-            "DASHBOARD_NEWS_MAX_RETRIES": "2",
-        })
-        captured = {}
-
-        def fake_request(base_url, api_key, payload, model_name, max_retries=3, timeout=60, **kwargs):
-            captured.update({"max_retries": max_retries, "timeout": timeout})
-            return "- 000001 平安银行：无重大消息（中性）"
-
-        module.request_chat_content = fake_request
-        module.check_candidate_news_precheck([{"code": "000001", "name": "平安银行"}])
-
-        self.assertEqual(captured["max_retries"], 2)
-        self.assertEqual(captured["timeout"], 30)
-
-    def test_news_precheck_checks_candidates_concurrently_and_preserves_order(self):
-        module = import_trader_with_env({
-            "DASHBOARD_NEWS_BASE_URL": "https://news.example/v1",
-            "DASHBOARD_NEWS_API_KEY": "news-secret",
-            "DASHBOARD_NEWS_MODEL": "search-model",
-            "DASHBOARD_NEWS_CONCURRENCY": "3",
-        })
-        prompts = []
-
-        def fake_request(base_url, api_key, payload, model_name, max_retries=3, timeout=60, **kwargs):
-            prompt = payload["messages"][0]["content"]
-            prompts.append(prompt)
-            if "000001" in prompt:
-                time.sleep(0.05)
-                return "- 000001 平安银行：无重大消息（中性）"
-            if "000002" in prompt:
-                return "- 000002 万科A：融资消息偏弱（利空）"
-            return "- 000003 国农科技：订单消息偏强（利好）"
-
-        module.request_chat_content = fake_request
-        result = module.check_candidate_news_precheck([
-            {"code": "000001", "name": "平安银行"},
-            {"code": "000002", "name": "万科A"},
-            {"code": "000003", "name": "国农科技"},
-        ])
-
-        self.assertIn("并发3", result)
-        self.assertEqual(len(prompts), 3)
-        self.assertTrue(all(not ("000001" in prompt and "000002" in prompt) for prompt in prompts))
-        self.assertLess(result.index("000001"), result.index("000002"))
-        self.assertLess(result.index("000002"), result.index("000003"))
-
-    def test_news_precheck_keeps_partial_results_when_one_parallel_request_fails(self):
-        module = import_trader_with_env({
-            "DASHBOARD_NEWS_BASE_URL": "https://news.example/v1",
-            "DASHBOARD_NEWS_API_KEY": "news-secret",
-            "DASHBOARD_NEWS_MODEL": "search-model",
-            "DASHBOARD_NEWS_CONCURRENCY": "2",
-        })
-
-        def fake_request(base_url, api_key, payload, model_name, max_retries=3, timeout=60, **kwargs):
-            prompt = payload["messages"][0]["content"]
-            if "000002" in prompt:
-                raise RuntimeError("rate limited")
-            return "- 000001 平安银行：无重大消息（中性）"
-
-        module.request_chat_content = fake_request
-        result = module.check_candidate_news_precheck([
-            {"code": "000001", "name": "平安银行"},
-            {"code": "000002", "name": "万科A"},
-        ])
-
-        self.assertIn("000001 平安银行", result)
-        self.assertIn("000002 万科A：消息面预检失败", result)
-
-    def test_news_precheck_context_length_does_not_set_max_tokens(self):
-        module = import_trader_with_env({
-            "DASHBOARD_NEWS_BASE_URL": "https://news.example/v1",
-            "DASHBOARD_NEWS_API_KEY": "news-secret",
-            "DASHBOARD_NEWS_MODEL": "search-model",
-            "DASHBOARD_NEWS_CONTEXT_LENGTH": "128000",
-        })
-        captured = {}
-
-        def fake_request(base_url, api_key, payload, model_name, max_retries=3, timeout=60, **kwargs):
-            captured["payload"] = payload
-            return "- 000001 平安银行：无重大消息（中性）"
-
-        module.request_chat_content = fake_request
-        module.check_candidate_news_precheck([{"code": "000001", "name": "平安银行"}])
-
-        self.assertEqual(module.NEWS_PRECHECK_CONTEXT_LENGTH, 128000)
-        self.assertEqual(captured["payload"]["max_tokens"], 4096)
-
-    def test_news_precheck_max_tokens_sets_output_tokens(self):
-        module = import_trader_with_env({
-            "DASHBOARD_NEWS_BASE_URL": "https://news.example/v1",
-            "DASHBOARD_NEWS_API_KEY": "news-secret",
-            "DASHBOARD_NEWS_MODEL": "search-model",
-            "DASHBOARD_NEWS_CONTEXT_LENGTH": "128000",
-            "DASHBOARD_NEWS_MAX_TOKENS": "1200",
-        })
-        captured = {}
-
-        def fake_request(base_url, api_key, payload, model_name, max_retries=3, timeout=60, **kwargs):
-            captured["payload"] = payload
-            return "- 000001 平安银行：无重大消息（中性）"
-
-        module.request_chat_content = fake_request
-        module.check_candidate_news_precheck([{"code": "000001", "name": "平安银行"}])
-
-        self.assertEqual(module.NEWS_PRECHECK_CONTEXT_LENGTH, 128000)
-        self.assertEqual(captured["payload"]["max_tokens"], 1200)
-
-    def test_news_precheck_context_length_accepts_suffixes(self):
-        module = import_trader_with_env({
-            "DASHBOARD_NEWS_CONTEXT_LENGTH": "1M",
-        })
-
-        self.assertEqual(module.NEWS_PRECHECK_CONTEXT_LENGTH, 1000000)
-        self.assertEqual(module.NEWS_PRECHECK_MAX_TOKENS, 4096)
-
-    def test_parse_chat_completion_content_accepts_sse_stream(self):
-        module = import_trader_with_env({})
-        raw = (
-            'data: {"choices":[{"delta":{"content":"- 000001 平安银行："}}]}\n\n'
-            'data: {"choices":[{"delta":{"content":"消息稳定（中性）"},"finish_reason":"stop"}]}\n\n'
-            "data: [DONE]\n\n"
+        failed_record = {
+            "code": "000001",
+            "name": "平安银行",
+            "checked": False,
+            "available": False,
+            "tone": "neutral",
+            "tone_label": "不可用",
+            "summary": "",
+            "provider": "同花顺问财",
+            "source_mode": "iwencai",
+            "source_version": IWENCAI_NEWS_SOURCE_VERSION,
+            "error": "request_TimeoutError",
+        }
+        module.fetch_candidate_news_records = (
+            lambda _candidates, _config, **_kwargs: [failed_record]
         )
+        candidate = {
+            "code": "000001",
+            "name": "平安银行",
+            "news_precheck": failed_record,
+            "news_available": False,
+            "news_tone_label": "不可用",
+        }
 
-        content, detail = module.parse_chat_completion_content(raw)
+        self.assertEqual(module.check_candidate_news_precheck([candidate]), "")
+        self.assertFalse(
+            module.news_precheck_record_has_decision_weight(failed_record)
+        )
+        self.assertEqual(module.candidate_news_tone_for_decision(candidate), "中性")
 
-        self.assertEqual(content, "- 000001 平安银行：消息稳定（中性）")
-        self.assertIn("sse_chunks=2", detail)
-        self.assertIn("finish_reason=stop", detail)
+    def test_valid_precheck_keeps_decision_weight(self):
+        module = import_trader_with_env({})
+        record = {
+            "checked": True,
+            "available": True,
+            "tone": "negative",
+            "tone_label": "利空",
+            "summary": "监管函提示风险（利空）",
+        }
+        candidate = {
+            "news_precheck": record,
+            "news_available": True,
+            "news_tone_label": "利空",
+        }
+
+        self.assertTrue(module.news_precheck_record_has_decision_weight(record))
+        self.assertEqual(module.candidate_news_tone_for_decision(candidate), "利空")
+
+    def test_enabled_precheck_requires_enabled_iwencai_and_key(self):
+        module = import_trader_with_env({
+            "IWENCAI_NEWS_PRECHECK_ENABLED": "1",
+            "IWENCAI_ENABLED": "0",
+        })
+
+        with self.assertRaisesRegex(RuntimeError, "source_disabled"):
+            module.load_news_precheck_config()
 
 
 if __name__ == "__main__":

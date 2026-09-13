@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from app.dashboard.apis.market_breadth import (
     DEFAULT_HISTORY_LIMIT,
@@ -112,6 +112,8 @@ class TencentMarketBreadthTests(unittest.TestCase):
         )
         self.assertEqual(quote_snapshot["market_snapshot"]["up"], 2)
         self.assertEqual(quote_snapshot["market_snapshot"]["down"], 1)
+        self.assertEqual(quote_snapshot["quotes"]["sh600001"]["upper_limit"], 11)
+        self.assertEqual(quote_snapshot["quotes"]["sh600001"]["lower_limit"], 9)
 
     def test_previous_market_turnover_uses_latest_common_prior_trading_day(self):
         bodies = {
@@ -261,6 +263,150 @@ class TencentMarketBreadthTests(unittest.TestCase):
 
 
 class MarketBreadthHistoryTests(unittest.TestCase):
+    def test_startup_recovery_waits_for_validation_then_runs_once(self):
+        class StopEvent:
+            def __init__(self):
+                self.waits = []
+
+            def is_set(self):
+                return False
+
+            def wait(self, timeout):
+                self.waits.append(timeout)
+                return False
+
+        stop_event = StopEvent()
+        runner = Mock(return_value="succeeded")
+        with patch.object(
+            dashboard,
+            "market_breadth_auto_recovery_state",
+            side_effect=[
+                {"status": "waiting_validation"},
+                {"status": "ready"},
+            ],
+        ), patch.object(dashboard, "invalidate_api_cache") as invalidate:
+            dashboard.market_breadth_auto_recovery_loop(
+                stop_event=stop_event,
+                poll_seconds=0.25,
+                runner=runner,
+            )
+
+        self.assertEqual(stop_event.waits, [0.25])
+        runner.assert_called_once_with()
+        invalidate.assert_called_once_with("market_breadth")
+
+    def test_startup_recovery_state_requires_a_safe_same_day_boundary(self):
+        with patch.object(
+            dashboard,
+            "is_a_share_trading_day_for_dashboard",
+            return_value=True,
+        ), patch.object(
+            dashboard,
+            "load_market_breadth_samples",
+            return_value=[
+                sample("2026-08-10 10:43:07"),
+                sample("2026-08-10 10:44:07"),
+                sample("2026-08-10 10:45:07"),
+            ],
+        ):
+            ready = dashboard.market_breadth_auto_recovery_state(
+                datetime(2026, 8, 10, 10, 45, 30),
+            )
+
+        self.assertEqual(ready["status"], "ready")
+        self.assertEqual(len(ready["validation_targets"]), 3)
+
+    def test_startup_recovery_waits_for_a_post_start_sample_before_planning(self):
+        with patch.object(
+            dashboard,
+            "is_a_share_trading_day_for_dashboard",
+            return_value=True,
+        ), patch.object(
+            dashboard,
+            "load_market_breadth_samples",
+            return_value=[sample("2026-08-10 10:00:00")],
+        ):
+            state = dashboard.market_breadth_auto_recovery_state(
+                datetime(2026, 8, 10, 11, 0, 0),
+                started_at=datetime(2026, 8, 10, 10, 59, 59),
+            )
+
+        self.assertEqual(state["status"], "waiting_startup_sample")
+
+    def test_startup_recovery_after_close_detects_a_terminal_gap(self):
+        with patch.object(
+            dashboard,
+            "is_a_share_trading_day_for_dashboard",
+            return_value=True,
+        ), patch.object(
+            dashboard,
+            "load_market_breadth_samples",
+            return_value=[
+                sample("2026-08-10 09:31:00"),
+                sample("2026-08-10 09:32:00"),
+                sample("2026-08-10 09:33:00"),
+            ],
+        ):
+            state = dashboard.market_breadth_auto_recovery_state(
+                datetime(2026, 8, 10, 15, 30, 0),
+                started_at=datetime(2026, 8, 10, 15, 29, 0),
+            )
+
+        self.assertEqual(state["status"], "ready")
+        self.assertEqual(
+            state["backfill_targets"][-1],
+            datetime(2026, 8, 10, 15, 0),
+        )
+
+    def test_startup_recovery_stops_after_bounded_failures(self):
+        class StopEvent:
+            def is_set(self):
+                return False
+
+            def wait(self, _timeout):
+                return False
+
+        runner = Mock(return_value="failed")
+        with patch.object(
+            dashboard,
+            "market_breadth_auto_recovery_state",
+            return_value={"status": "ready"},
+        ):
+            dashboard.market_breadth_auto_recovery_loop(
+                stop_event=StopEvent(),
+                runner=runner,
+            )
+
+        self.assertEqual(
+            runner.call_count,
+            dashboard.MARKET_BREADTH_AUTO_RECOVERY_MAX_ATTEMPTS,
+        )
+
+    def test_startup_recovery_process_is_bounded_and_cross_process_leased(self):
+        with tempfile.TemporaryDirectory(prefix="niuone-breadth-auto-recovery-") as temp_dir:
+            completed = Mock(returncode=0)
+            with patch.object(
+                dashboard,
+                "CRON_STATE_DIR",
+                Path(temp_dir),
+            ), patch.object(
+                dashboard.subprocess,
+                "run",
+                return_value=completed,
+            ) as run:
+                outcome = dashboard.run_market_breadth_auto_recovery_process(
+                    deadline_seconds=45,
+                    process_timeout_seconds=75,
+                )
+
+        self.assertEqual(outcome, "succeeded")
+        command = run.call_args.args[0]
+        self.assertEqual(command[1].endswith("recover_market_breadth_history.py"), True)
+        self.assertIn("--write", command)
+        self.assertEqual(run.call_args.kwargs["timeout"], 75)
+        self.assertEqual(run.call_args.kwargs["stdout"], dashboard.subprocess.DEVNULL)
+        self.assertEqual(run.call_args.kwargs["stderr"], dashboard.subprocess.DEVNULL)
+
     def test_default_thirty_second_history_retains_a_complete_trading_day(self):
         morning = datetime(2026, 7, 22, 9, 30)
         afternoon = datetime(2026, 7, 22, 13, 0)
@@ -317,7 +463,7 @@ class MarketBreadthHistoryTests(unittest.TestCase):
 
         self.assertEqual(stop_event.timeout, 30.0)
 
-    def test_daily_reset_retains_snapshots_until_nine_then_clears_them(self):
+    def test_daily_reset_archives_complete_breadth_curve_at_nine(self):
         original_breadth_file = dashboard.MARKET_BREADTH_HISTORY_FILE
         original_flow_file = dashboard.INDUSTRY_FLOW_HISTORY_FILE
         original_money_file = dashboard.MONEY_FLOW_SNAPSHOT_FILE
@@ -384,6 +530,9 @@ class MarketBreadthHistoryTests(unittest.TestCase):
                 self.assertFalse(repeated)
                 self.assertEqual(breadth["date"], "2026-07-23")
                 self.assertEqual(breadth["samples"], [])
+                self.assertEqual(breadth["previous_day"]["date"], "2026-07-22")
+                self.assertEqual(len(breadth["previous_day"]["samples"]), 1)
+                self.assertEqual(breadth["previous_day"]["samples"][0]["red"], 3000)
                 self.assertEqual(breadth["previous_turnover"]["date"], "2026-07-22")
                 self.assertEqual(len(breadth["previous_turnover"]["samples"]), 1)
                 self.assertEqual(
@@ -515,7 +664,120 @@ class MarketBreadthHistoryTests(unittest.TestCase):
             dashboard.MONEY_FLOW_SNAPSHOT_FILE = original_money_file
             dashboard.is_a_share_trading_day_for_dashboard = original_calendar
 
-    def test_apis_publish_yesterday_before_nine_and_clear_it_at_nine(self):
+    def test_daily_reset_restores_current_breadth_from_unusable_primary(self):
+        original_breadth_file = dashboard.MARKET_BREADTH_HISTORY_FILE
+        original_flow_file = dashboard.INDUSTRY_FLOW_HISTORY_FILE
+        original_money_file = dashboard.MONEY_FLOW_SNAPSHOT_FILE
+        try:
+            for failure_mode in ("missing", "corrupt", "empty"):
+                with self.subTest(failure_mode=failure_mode), tempfile.TemporaryDirectory(
+                    prefix="niuone-market-breadth-recover-"
+                ) as temp_dir:
+                    root = Path(temp_dir)
+                    dashboard.MARKET_BREADTH_HISTORY_FILE = root / "market_breadth.json"
+                    dashboard.INDUSTRY_FLOW_HISTORY_FILE = root / "industry_flow.json"
+                    dashboard.MONEY_FLOW_SNAPSHOT_FILE = root / "money_flow.json"
+                    dashboard.record_market_breadth_sample(
+                        sample("2026-07-23 10:00:00"),
+                        now=datetime(2026, 7, 23, 10, 0),
+                    )
+                    dashboard.record_market_breadth_sample(
+                        sample("2026-07-23 10:01:00", red=3100, green=1900),
+                        now=datetime(2026, 7, 23, 10, 1),
+                    )
+                    recovery_file = dashboard._market_breadth_history_recovery_file()
+                    mirrored = json.loads(recovery_file.read_text(encoding="utf-8"))
+
+                    if failure_mode == "missing":
+                        dashboard.MARKET_BREADTH_HISTORY_FILE.unlink()
+                    elif failure_mode == "corrupt":
+                        dashboard.MARKET_BREADTH_HISTORY_FILE.write_text(
+                            "{not-json", encoding="utf-8"
+                        )
+                    else:
+                        dashboard.MARKET_BREADTH_HISTORY_FILE.write_text(
+                            json.dumps(
+                                dashboard._empty_market_breadth_history("2026-07-23")
+                            ),
+                            encoding="utf-8",
+                        )
+
+                    changed = dashboard.reset_daily_market_histories(
+                        datetime(2026, 7, 23, 11, 0)
+                    )
+                    restored = json.loads(
+                        dashboard.MARKET_BREADTH_HISTORY_FILE.read_text(encoding="utf-8")
+                    )
+                    repeated = dashboard.reset_daily_market_histories(
+                        datetime(2026, 7, 23, 11, 1)
+                    )
+
+                    self.assertEqual(len(mirrored["samples"]), 2)
+                    self.assertTrue(changed)
+                    self.assertFalse(repeated)
+                    self.assertEqual(restored, mirrored)
+        finally:
+            dashboard.MARKET_BREADTH_HISTORY_FILE = original_breadth_file
+            dashboard.INDUSTRY_FLOW_HISTORY_FILE = original_flow_file
+            dashboard.MONEY_FLOW_SNAPSHOT_FILE = original_money_file
+
+    def test_next_breadth_sample_merges_richer_recovery_before_persisting(self):
+        original_breadth_file = dashboard.MARKET_BREADTH_HISTORY_FILE
+        original_flow_file = dashboard.INDUSTRY_FLOW_HISTORY_FILE
+        original_money_file = dashboard.MONEY_FLOW_SNAPSHOT_FILE
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix="niuone-market-breadth-append-recover-"
+            ) as temp_dir:
+                root = Path(temp_dir)
+                dashboard.MARKET_BREADTH_HISTORY_FILE = root / "market_breadth.json"
+                dashboard.INDUSTRY_FLOW_HISTORY_FILE = root / "industry_flow.json"
+                dashboard.MONEY_FLOW_SNAPSHOT_FILE = root / "money_flow.json"
+                dashboard.record_market_breadth_sample(
+                    sample("2026-07-23 10:00:00"),
+                    now=datetime(2026, 7, 23, 10, 0),
+                )
+                dashboard.record_market_breadth_sample(
+                    sample("2026-07-23 10:01:00", red=3100, green=1900),
+                    now=datetime(2026, 7, 23, 10, 1),
+                )
+                dashboard.MARKET_BREADTH_HISTORY_FILE.write_text(
+                    json.dumps(dashboard._empty_market_breadth_history("2026-07-23")),
+                    encoding="utf-8",
+                )
+
+                recorded = dashboard.record_market_breadth_sample(
+                    sample("2026-07-23 10:02:00", red=3200, green=1800),
+                    now=datetime(2026, 7, 23, 10, 2),
+                )
+                stored = json.loads(
+                    dashboard.MARKET_BREADTH_HISTORY_FILE.read_text(encoding="utf-8")
+                )
+                recovery = json.loads(
+                    dashboard._market_breadth_history_recovery_file().read_text(
+                        encoding="utf-8"
+                    )
+                )
+
+                expected_times = [
+                    "2026-07-23 10:00:00",
+                    "2026-07-23 10:01:00",
+                    "2026-07-23 10:02:00",
+                ]
+                self.assertEqual(
+                    [item["generated_at"] for item in recorded], expected_times
+                )
+                self.assertEqual(
+                    [item["generated_at"] for item in stored["samples"]],
+                    expected_times,
+                )
+                self.assertEqual(recovery, stored)
+        finally:
+            dashboard.MARKET_BREADTH_HISTORY_FILE = original_breadth_file
+            dashboard.INDUSTRY_FLOW_HISTORY_FILE = original_flow_file
+            dashboard.MONEY_FLOW_SNAPSHOT_FILE = original_money_file
+
+    def test_market_breadth_keeps_previous_curve_after_nine(self):
         original_breadth_file = dashboard.MARKET_BREADTH_HISTORY_FILE
         original_flow_file = dashboard.INDUSTRY_FLOW_HISTORY_FILE
         original_money_file = dashboard.MONEY_FLOW_SNAPSHOT_FILE
@@ -581,8 +843,13 @@ class MarketBreadthHistoryTests(unittest.TestCase):
                     flow_at_nine = dashboard.produce_industry_flow_data()
 
                 fetch_at_nine.assert_not_called()
-                self.assertFalse(breadth_at_nine["available"])
-                self.assertEqual(breadth_at_nine["timeline"], [])
+                self.assertTrue(breadth_at_nine["available"])
+                self.assertTrue(breadth_at_nine["displaying_previous_trading_day"])
+                self.assertEqual(breadth_at_nine["display_date"], "2026-07-22")
+                self.assertEqual(
+                    breadth_at_nine["timeline"][-1]["generated_at"],
+                    "2026-07-22 15:00:00",
+                )
                 self.assertFalse(flow_at_nine["available"])
                 self.assertEqual(flow_at_nine["nodes"], [])
                 self.assertEqual(flow_at_nine["timeline"], [])
@@ -632,7 +899,7 @@ class MarketBreadthHistoryTests(unittest.TestCase):
         self.assertEqual(next_day["date"], "2026-07-23")
         self.assertEqual(len(next_day["samples"]), 1)
 
-    def test_next_day_retains_only_previous_actual_turnover_curve(self):
+    def test_next_day_retains_previous_breadth_and_turnover_curves(self):
         history = append_market_breadth_sample({}, {
             **sample("2026-07-22 09:30:00"),
             "actual_turnover_yi": 100,
@@ -651,14 +918,95 @@ class MarketBreadthHistoryTests(unittest.TestCase):
             "actual_turnover_yi": 120,
         })
 
-        self.assertEqual(next_day["schema_version"], 4)
+        self.assertEqual(next_day["schema_version"], 5)
         self.assertEqual(len(next_day["samples"]), 1)
+        previous_day = next_day["previous_day"]
+        self.assertEqual(previous_day["date"], "2026-07-22")
+        self.assertEqual(len(previous_day["samples"]), 2)
+        self.assertEqual(previous_day["samples"][0]["red"], 3000)
+        self.assertEqual(previous_day["samples"][-1]["actual_turnover_yi"], 220)
         previous = next_day["previous_turnover"]
         self.assertEqual(previous["date"], "2026-07-22")
         self.assertEqual(previous["source"], "测试分钟线")
         self.assertEqual(len(previous["samples"]), 2)
         self.assertNotIn("red", previous["samples"][0])
         self.assertEqual(previous["samples"][-1]["actual_turnover_yi"], 220)
+
+    def test_previous_breadth_survives_consecutive_closed_day_rolls(self):
+        friday = append_market_breadth_sample(
+            {},
+            sample("2026-07-24 15:00:00", red=3400, green=1600),
+        )
+
+        saturday = dashboard.roll_market_breadth_history(friday, "2026-07-25")
+        sunday = dashboard.roll_market_breadth_history(saturday, "2026-07-26")
+        monday = dashboard.roll_market_breadth_history(sunday, "2026-07-27")
+
+        self.assertEqual(monday["samples"], [])
+        self.assertEqual(monday["previous_day"]["date"], "2026-07-24")
+        self.assertEqual(
+            monday["previous_day"]["samples"][-1]["generated_at"],
+            "2026-07-24 15:00:00",
+        )
+        self.assertEqual(monday["previous_day"]["samples"][-1]["red"], 3400)
+
+    def test_money_flow_uses_previous_trading_day_recovery_when_refresh_is_empty(self):
+        original_industry_file = dashboard.INDUSTRY_FLOW_HISTORY_FILE
+        original_money_file = dashboard.MONEY_FLOW_SNAPSHOT_FILE
+        original_runner = dashboard.run_dashboard_helper
+        original_clock = dashboard.current_cn_datetime
+        original_calendar = dashboard.dashboard_trading_day_status
+        try:
+            with tempfile.TemporaryDirectory(prefix="niuone-money-flow-previous-") as temp_dir:
+                root = Path(temp_dir)
+                dashboard.INDUSTRY_FLOW_HISTORY_FILE = root / "industry_flow.json"
+                dashboard.MONEY_FLOW_SNAPSHOT_FILE = root / "money_flow.json"
+                dashboard.INDUSTRY_FLOW_HISTORY_FILE.write_text(json.dumps({
+                    "date": "2026-07-26",
+                    "samples": [],
+                }), encoding="utf-8")
+                dashboard._industry_flow_history_recovery_file().write_text(json.dumps({
+                    "date": "2026-07-24",
+                    "samples": [{
+                        "generated_at": "2026-07-24 15:00:00",
+                        "items": [
+                            {"name": "半导体", "net_flow_yi": 12},
+                            {"name": "软件开发", "net_flow_yi": 8},
+                            {"name": "银行", "net_flow_yi": -6},
+                        ],
+                    }],
+                }), encoding="utf-8")
+                dashboard.run_dashboard_helper = lambda *_args, **_kwargs: {
+                    "inflow": [],
+                    "outflow": [],
+                    "error": "upstream unavailable",
+                }
+                dashboard.current_cn_datetime = lambda: datetime(2026, 7, 26, 10, 0)
+                dashboard.dashboard_trading_day_status = lambda _now=None: {
+                    "date": "2026-07-26",
+                    "is_trading_day": False,
+                    "previous_trading_day": "2026-07-24",
+                }
+
+                payload = dashboard.produce_money_flow_data()
+
+                self.assertTrue(payload["displaying_previous_trading_day"])
+                self.assertTrue(payload["displaying_historical_data"])
+                self.assertEqual(payload["display_date"], "2026-07-24")
+                self.assertEqual(
+                    [row["name"] for row in payload["inflow"]],
+                    ["半导体", "软件开发"],
+                )
+                self.assertEqual(payload["outflow"][0]["name"], "银行")
+                self.assertEqual(payload["inflow"][0]["net_flow_yi"], 12)
+                self.assertTrue(payload["stale_cache"])
+                self.assertEqual(payload["error"], "upstream unavailable")
+        finally:
+            dashboard.INDUSTRY_FLOW_HISTORY_FILE = original_industry_file
+            dashboard.MONEY_FLOW_SNAPSHOT_FILE = original_money_file
+            dashboard.run_dashboard_helper = original_runner
+            dashboard.current_cn_datetime = original_clock
+            dashboard.dashboard_trading_day_status = original_calendar
 
     def test_invalid_or_lunch_samples_never_replace_valid_history(self):
         history = append_market_breadth_sample({}, sample("2026-07-22 10:00:00"))
@@ -912,6 +1260,36 @@ class MarketBreadthHistoryTests(unittest.TestCase):
                 self.assertIn("TimeoutError", payload["error"])
                 self.assertEqual(payload["latest"]["red"], 3456)
                 self.assertEqual(payload["latest"]["green"], 1544)
+        finally:
+            dashboard.MARKET_BREADTH_HISTORY_FILE = original_history_file
+
+    def test_previous_curve_recovers_when_active_history_loses_its_archive(self):
+        original_history_file = dashboard.MARKET_BREADTH_HISTORY_FILE
+        try:
+            with tempfile.TemporaryDirectory(prefix="niuone-market-breadth-recovery-") as temp_dir:
+                history_file = Path(temp_dir) / "history.json"
+                dashboard.MARKET_BREADTH_HISTORY_FILE = history_file
+                dashboard.record_market_breadth_sample(
+                    sample("2026-07-24 09:30:00", red=2800, green=2200),
+                    now=datetime(2026, 7, 24, 9, 30),
+                )
+                dashboard.record_market_breadth_sample(
+                    sample("2026-07-24 15:00:00", red=3400, green=1600),
+                    now=datetime(2026, 7, 24, 15, 0),
+                )
+                recovery_file = dashboard._market_breadth_history_recovery_file()
+                self.assertTrue(recovery_file.exists())
+
+                history_file.write_text(json.dumps(
+                    dashboard.roll_market_breadth_history(None, "2026-07-26"),
+                ), encoding="utf-8")
+                recovered = dashboard.load_previous_market_breadth_samples(
+                    now=datetime(2026, 7, 26, 12, 0),
+                )
+
+                self.assertEqual(len(recovered), 2)
+                self.assertEqual(recovered[0]["generated_at"], "2026-07-24 09:30:00")
+                self.assertEqual(recovered[-1]["red"], 3400)
         finally:
             dashboard.MARKET_BREADTH_HISTORY_FILE = original_history_file
 

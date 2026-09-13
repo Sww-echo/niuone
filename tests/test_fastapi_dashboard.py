@@ -2,6 +2,7 @@
 import json
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -9,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from app.dashboard.fastapi_app import _legacy_module, create_app
 from app.dashboard.routers.market import compact_industry_flow_payload
-from app.dashboard.routers.messages import message_page_payload, messages_revision_payload
+from app.dashboard.routers.messages import messages_revision_payload
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -83,7 +84,7 @@ class FastApiDashboardTests(unittest.TestCase):
 
     def test_vue_dashboard_and_admin_share_the_fastapi_port(self):
         for path in (
-            "/", "/practice", "/technical-analysis", "/niuone-mainline", "/admin",
+            "/", "/candidates", "/practice", "/technical-analysis", "/watchlist", "/niuone-mainline", "/admin",
             "/admin/settings/notifications", "/admin/backtest/niuone",
         ):
             with self.subTest(path=path):
@@ -97,9 +98,52 @@ class FastApiDashboardTests(unittest.TestCase):
         missing = self.client.get("/admin/settings/not-a-group")
         self.assertEqual(missing.status_code, 404)
 
+        for removed_path in ("/x-monitor", "/api/x_media"):
+            with self.subTest(removed_path=removed_path):
+                self.assertEqual(self.client.get(removed_path).status_code, 404)
+
         asset = self.client.get("/assets/app.js")
         self.assertEqual(asset.status_code, 200)
         self.assertIn("immutable", asset.headers["Cache-Control"])
+
+    def test_lifespan_starts_market_breadth_auto_recovery(self):
+        startup_names = (
+            "ensure_stats_db",
+            "get_or_create_admin_token",
+            "restore_practice_manual_cycle_state",
+            "start_b1_scheduler",
+            "start_kline_prewarm_scheduler",
+            "start_pending_decision_executor",
+            "start_practice_equity_heartbeat",
+            "start_daily_market_history_reset",
+            "start_market_breadth_sampler",
+            "start_market_breadth_auto_recovery",
+            "start_industry_flow_sampler",
+        )
+        with ExitStack() as stack:
+            mocks = {
+                name: stack.enter_context(patch.object(self.legacy, name))
+                for name in startup_names
+            }
+            stack.enter_context(patch.object(
+                self.legacy.push_history,
+                "connect",
+                return_value=Mock(),
+            ))
+            stack.enter_context(patch.dict(
+                "os.environ",
+                {"DASHBOARD_PUBLIC_PROJECTION_ENABLED": "0"},
+            ))
+            app = create_app(
+                legacy_module=self.legacy,
+                web_dist_dir=self.dist,
+                enable_background_services=True,
+            )
+            with TestClient(app) as client:
+                self.assertEqual(client.get("/healthz").status_code, 200)
+
+        mocks["start_market_breadth_sampler"].assert_called_once_with()
+        mocks["start_market_breadth_auto_recovery"].assert_called_once_with()
 
     def test_native_snapshot_routes_support_etag_and_health_metadata(self):
         health = self.client.get("/healthz")
@@ -183,8 +227,6 @@ class FastApiDashboardTests(unittest.TestCase):
         message_payload = {
             "categories": {
                 "market_monitor": {"label": "盘面监控", "count": 6},
-                "x_monitor": {"label": "推特监控", "count": 108},
-                "us_ratings": {"label": "美股机构买入评级", "count": 4},
                 "other": {"label": "其他", "count": 3},
             },
         }
@@ -207,7 +249,7 @@ class FastApiDashboardTests(unittest.TestCase):
         )
         self.assertEqual(
             first.json()["message_counts"],
-            {"market_monitor": 6, "x_monitor": 108, "us_ratings": 4},
+            {"market_monitor": 6},
         )
         self.assertIs(first.json()["message_counts_available"], True)
         self.assertIn(f"{self.legacy.VISITOR_COOKIE_NAME}=nvst_", first.headers["Set-Cookie"])
@@ -221,20 +263,17 @@ class FastApiDashboardTests(unittest.TestCase):
         merge_records.assert_called_with(limit=0)
 
     def test_dashboard_bootstrap_degrades_when_message_counts_are_unavailable(self):
-        with (
-            patch.object(
-                self.legacy,
-                "merge_records_from_db",
-                side_effect=RuntimeError("message store unavailable"),
-            ),
-            patch.object(self.legacy, "us_features_enabled", return_value=True),
+        with patch.object(
+            self.legacy,
+            "merge_records_from_db",
+            side_effect=RuntimeError("message store unavailable"),
         ):
             response = self.client.get("/api/dashboard/bootstrap")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["visits"], 1)
         self.assertEqual(response.json()["unique"], 1)
-        self.assertIs(response.json()["us_features_enabled"], True)
+        self.assertNotIn("us_features_enabled", response.json())
         self.assertEqual(response.json()["message_counts"], {})
         self.assertIs(response.json()["message_counts_available"], False)
 
@@ -261,21 +300,20 @@ class FastApiDashboardTests(unittest.TestCase):
                 ),
             }
             for path, cache_key in (
-                ("/api/messages?limit=25&offset=50&category=x_monitor", "messages:v4:x_monitor:25:50"),
+                ("/api/messages?limit=25&offset=50&category=market_monitor", "messages:v4:market_monitor:25:50"),
                 (
                     "/api/messages/revision?category=market_monitor",
                     "messages-revision:v1:market_monitor",
                 ),
-                (
-                    "/api/messages/revision?category=x_monitor&limit=10&offset=20",
-                    "messages-revision:v2:x_monitor:10:20",
-                ),
+                ("/api/realtime-news", "realtime_news:v1"),
                 (
                     "/api/iwencai/dragon-tiger?date=2026-07-16&page=2&limit=10",
                     "iwencai_dragon_tiger:2026-07-16:2:10:0:0:0",
                 ),
                 ("/api/practice_candidates", "practice_candidates"),
                 ("/api/b1_screen", "practice_candidates"),
+                ("/api/today_candidates", "today_candidates"),
+                ("/api/today_candidates/intraday", "today_candidate_intraday"),
                 ("/api/niuone/mainline", "niuone_mainline"),
                 ("/api/niuniu_practice?fast=1", "niuniu_practice_fast:v2"),
                 ("/api/niuniu_practice", "niuniu_practice"),
@@ -285,8 +323,6 @@ class FastApiDashboardTests(unittest.TestCase):
                 ("/api/sectors", "sectors"),
                 ("/api/hot_stocks?sort_by=turnover", "hot_stocks:turnover"),
                 ("/api/hot_stocks?sort_by=not-valid", "hot_stocks:amount"),
-                ("/api/us_quotes?symbols=AAPL,msft,bad%24", "us_quotes:AAPL,MSFT"),
-                ("/api/us_profiles?symbols=NVDA,amd", "us_profiles:NVDA,AMD"),
                 ("/api/us_market_summary", "us_market_summary"),
                 ("/api/us_sectors", "us_sectors"),
                 ("/api/money_flow", "money_flow"),
@@ -320,12 +356,14 @@ class FastApiDashboardTests(unittest.TestCase):
 
         self.assertEqual(reset_daily.call_count, 4)
         self.assertEqual(seen_keys, [
-            "messages:v4:x_monitor:25:50",
+            "messages:v4:market_monitor:25:50",
             "messages-revision:v1:market_monitor",
-            "messages-revision:v2:x_monitor:10:20",
+            "realtime_news:v1",
             "iwencai_dragon_tiger:2026-07-16:2:10:0:0:0",
             "practice_candidates",
             "practice_candidates",
+            "today_candidates",
+            "today_candidate_intraday",
             "niuone_mainline",
             "niuniu_practice_fast:v2",
             "niuniu_practice",
@@ -335,8 +373,6 @@ class FastApiDashboardTests(unittest.TestCase):
             "sectors",
             "hot_stocks:turnover",
             "hot_stocks:amount",
-            "us_quotes:AAPL,MSFT",
-            "us_profiles:NVDA,AMD",
             "us_market_summary",
             "us_sectors",
             "money_flow",
@@ -346,7 +382,16 @@ class FastApiDashboardTests(unittest.TestCase):
         ])
         self.assertEqual(
             non_cacheable_keys,
-            ["us_sectors", "money_flow", "industry_flow", "industry_flow:compact:v1"],
+            [
+                "indices",
+                "sectors",
+                "hot_stocks:turnover",
+                "hot_stocks:amount",
+                "us_sectors",
+                "money_flow",
+                "industry_flow",
+                "industry_flow:compact:v1",
+            ],
         )
         self.assertEqual(head.status_code, 200)
         self.assertEqual(head.content, b"")
@@ -455,59 +500,6 @@ class FastApiDashboardTests(unittest.TestCase):
         self.assertNotIn("content", revision["latest"])
         self.assertNotIn("records", revision)
 
-        page_payload = {
-            "categories": {"x_monitor": {"count": 21}},
-            "records": [{
-                "id": "page-id",
-                "timestamp": 1784619500.0,
-                "content_hash": "page-hash",
-                "updated_at": "2026-07-21 15:30:00",
-                "metadata": {"post": {"media": [{"url": "https://pbs.twimg.com/media/a.jpg"}]}},
-                "content": "page body",
-            }],
-        }
-        page_revision = messages_revision_payload(
-            page_payload,
-            "x_monitor",
-            page_limit=10,
-            page_offset=20,
-        )
-        changed_payload = json.loads(json.dumps(page_payload))
-        changed_payload["records"][0]["metadata"]["post"]["media"][0]["url"] = (
-            "https://pbs.twimg.com/media/b.jpg"
-        )
-        changed_revision = messages_revision_payload(
-            changed_payload,
-            "x_monitor",
-            page_limit=10,
-            page_offset=20,
-        )
-
-        self.assertEqual(page_revision["page"]["limit"], 10)
-        self.assertEqual(page_revision["page"]["offset"], 20)
-        self.assertEqual(page_revision["page"]["count"], 1)
-        self.assertEqual(len(page_revision["page"]["fingerprint"]), 64)
-        self.assertNotEqual(
-            page_revision["page"]["fingerprint"],
-            changed_revision["page"]["fingerprint"],
-        )
-        self.assertNotIn("metadata", page_revision["latest"])
-
-        full_page = message_page_payload(
-            page_payload,
-            "x_monitor",
-            limit=10,
-            offset=20,
-        )
-        ordinary_page = message_page_payload(
-            page_payload,
-            "market_monitor",
-            limit=10,
-            offset=0,
-        )
-        self.assertEqual(full_page["revision"]["page"]["fingerprint"], page_revision["page"]["fingerprint"])
-        self.assertIs(ordinary_page, page_payload)
-
         missing = self.client.get("/api/messages/revision")
         self.assertEqual(missing.status_code, 400)
         self.assertEqual(missing.json()["error"], "message_category_required")
@@ -561,17 +553,12 @@ class FastApiDashboardTests(unittest.TestCase):
         self.assertNotIn("volume_model", payload["sampling"])
         self.assertTrue(payload["stale_cache"])
 
-    def test_native_media_and_practice_status_routes_bypass_the_adapter(self):
+    def test_native_practice_status_routes_bypass_the_adapter(self):
         (self.legacy.CRON_OUTPUT_DIR / "daily_evolution_report.json").write_text(
             json.dumps({"available": True}),
             encoding="utf-8",
         )
         with (
-            patch.object(
-                self.legacy,
-                "fetch_x_media",
-                return_value=(b"image-bytes", "image/png"),
-            ) as media,
             patch.object(
                 self.legacy,
                 "practice_manual_cycle_status",
@@ -588,19 +575,11 @@ class FastApiDashboardTests(unittest.TestCase):
                 return_value={"enabled": True},
             ) as self_optimize,
         ):
-            media_response = self.client.get(
-                "/api/x_media?url=https%3A%2F%2Fpbs.twimg.com%2Fmedia%2Fexample.jpg"
-            )
             manual_response = self.client.get("/api/niuniu_practice/manual-cycle")
             summary_response = self.client.get("/api/niuniu_practice/market-summary")
             optimize_response = self.client.get("/api/self_optimize/status")
             evolution_response = self.client.get("/api/daily_evolution")
 
-        self.assertEqual(media_response.status_code, 200)
-        self.assertEqual(media_response.content, b"image-bytes")
-        self.assertEqual(media_response.headers["Content-Type"], "image/png")
-        self.assertIn("immutable", media_response.headers["Cache-Control"])
-        media.assert_called_once_with("https://pbs.twimg.com/media/example.jpg")
         self.assertEqual(manual_response.json(), {"running": False})
         self.assertEqual(summary_response.json(), {"available": True})
         self.assertEqual(optimize_response.json(), {"enabled": True})
@@ -797,7 +776,7 @@ class FastApiDashboardTests(unittest.TestCase):
             patch.object(
                 self.legacy,
                 "admin_visible_env_names",
-                return_value=["DASHBOARD_PRACTICE_SCHEDULE_TIMES"],
+                return_value=["DASHBOARD_PRACTICE_SCHEDULE_TIMES", "NEWSNOW_SOURCES"],
             ),
             patch.object(
                 self.legacy,
@@ -826,6 +805,8 @@ class FastApiDashboardTests(unittest.TestCase):
                 content=(
                     "env__DASHBOARD_PRACTICE_SCHEDULE_TIMES=09%3A30&"
                     "env__DASHBOARD_PRACTICE_SCHEDULE_TIMES=10%3A00&"
+                    "env__NEWSNOW_SOURCES=cls-telegraph&"
+                    "env__NEWSNOW_SOURCES=wallstreetcn-quick&"
                     "env__NOT_ALLOWED=ignored&notification_remove__telegram=1"
                 ),
                 headers={
@@ -843,7 +824,10 @@ class FastApiDashboardTests(unittest.TestCase):
         self.assertTrue(response.json()["ok"])
         self.assertEqual(response.json()["restart"]["skipped"], "hot_applied")
         self.assertEqual(response.json()["config"], {"items": []})
-        expected_updates = {"DASHBOARD_PRACTICE_SCHEDULE_TIMES": "09:30,10:00"}
+        expected_updates = {
+            "DASHBOARD_PRACTICE_SCHEDULE_TIMES": "09:30,10:00",
+            "NEWSNOW_SOURCES": "cls-telegraph,wallstreetcn-quick",
+        }
         normalize.assert_called_once_with(expected_updates)
         validate.assert_called_once_with(expected_updates)
         removed.assert_called_once_with({"telegram"})
@@ -864,7 +848,7 @@ class FastApiDashboardTests(unittest.TestCase):
             patch.object(
                 self.legacy,
                 "model_test_override_names",
-                return_value={"DASHBOARD_GROK_API_KEY"},
+                return_value={"A_SHARE_MODEL_SUMMARY_API_KEY"},
             ),
             patch.object(
                 self.legacy,
@@ -889,7 +873,12 @@ class FastApiDashboardTests(unittest.TestCase):
             )
             model_response = self.client.post(
                 "/api/admin/models/test",
-                content="target=grok-model&env__DASHBOARD_GROK_API_KEY=key&env__IGNORED=secret",
+                content="target=a-share-summary-model&env__A_SHARE_MODEL_SUMMARY_API_KEY=key&env__IGNORED=secret",
+                headers=action_headers,
+            )
+            data_source_response = self.client.post(
+                "/api/admin/data-sources/test",
+                content="target=removed",
                 headers=action_headers,
             )
             notification_response = self.client.post(
@@ -903,13 +892,14 @@ class FastApiDashboardTests(unittest.TestCase):
 
         self.assertEqual(iwencai_response.json()["message"], "iwencai")
         self.assertEqual(model_response.json()["message"], "model")
+        self.assertEqual(data_source_response.status_code, 404)
         self.assertEqual(notification_response.json()["message"], "notification")
         iwencai.assert_called_once_with(
             {"IWENCAI_BASE_URL": "https://example.test"}
         )
         model.assert_called_once_with(
-            "grok-model",
-            {"DASHBOARD_GROK_API_KEY": "key"},
+            "a-share-summary-model",
+            {"A_SHARE_MODEL_SUMMARY_API_KEY": "key"},
         )
         notification.assert_called_once_with(
             "telegram",
@@ -1022,7 +1012,11 @@ class FastApiDashboardTests(unittest.TestCase):
         self.assertEqual(market_summary.call_count, 2)
         trader.resume_trading.assert_called_once_with()
         optimize.assert_called_once_with()
-        invalidate.assert_any_call(self.legacy.PRACTICE_CANDIDATES_CACHE_KEY)
+        invalidate.assert_any_call(
+            self.legacy.PRACTICE_CANDIDATES_CACHE_KEY,
+            self.legacy.TODAY_CANDIDATES_CACHE_KEY,
+            self.legacy.TODAY_CANDIDATE_INTRADAY_CACHE_KEY,
+        )
         invalidate.assert_any_call("niuniu_practice", self.legacy.PRACTICE_FAST_CACHE_KEY)
 
     def test_niuone_mainline_manual_refresh_requires_admin(self):
@@ -1089,7 +1083,13 @@ class FastApiDashboardTests(unittest.TestCase):
             "const width = chartWidth.value",
             component,
         )
-        self.assertIn("const compact = width < 560", component)
+        self.assertIn(
+            "const compact = width < 560 || (props.terminal && !supportsHover.value)",
+            component,
+        )
+        self.assertIn("const FINE_POINTER_QUERY = '(hover: hover) and (pointer: fine)'", component)
+        self.assertIn("finePointerMediaQuery.addEventListener('change', syncHoverCapability)", component)
+        self.assertIn("finePointerMediaQuery?.removeEventListener('change', syncHoverCapability)", component)
         self.assertIn(
             "const baseHeight = showSentiment && showVolume.value ? (compact ? 280 : 330)",
             component,
@@ -1122,7 +1122,10 @@ class FastApiDashboardTests(unittest.TestCase):
         self.assertIn("chartWidth.value = Math.max(300, availableWidth)", component)
         self.assertIn("const activeSample = computed(() =>", component)
         self.assertIn("|| current.samples.at(-1)", component)
-        self.assertIn('v-if="activeSample"', component)
+        self.assertIn(
+            'v-if="activeSample && (!terminal || chart.compact || hoveredAt)"',
+            component,
+        )
         self.assertIn("label: '较昨日同期差', compactLabel: '同期差'", component)
         self.assertNotIn("同时点量能差", component)
         self.assertIn("group: 'volume', emphasized: true", component)
@@ -1131,17 +1134,23 @@ class FastApiDashboardTests(unittest.TestCase):
         self.assertIn("--market-breadth-same-time-delta:#f472b6;", stylesheet)
         self.assertIn("--market-breadth-same-time-delta:#be185d;", stylesheet)
         self.assertIn("--market-breadth-previous-turnover:#64748b;", stylesheet)
+        self.assertIn("const margin = compact", component)
         self.assertIn("? { top: showVolume.value ? 74 : 42, right: 38", component)
         self.assertIn("compactDisplayValue: formatCompactSeriesValue", component)
         self.assertIn("...rows.filter(row => row.group === 'breadth')", component)
         self.assertIn("compactVolumeRows: rows.filter(row => row.group === 'volume')", component)
-        self.assertIn('v-if="!chart.compact"', component)
+        self.assertIn('v-if="!chart.compact && !terminal"', component)
         self.assertIn('v-if="chart.compact && activeSample"', component)
+        self.assertIn('v-if="terminal && !chart.compact && hoveredAt && activeSample"', component)
+        self.assertIn("class=\"market-breadth-desktop-tooltip\"", component)
+        self.assertIn("left: `${chart.margin.left / chart.width * 100}%`", component)
+        self.assertIn("right: `${chart.margin.right / chart.width * 100}%`", component)
         self.assertIn('v-for="row in activeSample.compactVolumeRows"', component)
         self.assertIn("market-breadth-compact-tooltip-count-item", component)
         self.assertIn("market-breadth-compact-tooltip-volume-item", component)
         self.assertIn(".market-breadth-compact-tooltip { position:absolute;", stylesheet)
-        self.assertIn("grid-template-columns:44px repeat(5,minmax(0,1fr));", stylesheet)
+        self.assertIn(".market-breadth-desktop-tooltip { position:absolute;", stylesheet)
+        self.assertIn("grid-template-columns:minmax(38px,.85fr) repeat(5,minmax(0,1fr));", stylesheet)
         self.assertNotIn("market-breadth-compact-tooltip-row", component + stylesheet)
         self.assertNotIn("spreadEndLabels", component)
         self.assertNotIn("chart.endLabels", component)
@@ -1180,7 +1189,7 @@ class FastApiDashboardTests(unittest.TestCase):
         self.assertIn(".dashboard-info-trigger:hover { color:#eef2ff;", stylesheet)
         self.assertIn(".dashboard-info-trigger:focus-visible {", stylesheet)
         self.assertIn(
-            'html:not([data-theme="dark"]) .dashboard-info-trigger { --dashboard-info-color:#315aa8;',
+            'html[data-theme="light"] .dashboard-info-trigger { --dashboard-info-color:#315aa8;',
             stylesheet,
         )
         self.assertIn('html[data-theme="dark"] .dashboard-info-trigger {', stylesheet)
@@ -1275,31 +1284,105 @@ class FastApiDashboardTests(unittest.TestCase):
         self.assertIn("同花顺问财归纳，仅供研究参考", component)
         self.assertIn('aria-label="上榜理由"', component)
         self.assertIn(
-            'html:not([data-theme="dark"]) .dragon-tiger-limit-up-reason '
-            "{ border-color:#efc9c5; border-left-color:#c43d35; "
-            "background:#fff7f6; }",
+            'html[data-theme="light"] .dragon-tiger-limit-up-reason '
+            "{ border-color:#e4b7b3; background:#fff; }",
             stylesheet,
         )
         self.assertIn(
-            'html:not([data-theme="dark"]) .dragon-tiger-limit-up-reason p '
+            'html[data-theme="light"] .dragon-tiger-limit-up-reason p '
             "{ color:#344054; }",
             stylesheet,
         )
         self.assertIn(
-            'html:not([data-theme="dark"]) .dragon-tiger-limit-up-reason > small '
+            'html[data-theme="light"] .dragon-tiger-limit-up-reason > small '
             "{ color:#667085; }",
             stylesheet,
         )
         self.assertIn(
-            'html:not([data-theme="dark"]) .dragon-tiger-status.querying '
+            'html[data-theme="light"] .dragon-tiger-status.querying '
             "{ border-color:#b9c9ea; background:#edf3ff; color:#214b9c; }",
             stylesheet,
         )
         self.assertIn(
-            'html:not([data-theme="dark"]) '
+            'html[data-theme="light"] '
             ".dragon-tiger-continuous-tooltip-head em.negative "
             "{ border-color:#b9dfd0; background:#eff9f5; color:#087052; }",
             stylesheet,
+        )
+
+    def test_dragon_tiger_expanded_view_uses_terminal_report_layout(self):
+        component = (
+            ROOT / "web" / "src" / "components" / "DragonTigerPanel.vue"
+        ).read_text(encoding="utf-8")
+        stylesheet = (ROOT / "frontend" / "dashboard.css").read_text(
+            encoding="utf-8"
+        )
+        tongdaxin_styles = (
+            ROOT / "frontend" / "tongdaxin-theme.css"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('class="dragon-tiger-analysis-grid"', component)
+        self.assertIn("function reasonRank(index)", component)
+        self.assertIn("{{ reasonRank(index) }}", component)
+        self.assertNotIn("directionalNewsTone(item) === 'positive' ? '✦' : '▼'", component)
+        self.assertIn(
+            ".dragon-tiger-seat-record { display:grid; "
+            "grid-template-columns:minmax(170px,1.7fr) "
+            "repeat(3,minmax(64px,.58fr)); min-width:0; }",
+            stylesheet,
+        )
+        self.assertIn(".dragon-tiger-seat-values { display:contents; }", stylesheet)
+        self.assertIn(
+            ".dragon-tiger-detail-record { border:0; border-radius:0;",
+            stylesheet,
+        )
+        self.assertIn(
+            'html[data-theme="tongdaxin"]:root '
+            ":where(.dragon-tiger-reasons,.dragon-tiger-funds,.dragon-tiger-seats)",
+            tongdaxin_styles,
+        )
+        self.assertIn(
+            ".dragon-tiger-seat-record { display:block; padding:6px 7px; }",
+            stylesheet,
+        )
+
+    def test_tongdaxin_dragon_tiger_uses_dense_quote_terminal_rows(self):
+        component = (
+            ROOT / "web" / "src" / "components" / "DragonTigerPanel.vue"
+        ).read_text(encoding="utf-8")
+        stylesheet = (ROOT / "frontend" / "dashboard.css").read_text(
+            encoding="utf-8"
+        )
+        tongdaxin_styles = (
+            ROOT / "frontend" / "tongdaxin-theme.css"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("function shortCode(value)", component)
+        self.assertIn(
+            'class="dragon-tiger-list-code">{{ shortCode(item.code) }}',
+            component,
+        )
+        self.assertIn(".dragon-tiger-list-code { display:none; }", stylesheet)
+        self.assertIn("content:'代码 / 名称';", tongdaxin_styles)
+        self.assertIn(
+            ".dragon-tiger-item:nth-of-type(even) { "
+            "background:var(--terminal-row-alt); }",
+            tongdaxin_styles,
+        )
+        self.assertIn("background:var(--terminal-selection);", tongdaxin_styles)
+        self.assertIn("content:'+';", tongdaxin_styles)
+        self.assertIn("content:'\\2212';", tongdaxin_styles)
+        self.assertIn(
+            ".dragon-tiger-list-code {\n  display:inline-block;",
+            tongdaxin_styles,
+        )
+        self.assertIn(
+            ".dragon-tiger-detail-values > span {\n  display:flex;",
+            tongdaxin_styles,
+        )
+        self.assertIn(
+            ".dragon-tiger-seat-record:nth-child(even) { background:#090909; }",
+            tongdaxin_styles,
         )
 
     def test_dragon_tiger_collapsed_rows_color_limit_up_reason_names(self):
@@ -1320,7 +1403,7 @@ class FastApiDashboardTests(unittest.TestCase):
             stylesheet,
         )
         self.assertIn(
-            'html:not([data-theme="dark"]) '
+            'html[data-theme="light"] '
             ".dragon-tiger-name-has-limit-up-reason { color:#a8173a;",
             stylesheet,
         )
@@ -1393,8 +1476,9 @@ class FastApiDashboardTests(unittest.TestCase):
         self.assertIn(".dragon-tiger-continuous-tooltip-summary", stylesheet)
         self.assertNotIn("continuousTooltip.note", component)
         self.assertNotIn("代码 名称：", component)
-        self.assertIn("公开检索：公告/财经媒体 · 雪球 · X · 最近 3 天", component)
-        self.assertIn("公开检索：最近 3 天", component)
+        self.assertIn("同花顺问财：公告 · 新闻 · 事件 · 最近 3 天", component)
+        self.assertIn("同花顺问财：最近 3 天", component)
+        self.assertNotIn("公开检索：公告/财经媒体 · 雪球 · X · 最近 3 天", component)
         self.assertIn("核心消息", component)
         self.assertIn("直接影响", component)
         self.assertIn("continuousTooltip.impact", component)
@@ -1460,7 +1544,7 @@ class FastApiDashboardTests(unittest.TestCase):
         router_dir = ROOT / "app" / "dashboard" / "routers"
         router_sources = {
             name: (router_dir / f"{name}.py").read_text(encoding="utf-8")
-            for name in ("system", "messages", "market", "practice", "admin")
+            for name in ("system", "messages", "realtime_news", "market", "practice", "admin")
         }
 
         self.assertNotIn('@app.api_route("/api/', composition)
@@ -1483,6 +1567,7 @@ class FastApiDashboardTests(unittest.TestCase):
         for name, route in (
             ("system", "/api/v2/public/latest"),
             ("messages", "/api/messages/revision"),
+            ("realtime_news", "/api/realtime-news"),
             ("market", "/api/industry-flow"),
             ("practice", "/api/niuniu_practice"),
             ("admin", "/api/admin/config"),

@@ -19,7 +19,13 @@ from urllib.parse import quote
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from core.model_api import build_model_request, request_model
+from core.model_api import build_model_request, request_model_complete
+from core.shared_model_config import (
+    LEGACY_SUMMARY_MODEL_ENV_NAMES,
+    SHARED_MODEL_ENV_NAMES,
+    load_crossdesk_provider,
+    resolve_shared_model_config,
+)
 from niuone_paths import get_dashboard_env_file, get_dashboard_home
 
 CN_TZ = ZoneInfo("Asia/Shanghai")
@@ -169,20 +175,11 @@ US_SECTOR_PROXY_DEFS: list[dict[str, Any]] = [
 
 def load_dashboard_env() -> None:
     allowed = {
-        "DASHBOARD_GROK_MODEL",
-        "DASHBOARD_GROK_CONTEXT_LENGTH",
-        "DASHBOARD_GROK_BASE_URL",
-        "DASHBOARD_GROK_API_KEY",
-        "US_MARKET_SUMMARY_MODEL",
-        "US_MARKET_SUMMARY_CONTEXT_LENGTH",
         "US_MARKET_SUMMARY_MAX_TOKENS",
-        "US_MARKET_SUMMARY_BASE_URL",
-        "US_MARKET_SUMMARY_API_KEY",
         "US_MARKET_SUMMARY_DEADLINE_SECONDS",
         "US_MARKET_SUMMARY_REQUEST_TIMEOUT_SECONDS",
-        "CROSSDESK_BASE_URL",
-        "CROSSDESK_API_KEY",
-    }
+        "DASHBOARD_CONFIG",
+    } | set(SHARED_MODEL_ENV_NAMES) | set(LEGACY_SUMMARY_MODEL_ENV_NAMES)
     path = get_dashboard_env_file(PROJECT_ROOT)
     if not path.exists():
         return
@@ -208,40 +205,42 @@ def _int_env(name: str, default: int, *, min_value: int) -> int:
     return max(min_value, value)
 
 
-def _token_count_env(*names: str, default: int) -> int:
-    for name in names:
-        raw = str(os.environ.get(name) or "").strip()
-        if not raw:
-            continue
+def _token_count_value(raw: str, *, default: int) -> int:
+    raw = str(raw or "").strip()
+    if raw:
         compact = raw.replace(",", "").replace("_", "").strip()
         match = re.fullmatch(r"(\d+(?:\.\d+)?)([kKmM]?)", compact)
-        if not match:
-            continue
-        number = float(match.group(1))
-        unit = match.group(2).lower()
-        multiplier = 1_000_000 if unit == "m" else 1_000 if unit == "k" else 1
-        value = int(number * multiplier)
-        if value > 0:
-            return value
+        if match:
+            number = float(match.group(1))
+            unit = match.group(2).lower()
+            multiplier = 1_000_000 if unit == "m" else 1_000 if unit == "k" else 1
+            value = int(number * multiplier)
+            if value > 0:
+                return value
     return default
 
 
-US_MARKET_SUMMARY_MODEL = (
-    os.environ.get("US_MARKET_SUMMARY_MODEL")
-    or os.environ.get("DASHBOARD_GROK_MODEL")
-    or "grok-4.20-multi-agent-xhigh"
+_SHARED_MODEL = resolve_shared_model_config(
+    os.environ,
+    provider_fallback=load_crossdesk_provider(
+        os.environ.get("DASHBOARD_CONFIG") or DASHBOARD_HOME / "config.yaml"
+    ),
 )
+US_MARKET_SUMMARY_MODEL = _SHARED_MODEL.model
+US_MARKET_SUMMARY_STREAM_MODE = _SHARED_MODEL.stream_mode
+US_MARKET_SUMMARY_REASONING_EFFORT = _SHARED_MODEL.reasoning_effort
 US_MARKET_SUMMARY_DEADLINE_SECONDS = _int_env("US_MARKET_SUMMARY_DEADLINE_SECONDS", 150, min_value=30)
 US_MARKET_SUMMARY_REQUEST_TIMEOUT_SECONDS = _int_env("US_MARKET_SUMMARY_REQUEST_TIMEOUT_SECONDS", 90, min_value=10)
-US_MARKET_SUMMARY_CONTEXT_LENGTH = _token_count_env(
-    "US_MARKET_SUMMARY_CONTEXT_LENGTH",
-    "DASHBOARD_GROK_CONTEXT_LENGTH",
+US_MARKET_SUMMARY_CONTEXT_LENGTH = _token_count_value(
+    _SHARED_MODEL.context_length,
     default=128000,
 )
-US_MARKET_SUMMARY_MAX_TOKENS = _token_count_env(
-    "US_MARKET_SUMMARY_MAX_TOKENS",
+US_MARKET_SUMMARY_MAX_TOKENS = _token_count_value(
+    _SHARED_MODEL.max_tokens,
     default=4096,
 )
+US_MARKET_SUMMARY_BASE_URL = _SHARED_MODEL.base_url
+US_MARKET_SUMMARY_API_KEY = _SHARED_MODEL.api_key
 
 
 def previous_us_session_date(cn_day: date | datetime | None = None) -> date:
@@ -272,39 +271,8 @@ def _safe_float(value: Any) -> float | None:
         return None
 
 
-def _load_config() -> dict[str, Any]:
-    config_path = Path(os.environ.get("DASHBOARD_CONFIG") or str(DASHBOARD_HOME / "config.yaml")).expanduser()
-    try:
-        import yaml  # type: ignore
-
-        if config_path.exists():
-            return yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    except Exception:
-        return {}
-    return {}
-
-
 def _get_grok_credentials() -> tuple[str, str]:
-    env_base_url = (
-        os.environ.get("US_MARKET_SUMMARY_BASE_URL")
-        or os.environ.get("DASHBOARD_GROK_BASE_URL")
-        or os.environ.get("CROSSDESK_BASE_URL")
-    )
-    env_api_key = (
-        os.environ.get("US_MARKET_SUMMARY_API_KEY")
-        or os.environ.get("DASHBOARD_GROK_API_KEY")
-        or os.environ.get("CROSSDESK_API_KEY")
-    )
-    if env_base_url and env_api_key:
-        return env_base_url.rstrip("/"), env_api_key
-
-    cfg = _load_config()
-    for provider in cfg.get("custom_providers", []) or []:
-        base_url = str(provider.get("base_url") or "")
-        if "crossdesk.ccwu.cc" in base_url or "grok" in str(provider.get("name") or "").lower():
-            return base_url.rstrip("/"), str(provider.get("api_key") or "")
-    model_cfg = cfg.get("model", {}) if isinstance(cfg.get("model"), dict) else {}
-    return str(model_cfg.get("base_url") or "").rstrip("/"), str(model_cfg.get("api_key") or "")
+    return US_MARKET_SUMMARY_BASE_URL, US_MARKET_SUMMARY_API_KEY
 
 
 def _is_transient_error(err: Exception) -> bool:
@@ -319,15 +287,18 @@ def _is_transient_error(err: Exception) -> bool:
 
 
 def _call_grok_api(messages: list[dict[str, str]], *, max_tokens: int = US_MARKET_SUMMARY_MAX_TOKENS) -> str:
+    if not US_MARKET_SUMMARY_MODEL:
+        raise RuntimeError("shared model not configured: set DASHBOARD_DECISION_MODEL")
     base_url, api_key = _get_grok_credentials()
     if not base_url or not api_key:
-        raise RuntimeError("Grok credentials not found: set DASHBOARD_GROK_BASE_URL and DASHBOARD_GROK_API_KEY")
+        raise RuntimeError("shared model credentials not found: set DASHBOARD_DECISION_BASE_URL/API_KEY")
     model_request = build_model_request(
         base_url,
         US_MARKET_SUMMARY_MODEL,
         messages,
         max_tokens=max_tokens,
-        api_mode="chat",
+        api_mode="auto",
+        reasoning_effort=US_MARKET_SUMMARY_REASONING_EFFORT,
         stream=False,
         extra_payload={"stream": False},
     )
@@ -339,16 +310,17 @@ def _call_grok_api(messages: list[dict[str, str]], *, max_tokens: int = US_MARKE
             break
         try:
             timeout_seconds = min(max(10, US_MARKET_SUMMARY_REQUEST_TIMEOUT_SECONDS), max(10, remaining - 2))
-            parsed = request_model(
+            parsed = request_model_complete(
                 model_request,
                 api_key,
                 timeout=timeout_seconds,
+                stream_mode=US_MARKET_SUMMARY_STREAM_MODE,
                 opener=urlopen,
                 ssl_context=_SSL_CONTEXT,
             )
             if str(parsed.content or "").strip():
                 return str(parsed.content).strip()
-            last_err = RuntimeError("Grok returned empty content")
+            last_err = RuntimeError("market summary model returned empty content")
         except Exception as exc:
             last_err = exc
             if attempt < 3 and _is_transient_error(exc) and (deadline - time.monotonic()) > 8:
@@ -356,8 +328,8 @@ def _call_grok_api(messages: list[dict[str, str]], *, max_tokens: int = US_MARKE
                 continue
             break
     if last_err:
-        raise RuntimeError(f"Grok call failed: {last_err}")
-    raise RuntimeError("Grok call did not complete before the local deadline")
+        raise RuntimeError(f"market summary model call failed: {last_err}")
+    raise RuntimeError("market summary model call did not complete before the local deadline")
 
 
 def _fmt_pct(value: float | None) -> str:
@@ -982,7 +954,7 @@ def _strip_json_fence(content: str) -> str:
 def parse_grok_summary_content(content: str) -> dict[str, Any]:
     payload = json.loads(_strip_json_fence(content))
     if not isinstance(payload, dict):
-        raise ValueError("Grok summary JSON must be an object")
+        raise ValueError("market summary model JSON must be an object")
     tone = str(payload.get("tone") or "neutral").strip()
     if tone not in {"offensive", "balanced", "neutral", "cautious", "defensive"}:
         tone = "neutral"
@@ -1009,14 +981,14 @@ def apply_grok_summary(base_summary: dict[str, Any]) -> dict[str, Any]:
     content = _call_grok_api(build_grok_messages(base_summary))
     parsed = parse_grok_summary_content(content)
     if not parsed.get("summary"):
-        raise ValueError("Grok summary missing summary")
+        raise ValueError("market summary model missing summary")
     if len(parsed.get("guidance_lines") or []) < 2:
-        raise ValueError("Grok summary missing actionable guidance_lines")
+        raise ValueError("market summary model missing actionable guidance_lines")
     return {
         **base_summary,
         **parsed,
         "model_generated": True,
-        "model_provider": "grok",
+        "model_provider": "market_summary_model",
         "model": US_MARKET_SUMMARY_MODEL,
     }
 
@@ -1148,11 +1120,11 @@ def fetch_us_market_summary(
                 data = {
                     **data,
                     "model_generated": False,
-                    "model_provider": "grok",
+                    "model_provider": "market_summary_model",
                     "model": US_MARKET_SUMMARY_MODEL,
                     "model_error": f"{type(model_exc).__name__}: {model_exc}",
                     "guidance_lines": [
-                        "Grok 生成暂不可用，以下为本地规则兜底，今日不因外盘单独提高仓位。",
+                        "模型生成暂不可用，以下为本地规则兜底，今日不因外盘单独提高仓位。",
                         *(data.get("guidance_lines") or []),
                     ][:8],
                 }
@@ -1174,7 +1146,7 @@ def fetch_us_market_summary(
             "guidance_lines": ["美股摘要生成失败，暂不基于外盘调整仓位。"],
             "error": f"{type(exc).__name__}: {exc}",
             "model_generated": False,
-            "model_provider": "grok" if use_model else "",
+            "model_provider": "market_summary_model" if use_model else "",
             "model": US_MARKET_SUMMARY_MODEL if use_model else "",
         }
     _CACHE.update({"ts": current_ts, "key": cache_key, "data": data})

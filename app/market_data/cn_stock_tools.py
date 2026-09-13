@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import math
 import statistics
 import sys
 import time
@@ -8,8 +9,12 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
+try:
+    from app.market_data.tencent_kline_cache import fetch_a_share_daily_klines
+except ImportError:  # pragma: no cover - legacy top-level import path
+    from market_data.tencent_kline_cache import fetch_a_share_daily_klines
+
 EASTMONEY_QUOTE = "https://push2.eastmoney.com/api/qt/stock/get"
-TENCENT_KLINE = "https://ifzq.gtimg.cn/appstock/app/fqkline/get"
 TENCENT_QUOTE = "https://qt.gtimg.cn/q="
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
@@ -62,6 +67,17 @@ def normalize_symbol(raw):
     return {"raw": raw, "market": market, "code": code, "secid": secid, "display": market + code}
 
 
+def _turnover_pct(value: object, *, divisor: float = 1.0) -> float | None:
+    """Normalize provider turnover units without discarding a usable price."""
+    if isinstance(value, bool):
+        return None
+    try:
+        result = float(value) / divisor
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) and result >= 0 else None
+
+
 def get_quote(symbol):
     sym = normalize_symbol(symbol)
     try:
@@ -101,6 +117,7 @@ def get_quote(symbol):
             "amplitude_pct": pct(data.get("f171")),
             "volume_lots": amount(data.get("f47")),
             "turnover_yuan": amount(data.get("f48")),
+            "turnover": _turnover_pct(data.get("f168"), divisor=100.0),
             "volume_ratio": data.get("f50"),
             "source": "Eastmoney push2 quote"
         }
@@ -133,6 +150,7 @@ def get_quote(symbol):
             "amplitude_pct": amplitude_pct,
             "volume_lots": float(parts[6]),
             "turnover_yuan": float(parts[37]) * 10000,
+            "turnover": _turnover_pct(parts[38]) if len(parts) > 38 else None,
             "volume_ratio": None,
             "source": "Tencent qt quote fallback"
         }
@@ -140,25 +158,9 @@ def get_quote(symbol):
 
 def get_klines(symbol, count=120):
     sym = normalize_symbol(symbol)
-    key = sym["display"]
-    resp = http_get_json(TENCENT_KLINE, {
-        "param": f"{key},day,,,{count},qfq"
-    })
-    data = (resp.get("data") or {}).get(key) or {}
-    klines = data.get("qfqday") or data.get("day") or []
-    if not klines:
+    rows = fetch_a_share_daily_klines(sym["display"], count)
+    if not rows:
         raise RuntimeError("未获取到K线数据")
-    rows = []
-    for p in klines:
-        # [date, open, close, high, low, volume]
-        rows.append({
-            "date": p[0],
-            "open": float(p[1]),
-            "close": float(p[2]),
-            "high": float(p[3]),
-            "low": float(p[4]),
-            "volume": float(p[5]),
-        })
     return rows
 
 

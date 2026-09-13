@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
+from unittest import mock
 
 from app.market_data import tencent_kline_cache as cache
 
@@ -34,6 +35,129 @@ class TencentKlineCacheTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_tencent_fetch_uses_web_endpoint_then_compatibility_alias(self):
+        payload = json.dumps({
+            "data": {
+                "sh600519": {
+                    "qfqday": [
+                        ["2026-07-28", "10", "10.1", "10.2", "9.9", "1000"],
+                    ],
+                },
+            },
+        }).encode("utf-8")
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return payload
+
+        with mock.patch.object(
+            cache.urllib.request,
+            "urlopen",
+            side_effect=[OSError("primary unavailable"), Response()],
+        ) as urlopen:
+            rows = cache.fetch_tencent_daily_klines("sh600519", 120)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["date"], "2026-07-28")
+        requested_urls = [call.args[0].full_url for call in urlopen.call_args_list]
+        self.assertEqual(
+            [url.split("?", 1)[0] for url in requested_urls],
+            list(cache.TENCENT_KLINE_URLS[:2]),
+        )
+
+    def test_eastmoney_fetch_parses_qfq_daily_rows(self):
+        payload = json.dumps({
+            "data": {
+                "klines": [
+                    "2026-07-28,10,10.1,10.2,9.9,1000,100000,0,0,0,1.2",
+                    "2026-07-29,10.2,10.3,10.4,10.1,1200,120000,0,0,0,1.3",
+                ],
+            },
+        }).encode("utf-8")
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return payload
+
+        with mock.patch.object(cache.urllib.request, "urlopen", return_value=Response()) as urlopen:
+            rows = cache.fetch_eastmoney_daily_klines("sh600519", 120)
+
+        self.assertEqual([row["date"] for row in rows], ["2026-07-28", "2026-07-29"])
+        self.assertEqual(rows[-1]["close"], 10.3)
+        self.assertIn("secid=1.600519", urlopen.call_args.args[0].full_url)
+        self.assertIn("fqt=1", urlopen.call_args.args[0].full_url)
+
+    def test_multi_source_fetch_falls_back_from_tencent_to_eastmoney(self):
+        expected = sample_rows()
+        with (
+            mock.patch.object(cache, "fetch_tencent_daily_klines", return_value=[]) as tencent,
+            mock.patch.object(cache, "fetch_eastmoney_daily_klines", return_value=expected) as eastmoney,
+        ):
+            rows = cache.fetch_a_share_daily_klines("sh600519", 120)
+
+        self.assertEqual(rows, expected)
+        tencent.assert_called_once_with("sh600519", 120)
+        eastmoney.assert_called_once_with("sh600519", 120)
+
+    def test_prewarm_defaults_to_multi_source_fetcher(self):
+        with mock.patch.object(
+            cache,
+            "fetch_a_share_daily_klines",
+            return_value=sample_rows(),
+        ) as fetcher:
+            result = cache.prewarm_kline_cache(
+                ["sh600519"],
+                path=self.path,
+                target_date="2026-07-29",
+                workers=1,
+                max_attempts=1,
+            )
+
+        self.assertEqual(result["success_count"], 1)
+        fetcher.assert_called_once_with("sh600519", cache.DEFAULT_PREWARM_KLINE_COUNT)
+
+    def test_prewarm_fallback_retains_full_history_and_live_bar_buffer(self):
+        historical = sample_rows(count=500)
+        with (
+            mock.patch.object(cache, "fetch_tencent_daily_klines", return_value=[]),
+            mock.patch.object(
+                cache, "fetch_eastmoney_daily_klines", return_value=historical,
+            ) as fallback,
+        ):
+            cache.prewarm_kline_cache(
+                ["sh600519"], path=self.path, target_date="2026-07-29",
+                workers=1, max_attempts=1,
+            )
+
+        fallback.assert_called_once_with("sh600519", 500)
+        loaded = cache.load_kline_series_map(
+            ["sh600519"], path=self.path, count=500, min_rows=500,
+            min_requested_count=500,
+        )["sh600519"]
+        merged = cache.merge_live_quote(
+            loaded, {"quote_time": "2026-07-29 10:05:01", "price": 15.5},
+            limit=501,
+        )
+
+        self.assertEqual(len(merged), 501)
+        self.assertEqual(merged[0]["date"], historical[0]["date"])
+        self.assertTrue(all(row["bar_status"] == "closed" for row in merged[:-1]))
+        self.assertEqual(merged[-1]["bar_status"], "live")
+        self.assertEqual(merged[-1]["date"], "2026-07-29")
+        self.assertEqual(loaded, historical)
 
     def test_store_and_bulk_load_only_accept_fresh_completed_history(self):
         stored = cache.store_kline_series(
@@ -100,6 +224,13 @@ class TencentKlineCacheTests(unittest.TestCase):
         self.assertEqual(replaced[-1]["close"], 11.7)
         self.assertEqual(replaced[-1]["bar_status"], "live")
         self.assertEqual(len(replaced), len(merged))
+
+        iso_merged = cache.merge_live_quote(
+            historical,
+            {**quote, "quote_time": "2026-07-29 10:05:01", "price": 11.6},
+        )
+        self.assertEqual(iso_merged[-1]["date"], "2026-07-29")
+        self.assertEqual(iso_merged[-1]["close"], 11.6)
 
         closed = cache.merge_live_quote(historical, {})
         self.assertTrue(closed)
@@ -299,6 +430,30 @@ class TencentKlineCacheTests(unittest.TestCase):
 
         self.assertEqual(len(merged), 500)
         self.assertGreaterEqual(len(weekly), 60)
+
+    def test_merge_keeps_five_hundred_closed_bars_plus_live_buffer(self):
+        start = date(2024, 1, 1)
+        historical = [
+            {
+                "date": (start + timedelta(days=index)).isoformat(),
+                "open": 10.0,
+                "close": 10.0,
+                "high": 10.2,
+                "low": 9.8,
+                "volume": 1000,
+            }
+            for index in range(500)
+        ]
+        quote_day = (start + timedelta(days=500)).strftime("%Y%m%d")
+
+        merged = cache.merge_live_quote(
+            historical,
+            {"quote_time": quote_day + "100000", "price": 10.1},
+            limit=501,
+        )
+
+        self.assertEqual(len(merged), 501)
+        self.assertEqual(sum(row.get("bar_status") == "live" for row in merged), 1)
 
     def test_prewarm_records_coverage_and_keeps_successes(self):
         requested_counts = []

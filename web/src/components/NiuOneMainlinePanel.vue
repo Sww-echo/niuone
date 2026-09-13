@@ -12,6 +12,7 @@ const {
 } = useNiuOneMainlineData()
 
 const expandedTheme = ref('')
+const expandedThemeUpward = ref(false)
 const coveragePopoverOpen = ref(false)
 const coverageInfoRoot = ref(null)
 const coverageInfoTrigger = ref(null)
@@ -166,9 +167,27 @@ function themeStockPanelId(rankingKey, index) {
   return `${rankingKey}ThemeStocks${index}`
 }
 
-function toggleThemeStocks(theme, rankingKey) {
+async function toggleThemeStocks(theme, rankingKey, event) {
   const key = expandedThemeKey(theme, rankingKey)
-  expandedTheme.value = expandedTheme.value === key ? '' : key
+  if (expandedTheme.value === key) {
+    expandedTheme.value = ''
+    expandedThemeUpward.value = false
+    return
+  }
+  const trigger = event?.currentTarget
+  expandedThemeUpward.value = false
+  expandedTheme.value = key
+  await nextTick()
+  const panel = trigger?.nextElementSibling
+  if (!(panel instanceof HTMLElement)) return
+  const triggerRect = trigger.getBoundingClientRect()
+  const panelHeight = panel.getBoundingClientRect().height
+  const viewport = window.visualViewport
+  const viewportTop = viewport?.offsetTop || 0
+  const viewportBottom = viewportTop + (viewport?.height || window.innerHeight)
+  const spaceBelow = viewportBottom - triggerRect.bottom
+  const spaceAbove = triggerRect.top - viewportTop
+  expandedThemeUpward.value = spaceBelow < panelHeight + 8 && spaceAbove > spaceBelow
 }
 
 function handleThemeStocksPointerDown(event) {
@@ -176,6 +195,7 @@ function handleThemeStocksPointerDown(event) {
   const target = event.target
   if (target instanceof Element && target.closest('.theme-stock-list')) return
   expandedTheme.value = ''
+  expandedThemeUpward.value = false
 }
 
 function toggleCoveragePopover(event) {
@@ -451,7 +471,7 @@ onBeforeUnmount(() => {
                           :aria-expanded="expandedTheme === expandedThemeKey(theme, ranking.key)"
                           :aria-controls="themeStockPanelId(ranking.key, index)"
                           :aria-label="`${theme.industry}${leaderBadge(theme, ranking.key)}股 ${leaderStock(theme, ranking.key).name || leaderStock(theme, ranking.key).code}，${expandedTheme === expandedThemeKey(theme, ranking.key) ? '收起' : '展开'}代表股列表`"
-                          @click="toggleThemeStocks(theme, ranking.key)"
+                          @click="toggleThemeStocks(theme, ranking.key, $event)"
                         >
                           <span class="theme-leader-identity">
                             <span class="theme-leader-badge">{{ leaderBadge(theme, ranking.key) }}</span>
@@ -465,6 +485,7 @@ onBeforeUnmount(() => {
                           v-if="expandedTheme === expandedThemeKey(theme, ranking.key)"
                           :id="themeStockPanelId(ranking.key, index)"
                           class="theme-stock-details"
+                          :class="{ upward: expandedThemeUpward }"
                           role="region"
                           :aria-label="`${theme.industry}代表股列表`"
                         >
@@ -606,7 +627,8 @@ onBeforeUnmount(() => {
 .mainline-empty.compact { min-height:80px; }
 .theme-rankings { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); align-items:stretch; gap:12px; }
 .theme-ranking-panel { min-width:0; height:100%; overflow:visible; border:1px solid var(--mainline-line); border-radius:12px; background:var(--panel); background-clip:padding-box; box-shadow:0 1px 2px rgba(16,24,40,.04); container-type:inline-size; }
-.theme-ranking-head { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:10px 12px; border-bottom:1px solid var(--mainline-line); border-radius:11px 11px 0 0; }
+/* This nested header must not inherit the sticky site-header stacking layer. */
+.theme-ranking-head { position:static; top:auto; z-index:auto; display:flex; align-items:center; justify-content:space-between; gap:12px; padding:10px 12px; border-bottom:1px solid var(--mainline-line); border-radius:11px 11px 0 0; }
 .theme-ranking-head h4 { margin:0; font-size:15px; line-height:1.2; }
 .theme-ranking-count { flex-shrink:0; color:var(--muted); font-size:11px; font-variant-numeric:tabular-nums; white-space:nowrap; }
 .theme-ranking-list { margin:0; padding:0; list-style:none; }
@@ -658,6 +680,7 @@ onBeforeUnmount(() => {
 .theme-leader-button svg { width:12px; height:12px; fill:none; stroke:currentColor; stroke-width:1.6; transition:transform .15s ease; }
 .theme-leader-button[aria-expanded="true"] svg { transform:rotate(180deg); }
 .theme-stock-details { position:absolute; z-index:10; top:calc(100% + 3px); right:0; left:auto; width:min(520px,calc(100cqw - 24px)); max-width:calc(100vw - 44px); max-height:min(360px,60vh); overflow-y:auto; padding:8px; border:1px solid var(--mainline-line); border-radius:10px; background:var(--panel); box-shadow:0 12px 28px rgba(15,23,42,.18); }
+.theme-stock-details.upward { top:auto; bottom:calc(100% + 3px); }
 .theme-stock-details-head,.theme-stock-detail-row { display:grid; grid-template-columns:minmax(150px,1fr) 76px 58px 82px; align-items:center; gap:10px; }
 .theme-stock-details-head { padding:3px 10px 8px; color:var(--muted); font-size:9px; }
 .theme-stock-detail-head-change { text-align:right; }
@@ -729,18 +752,22 @@ onBeforeUnmount(() => {
   .theme-metrics { column-gap:6px; }
   .theme-metrics > span { gap:2px; }
   .theme-stock-list { margin-left:30px; }
-  .theme-stock-details { right:auto; left:-30px; width:calc(100vw - 72px); }
-  .theme-stock-details-head,.theme-stock-detail-row { grid-template-columns:minmax(0,1fr) auto; }
-  .theme-stock-details-head { grid-template-areas:"name change"; }
+  .theme-stock-details { right:auto; left:0; width:100%; max-width:100%; max-height:290px; padding:6px; }
+  .theme-stock-details-head,.theme-stock-detail-row { grid-template-columns:minmax(0,1fr) auto; gap:5px; }
+  .theme-stock-details-head { height:24px; grid-template-areas:"name change"; padding:2px 8px 6px; }
   .theme-stock-detail-head-name { grid-area:name; }
   .theme-stock-detail-head-change { grid-area:change; }
   .theme-stock-detail-head-code,.theme-stock-detail-head-attribution { display:none; }
-  .theme-stock-detail-row { grid-template-areas:"name change" "code attribution"; row-gap:5px; }
-  .theme-stock-detail-name { grid-area:name; }
+  .theme-stock-detail-row { height:48px; grid-template-areas:"name change" "code attribution"; row-gap:5px; padding:7px 8px; }
+  .theme-stock-detail-row + .theme-stock-detail-row { margin-top:3px; }
+  .theme-stock-detail-name { grid-area:name; overflow:hidden; white-space:nowrap; }
+  .theme-stock-detail-name strong { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; overflow-wrap:normal; }
   .theme-stock-detail-code { grid-area:code; }
   .theme-stock-detail-attribution { grid-area:attribution; justify-self:end; }
   .theme-stock-detail-row > .theme-stock-change { grid-area:change; }
-  .theme-stock-detail-code > span,.theme-stock-detail-attribution > span { display:inline; margin-right:4px; }
+  .theme-stock-detail-code,.theme-stock-detail-attribution { font-size:9px; }
+  .theme-stock-detail-code > span { display:none; }
+  .theme-stock-detail-attribution > span { display:inline; margin-right:2px; }
   .theme-context { display:grid; justify-items:end; gap:1px; }
   .theme-context strong,.theme-context small { width:100%; }
 }

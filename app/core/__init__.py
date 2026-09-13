@@ -6,9 +6,12 @@ from .model_api import (
     ParsedModelResponse,
     build_model_request,
     normalize_api_mode,
+    normalize_model_stream_mode,
     parse_model_response,
     request_model,
+    request_model_complete,
     responses_output_text,
+    stream_model_response,
     uses_responses_api,
 )
 from .paths import (
@@ -29,10 +32,13 @@ __all__ = [
     "ParsedModelResponse",
     "build_model_request",
     "normalize_api_mode",
+    "normalize_model_stream_mode",
     "parse_model_response",
     "read_json_cache",
     "request_model",
+    "request_model_complete",
     "responses_output_text",
+    "stream_model_response",
     "uses_responses_api",
     "write_json_cache",
 ]

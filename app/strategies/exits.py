@@ -1,12 +1,16 @@
 """Strategy-specific exit rules without market-data or execution side effects."""
 from __future__ import annotations
 
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
+import math
 from typing import Any
 
 
 SHAOFU_MIN_HOLD_TRADING_DAYS = 3
 SHAOFU_SOFT_EXIT_CONFIRMATIONS = 2
+SOFT_EXIT_CONFIRMATIONS = 2
+SOFT_EXIT_REDUCE_RATIO = 0.50
+SOFT_EXIT_SCORE_VETO_THRESHOLD = 4
 NIUONE_MAX_HOLD_CALENDAR_DAYS = 25
 NIUONE_LEADER_LOSS_CONFIRMATIONS = 2
 NIUONE_MAINLINE_WEAK_CONFIRMATIONS = 2
@@ -59,6 +63,94 @@ NIUONE_REVERSAL_MAINLINE_WEAK_CONFIRMATIONS = 1
 
 def _sell_signal(reason: str, signal: str, sell_ratio: float = 1.0) -> dict[str, Any]:
     return {"reason": reason, "signal": signal, "sell_ratio": sell_ratio}
+
+
+def niuone_stop_levels(position: Mapping[str, Any], *, cost: float, break_even: bool) -> dict[str, Any]:
+    """Separate immutable structure from cost protection without inventing history.
+
+    entry_stop_price remains the legacy effective-stop projection. Old positions
+    already overwritten with niu_breakeven have unknown original structure unless
+    a separately sourced shaofu stop survives.
+    """
+    def positive(value: Any) -> float:
+        try:
+            number = float(value or 0)
+        except (ValueError, TypeError):
+            return 0.0
+        return number if math.isfinite(number) and number > 0 else 0.0
+
+    source = str(position.get("entry_stop_source") or "")
+    shaofu_source = str(position.get("shaofu_stop_source") or "")
+    legacy = 0.0 if shaofu_source == "fallback_pct" else positive(
+        position.get("shaofu_stop_price") or position.get("entry_stop_price")
+    )
+    original = positive(position.get("original_structural_stop_price"))
+    if not original:
+        if positive(position.get("shaofu_stop_price")) and shaofu_source not in {"fallback_pct", "niu_breakeven"}:
+            original = positive(position.get("shaofu_stop_price"))
+        elif source not in {"niu_breakeven", "fallback_pct"} and shaofu_source != "fallback_pct":
+            original = positive(position.get("entry_stop_price"))
+    protection = positive(cost) if break_even and position.get("partial_tp_done") else 0.0
+    # An already applied legacy cost stop remains protected if a setting changes.
+    if source == "niu_breakeven":
+        protection = max(protection, positive(position.get("entry_stop_price")))
+    return {
+        "original_structural_stop_price": original or None,
+        "cost_protection_stop_price": protection,
+        "effective_stop_price": max(legacy, original, protection),
+    }
+
+
+def niuone_hard_exit_evidence(
+    *,
+    strategy_id: str,
+    current_price: float,
+    structural_stop: float,
+    market_hard_stop: bool,
+    theme_score: float,
+    theme_state: str,
+    cost_protection_stop: float = 0.0,
+    original_structural_stop: float | None = None,
+) -> dict[str, Any]:
+    """Verify hard risk conditions from observations, never model prose."""
+    price = float(current_price)
+    stop = float(structural_stop)
+    score = float(theme_score)
+    price = price if math.isfinite(price) and price > 0 else 0.0
+    stop = stop if math.isfinite(stop) and stop > 0 else 0.0
+    score = score if math.isfinite(score) else 100.0
+    signal, reason = "", ""
+    stop_kind = ""
+    if price > 0 and stop > 0 and price < stop:
+        signal = "niu_structure_stop"
+        if original_structural_stop and price < original_structural_stop:
+            stop_kind = "structure"
+        elif cost_protection_stop > 0 and price < cost_protection_stop:
+            stop_kind = "cost_protection"
+        else:
+            stop_kind = "structure"
+        label = "成本保护线" if stop_kind == "cost_protection" else "结构止损线"
+        reason = f"现价跌破牛牛{label} (现价{price:.2f} < 止损{stop:.2f})"
+    elif market_hard_stop and (score < 55 or theme_state in {"fading", "inactive"}):
+        signal = "niu_market_hard_stop"
+        reason = f"市场硬停止且主线转弱 (分数{score:.1f}，状态{theme_state or '-'})"
+    elif theme_state == "inactive":
+        signal = "niu_reversal_theme_failed" if strategy_id == "niu_reversal_probe" else "niu_mainline_faded"
+        reason = f"主线失活 (分数{score:.1f})"
+    return {
+        "schema_version": 1,
+        "confirmed": bool(signal),
+        "signal": signal,
+        "reason": reason,
+        "current_price": price,
+        "structural_stop": stop,
+        "stop_kind": stop_kind,
+        "original_structural_stop": original_structural_stop,
+        "cost_protection_stop": cost_protection_stop,
+        "market_hard_stop": bool(market_hard_stop),
+        "theme_score": score,
+        "theme_state": theme_state,
+    }
 
 
 def resolve_niuone_partial_take_profit(
@@ -126,6 +218,76 @@ def evaluate_shaofu_soft_exit(
     return {"status": "confirmed", "allow_reduce": True, "count": count, "required": required}
 
 
+def arbitrate_staged_soft_exit(
+    *,
+    signal_family: str,
+    session_key: str,
+    previous_family: str,
+    previous_session: str,
+    previous_count: int,
+    already_reduced: bool,
+    sell_score: float | None,
+    evidence_count: int = 1,
+    confirmations_required: int = SOFT_EXIT_CONFIRMATIONS,
+    reduce_ratio: float = SOFT_EXIT_REDUCE_RATIO,
+) -> dict[str, Any]:
+    """Resolve a non-structural exit without allowing a one-shot full sale.
+
+    A distinct trading session is one confirmation.  The first actionable
+    confirmation releases risk while preserving a runner; a full exit is only
+    available after the runner has already been reduced and the same soft
+    family persists on another session.  A strong 4-5 sell-fly score vetoes
+    the first session, but does not erase the evidence or block later risk
+    reduction.  Structural and market hard stops never call this arbiter.
+    """
+    family = str(signal_family or "soft_exit").strip() or "soft_exit"
+    session = str(session_key or "").strip()
+    prior_family = str(previous_family or "").strip()
+    prior_session = str(previous_session or "").strip()
+    count = max(0, int(previous_count or 0)) if family == prior_family else 0
+    if session and (family != prior_family or session != prior_session):
+        count += 1
+    count = max(count, max(1, int(evidence_count or 1)))
+
+    required = max(2, int(confirmations_required or 2))
+    score = float(sell_score) if isinstance(sell_score, (int, float)) else None
+    if score is not None and score >= SOFT_EXIT_SCORE_VETO_THRESHOLD and count < required:
+        return {
+            "status": "score_veto",
+            "count": count,
+            "required": required,
+            "sell_ratio": 0.0,
+            "signal_family": family,
+            "session_key": session,
+        }
+    if not already_reduced:
+        return {
+            "status": "reduce",
+            "count": count,
+            "required": required,
+            "sell_ratio": max(0.0, min(0.75, float(reduce_ratio))),
+            "signal_family": family,
+            "session_key": session,
+        }
+    if count >= required:
+        return {
+            "status": "exit",
+            "count": count,
+            "required": required,
+            "sell_ratio": 1.0,
+            "signal_family": family,
+            "session_key": session,
+        }
+    return {
+        "status": "runner_hold",
+        "count": count,
+        "required": required,
+        "sell_ratio": 0.0,
+        "signal_family": family,
+        "session_key": session,
+    }
+
+
 def evaluate_strategy_time_exit(
     *,
     entry_strategy: str,
@@ -187,20 +349,11 @@ def evaluate_strategy_time_exit(
             entry_strategy == "niu_reversal_probe"
             and strategy_variant != "daily_v"
             and hold_days >= 2
+            and not strategy_confirmation_met
         ):
             return _sell_signal(
                 f"牛牛试仓T+2仍未升级 ({hold_days}d，最高盈利{max_pnl_pct:.1f}%，现盈亏{pnl_pct:.1f}%)",
                 "niu_reversal_not_upgraded",
-            )
-        if (
-            entry_strategy == "niu_reversal_probe"
-            and strategy_variant != "daily_v"
-            and hold_days >= 1
-            and not strategy_confirmation_met
-        ):
-            return _sell_signal(
-                f"牛牛试仓T+1未形成跨日延续 ({hold_days}d，最高盈利{max_pnl_pct:.1f}%，现盈亏{pnl_pct:.1f}%)",
-                "niu_reversal_unconfirmed",
             )
         if entry_strategy == "niu_emerging" and hold_days >= 2 and max_pnl_pct < 1.5 and pnl_pct <= 0.5:
             return _sell_signal(

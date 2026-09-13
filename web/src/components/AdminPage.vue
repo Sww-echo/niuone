@@ -2,23 +2,23 @@
 import { computed, onMounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import AdminLogin from './AdminLogin.vue'
-import AdminPageTitle from './AdminPageTitle.vue'
+import AdminAppearanceSettings from './AdminAppearanceSettings.vue'
 import AdminSettingsGroup from './AdminSettingsGroup.vue'
 import AdminSettingsIndex from './AdminSettingsIndex.vue'
-import ThemeToggle from './ThemeToggle.vue'
 import { useAdminConfig } from '../composables/useAdminConfig.js'
 
 document.title = '牛牛1号'
 const { state, config, errorMessage, refresh, authenticate } = useAdminConfig()
 const route = useRoute()
 const groupSlug = computed(() => String(route.params.group || ''))
+const isAppearanceSettings = computed(() => groupSlug.value === 'appearance')
 const activeGroup = computed(() => (
   (config.value?.groups || []).find(group => group.slug === groupSlug.value) || null
 ))
 let pendingConfig = null
 
 function setTitle(title) {
-  window.dispatchEvent(new CustomEvent('niuone:admin-title', { detail: { title } }))
+  document.title = title === '设置' ? '牛牛1号 · 设置' : `牛牛1号 · ${title}`
 }
 
 watch(state, value => {
@@ -30,6 +30,10 @@ watch([state, groupSlug], ([currentState, slug]) => {
   if (currentState !== 'ready' || !config.value) return
   if (!slug) {
     setTitle('设置')
+    return
+  }
+  if (isAppearanceSettings.value) {
+    setTitle('界面主题')
     return
   }
   setTitle(activeGroup.value?.name || '设置分组不存在')
@@ -47,21 +51,27 @@ function acceptUpdatedConfig(updated) {
   else pendingConfig = updated
 }
 
-onMounted(() => {
-  refresh()
-})
+function publishLastUpdated(date = new Date()) {
+  const value = [date.getHours(), date.getMinutes(), date.getSeconds()]
+    .map(part => String(part).padStart(2, '0'))
+    .join(':')
+  window.dispatchEvent(new CustomEvent('niuone:last-updated', { detail: { value } }))
+}
+
+async function loadConfig() {
+  if (await refresh()) publishLastUpdated()
+}
+
+async function authenticateAndRefresh(credential) {
+  const authenticated = await authenticate(credential)
+  if (authenticated) publishLastUpdated()
+  return authenticated
+}
+
+onMounted(loadConfig)
 </script>
 
 <template>
-  <header class="admin-header">
-    <div class="admin-header-inner">
-      <div><div class="eyebrow">牛牛1号 · 设置</div><AdminPageTitle /></div>
-      <div id="adminHeaderActions" class="admin-header-actions">
-        <ThemeToggle button-id="adminThemeToggle" button-class="admin-theme-toggle" />
-        <a class="toplink" href="/">返回首页</a>
-      </div>
-    </div>
-  </header>
   <main
     id="adminApp"
     class="admin-main"
@@ -69,11 +79,14 @@ onMounted(() => {
     :aria-busy="state === 'loading' ? 'true' : 'false'"
   >
     <div v-if="state === 'loading'" class="admin-loading">设置加载中…</div>
-    <AdminLogin v-else-if="state === 'login'" :authenticate="authenticate" />
+    <AdminLogin v-else-if="state === 'login'" :authenticate="authenticateAndRefresh" />
     <div v-else-if="state === 'error'" class="errmsg">{{ errorMessage || '设置加载失败' }}</div>
     <AdminSettingsIndex
       v-else-if="state === 'ready' && !groupSlug && config"
       :config="config"
+    />
+    <AdminAppearanceSettings
+      v-else-if="state === 'ready' && isAppearanceSettings && config"
     />
     <AdminSettingsGroup
       v-else-if="state === 'ready' && groupSlug && config"
@@ -86,3 +99,4 @@ onMounted(() => {
 </template>
 
 <style src="../../../frontend/admin.css"></style>
+<style src="../../../frontend/tongdaxin-theme.css"></style>

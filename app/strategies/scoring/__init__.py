@@ -39,6 +39,7 @@ from .common import (
     with_strategy_profile,
 )
 from .li_daxiao import score_li_daxiao_bottom
+from .prompt import score_preset_text
 from .niuone import (
     NIUONE_MIN_ROWS,
     NIUONE_STRATEGY_IDS,
@@ -76,6 +77,7 @@ _SCORER_BY_NAME: dict[str, Callable[[list[dict[str, Any]]], dict[str, Any] | Non
     "score_b3_accelerate": score_b3_accelerate,
     "score_super_b1": score_super_b1,
     "score_li_daxiao_bottom": score_li_daxiao_bottom,
+    "score_preset_text": score_preset_text,
     "score_tide_leader": score_tide_leader,
     "score_tide_rotation": score_tide_rotation,
     "score_tide_recovery": score_tide_recovery,
@@ -136,6 +138,7 @@ __all__ = [
     "score_b3_accelerate",
     "score_breakout",
     "score_li_daxiao_bottom",
+    "score_preset_text",
     "score_niu_emerging",
     "score_niu_leader",
     "score_niu_pullback",

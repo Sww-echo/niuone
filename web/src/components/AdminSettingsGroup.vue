@@ -5,6 +5,7 @@ import AdminAbout from './AdminAbout.vue'
 import AdminConnectionTests from './AdminConnectionTests.vue'
 import AdminEnvInput from './AdminEnvInput.vue'
 import AdminNotificationSettings from './AdminNotificationSettings.vue'
+import AdminPromptStrategy from './AdminPromptStrategy.vue'
 import { allowInfoPopoverClick } from '../utils/infoPopover.js'
 
 const props = defineProps({
@@ -40,21 +41,15 @@ const items = computed(() => {
 })
 const isNotificationGroup = computed(() => group.value?.name === '交易通知')
 const isAboutGroup = computed(() => group.value?.slug === 'about')
+const isStrategyGroup = computed(() => group.value?.slug === 'stock-strategy')
 const itemCountLabel = computed(() => (
   isNotificationGroup.value
     ? `${(props.config.notification_channels || []).length} 个渠道`
     : `${items.value.length} 项`
 ))
-const gatedNames = computed(() => new Set(props.config.ui?.us_feature_gated_names || []))
 const strategyPreset = computed(() => String(props.config.ui?.strategy_preset_name || ''))
-const initialUsToggle = (props.config.items || []).find(
-  item => item.name === props.config.ui?.us_feature_toggle_name,
-)
 const initialStrategySource = items.value.find(
   item => ['strategy_source', 'strategy_suite'].includes(String(item.kind || '')),
-)
-const runtimeUsEnabled = ref(
-  Boolean(initialUsToggle) && isTruthy(initialUsToggle.effective || initialUsToggle.file_value),
 )
 const runtimeStrategySource = ref(String(initialStrategySource?.file_value || 'zettaranc'))
 const currentStates = reactive(Object.fromEntries(
@@ -105,9 +100,6 @@ function clearConnectionStatuses() {
 }
 
 function syncRuntimeToggles(target) {
-  if (target?.matches?.('[data-feature-toggle="us"]')) {
-    runtimeUsEnabled.value = target.value === '1'
-  }
   if (target?.matches?.('[data-strategy-source-toggle]') && target.checked) {
     runtimeStrategySource.value = target.value
   }
@@ -126,8 +118,21 @@ function handleFormMutation(event) {
   }
 }
 
+function reasoningModel(item) {
+  editRevision.value
+  for (const name of (item?.reasoning_model_names || [])) {
+    const formValue = formFieldValue(name)
+    if (formValue) return formValue
+    const modelItem = (props.config.items || []).find(entry => entry.name === name)
+    const configured = String(
+      modelItem?.file_value || modelItem?.effective || modelItem?.default || '',
+    ).trim()
+    if (configured) return configured
+  }
+  return ''
+}
+
 function rowHidden(item) {
-  if (gatedNames.value.has(item.name) && !runtimeUsEnabled.value) return true
   if (item.name === strategyPreset.value && runtimeStrategySource.value !== 'preset_text') return true
   return false
 }
@@ -290,7 +295,9 @@ async function runIwencaiTest() {
   if (iwencaiStatus.state === 'busy') return
   const body = new URLSearchParams()
   ;(props.config.iwencai_test?.field_names || []).forEach(name => {
-    body.set(`env__${name}`, formFieldValue(name))
+    if (form.value?.elements.namedItem(`env__${name}`)) {
+      body.set(`env__${name}`, formFieldValue(name))
+    }
   })
   iwencaiStatus.state = 'busy'
   iwencaiStatus.message = '正在连接问财接口...'
@@ -452,7 +459,6 @@ onBeforeUnmount(() => {
             v-for="item in items"
             :key="item.name"
             class="setting-row"
-            :data-feature-gated="gatedNames.has(item.name) ? 'us' : null"
             :data-strategy-source-gated="item.name === strategyPreset ? 'preset_text' : null"
             :hidden="rowHidden(item)"
             :aria-hidden="String(rowHidden(item))"
@@ -503,7 +509,12 @@ onBeforeUnmount(() => {
               </div>
             </div>
             <div class="setting-editor">
-              <AdminEnvInput :item="item" @field-change="handleFormMutation" />
+              <AdminEnvInput
+                :item="item"
+                :reasoning-model="reasoningModel(item)"
+                :reasoning-capabilities="config.reasoning_effort_capabilities || []"
+                @field-change="handleFormMutation"
+              />
             </div>
             <div class="setting-state">
               <div class="setting-state-item">
@@ -545,5 +556,6 @@ onBeforeUnmount(() => {
         </div>
       </section>
     </form>
+    <AdminPromptStrategy v-if="isStrategyGroup" />
   </div>
 </template>

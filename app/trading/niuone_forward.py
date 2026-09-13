@@ -12,6 +12,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
+from .accounting import ACCOUNTING_AUDIT_FIELDS, trade_counts_for_account
 from app.strategies.scoring.niuone import NIUONE_STRATEGY_IDS
 from app.strategies.lifecycle import (
     NIUONE_LIFECYCLE_STAGES,
@@ -30,10 +31,32 @@ from app.strategies.niuone_risk import (
     NIUONE_MARKUP_UPGRADE_MIN_PNL_PCT,
     NIUONE_MARKUP_UPGRADE_POSITION_CAP_PCT,
     NIUONE_MAX_NEW_POSITIONS_PER_TRADING_DAY,
+    NIUONE_MAX_OPEN_POSITIONS,
+    NIUONE_REVERSAL_RISK_BUDGETS,
+    NIUONE_REPLACEMENT_PRIORITY_MARGIN,
 )
 from app.strategies.exits import (
     NIUONE_LIFECYCLE_CLIMAX_MIN_PNL_PCT,
     NIUONE_LIFECYCLE_CLIMAX_PARTIAL_RATIO,
+    SOFT_EXIT_CONFIRMATIONS,
+    SOFT_EXIT_REDUCE_RATIO,
+    SOFT_EXIT_SCORE_VETO_THRESHOLD,
+    niuone_hard_exit_evidence,
+)
+from app.strategies.exit_feedback import (
+    EXIT_FEEDBACK_ALGORITHM_VERSION,
+    EXIT_FEEDBACK_DEFAULT_COOLDOWN_SAMPLES,
+    EXIT_FEEDBACK_DEFAULT_MIN_MONTHS,
+    EXIT_FEEDBACK_DEFAULT_MIN_SAMPLES,
+    EXIT_FEEDBACK_DEFAULT_PARAMETERS,
+    EXIT_FEEDBACK_CONFIDENCE_LEVEL,
+    EXIT_FEEDBACK_MAX_WINDOW_SAMPLES,
+    EXIT_FEEDBACK_PARAMETER_BOUNDS,
+)
+from app.trading.probe_chase import probe_chase_protocol
+from app.trading.lifecycles import (
+    COMPLETE_TRADE_DEFINITION, reconstruct_trade_lifecycles,
+    _trade_identity, _buy_cost, _sell_proceeds,
 )
 from app.strategies.policy import (
     NIUONE_DAILY_V_MAX_RECOVERY_RATIO,
@@ -41,12 +64,20 @@ from app.strategies.policy import (
     NIUONE_LEADER_MIN_SECTOR_RANK,
     NIUONE_REVERSAL_CONTINUATION_MIN_STATE_STREAK,
     NIUONE_REVERSAL_CONTINUATION_MIN_STRONG_COUNT,
+    NIUONE_REVERSAL_ENTRY_MAX_CHANGE_PCT_EXCLUSIVE,
+    NIUONE_MIN_ENTRY_TURNOVER_PCT,
+    NIUONE_MATURE_MIN_MARKET_AMOUNT_PERCENTILE,
+    NIUONE_MATURE_MIN_THEME_AMOUNT_PERCENTILE,
+    NIUONE_THEME_ATTRIBUTION_CONFIDENCE_SCORE,
+    NIUONE_THEME_LEADER_MIN_ATTRIBUTION_WEIGHT,
+    niuone_turnover_blocker,
+    niuone_stock_activity_blocker,
     NIUONE_TODAY_OBSERVATION_THRESHOLD,
 )
 from app.strategies.selection import strategy_daily_candidate_limit
 
 
-DEFAULT_COHORT_START = "2026-08-04"
+DEFAULT_COHORT_START = "2026-09-10"
 DEFAULT_MIN_COMPLETED_TRADES = 30
 DEFAULT_MIN_CALENDAR_MONTHS = 3
 DEFAULT_SHADOW_EXECUTION_GAP_PCT = 1.0
@@ -55,7 +86,7 @@ DEFAULT_HISTORICAL_REFERENCE_WIN_RATE_PCT = 59.71
 DEFAULT_WIN_RATE_CONFIDENCE_LEVEL = 0.95
 DEFAULT_MAX_PORTFOLIO_DRAWDOWN_PCT = 6.0
 DEFAULT_MIN_RETURN_TO_DRAWDOWN_RATIO = 1.0
-FORWARD_PROTOCOL_VERSION = "niuone-strict-forward-v31"
+FORWARD_PROTOCOL_VERSION = "niuone-strict-forward-v54"
 FORWARD_PERFORMANCE_CLUSTER_UNIT = "entry_date_x_entry_theme"
 FORWARD_SHADOW_CANDIDATES = {
     "execution_gap": "round13_execution_gap_le_1pct",
@@ -67,6 +98,11 @@ FORWARD_REQUIRED_ENTRY_CONTEXT_FIELDS = (
     "entry_niuone_lifecycle_entry_policy",
     "entry_mainline_state",
     "entry_signal_score",
+    "entry_stock_activity_score",
+    "entry_stock_market_amount_percentile",
+    "entry_stock_theme_amount_percentile",
+    "entry_stock_activity_confirmed",
+    "entry_turnover_pct",
     "entry_same_stage_candidate_rank",
     "entry_execution_gap_pct",
     "entry_daily_v_recovery_ratio",
@@ -113,7 +149,11 @@ FORWARD_REQUIRED_EXIT_CONTEXT_FIELDS = (
     "path",
 )
 FORWARD_SCHEDULED_RUN_KINDS = frozenset({"scheduled", "catchup"})
-FORWARD_ALLOWED_RUN_KINDS = frozenset({*FORWARD_SCHEDULED_RUN_KINDS, "manual"})
+FORWARD_ALLOWED_RUN_KINDS = frozenset({
+    *FORWARD_SCHEDULED_RUN_KINDS,
+    "holding_fast",
+    "manual",
+})
 FORWARD_ALLOWED_EXECUTION_MODES = frozenset({"direct", "deferred"})
 FORWARD_CONDITIONAL_ENTRY_CONTEXT_RULES = {
     "entry_schedule_slot": (
@@ -129,9 +169,9 @@ FORWARD_REQUIRED_OPERATING_DAY_EVENTS = (
     "closing_equity_snapshot_ok",
     "post_close_forward_evaluation_ok",
 )
-FORWARD_CANDIDATE_EVIDENCE_SCHEMA_VERSION = 1
+FORWARD_CANDIDATE_EVIDENCE_SCHEMA_VERSION = 2
 FORWARD_EXECUTION_EVIDENCE_SCHEMA_VERSION = 2
-FORWARD_SELL_EXECUTION_EVIDENCE_SCHEMA_VERSION = 1
+FORWARD_SELL_EXECUTION_EVIDENCE_SCHEMA_VERSION = 2
 FORWARD_REQUIRED_EXECUTED_BUY_SIZING_FIELDS = (
     "model_requested_shares",
     "maximum_permitted_shares",
@@ -155,20 +195,12 @@ FORWARD_REQUIRED_CANDIDATE_EVIDENCE_FIELDS = (
 )
 
 
-def _trade_identity(trade: Mapping[str, Any]) -> tuple[str, ...]:
-    """Return the same stable fill identity used by the practice ledger."""
-    return tuple(
-        json.dumps(trade.get(field, ""), ensure_ascii=False, sort_keys=True)
-        for field in ("time", "action", "code", "shares", "price", "reason")
-    )
-
-
 def merge_forward_trade_rows(
     *sources: Iterable[Mapping[str, Any]],
 ) -> tuple[list[dict[str, Any]], int]:
     """Merge persisted trade sources without duplicating simulated fills."""
     merged: list[dict[str, Any]] = []
-    seen: set[tuple[str, ...]] = set()
+    merged_by_identity: dict[tuple[str, ...], dict[str, Any]] = {}
     duplicate_count = 0
     for source in sources:
         for row in source:
@@ -176,11 +208,16 @@ def merge_forward_trade_rows(
                 continue
             materialized = dict(row)
             identity = _trade_identity(materialized)
-            if identity in seen:
+            retained = merged_by_identity.get(identity)
+            if retained is not None:
                 duplicate_count += 1
+                if not trade_counts_for_account(materialized):
+                    for field in ACCOUNTING_AUDIT_FIELDS:
+                        if field in materialized:
+                            retained[field] = materialized[field]
                 continue
-            seen.add(identity)
             merged.append(materialized)
+            merged_by_identity[identity] = materialized
     return merged, duplicate_count
 
 
@@ -235,6 +272,33 @@ def load_niuone_forward_trades_from_db(
         rows = connection.execute(
             f"SELECT {', '.join(selected)} FROM trades ORDER BY time, id"
         ).fetchall()
+        accounting_revision_rows: list[tuple[Any, ...]] = []
+        account_history_table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='account_history'"
+        ).fetchone()
+        if account_history_table is not None:
+            history_columns = {
+                str(item[1])
+                for item in connection.execute(
+                    "PRAGMA table_info(account_history)"
+                ).fetchall()
+            }
+            if {"id", "history_kind", "logical_key", "payload_json"}.issubset(
+                history_columns
+            ):
+                accounting_revision_rows = connection.execute("""
+                    SELECT h.payload_json
+                    FROM account_history AS h
+                    WHERE h.history_kind = 'trade_log'
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM account_history AS newer
+                          WHERE newer.history_kind = h.history_kind
+                            AND newer.logical_key = h.logical_key
+                            AND newer.id > h.id
+                      )
+                    ORDER BY h.id
+                """).fetchall()
 
     materialized: list[dict[str, Any]] = []
     rich_payload_count = 0
@@ -258,10 +322,32 @@ def load_niuone_forward_trades_from_db(
         else:
             materialized.append(_legacy_db_trade(selected, values))
             legacy_payload_count += 1
+    materialized_by_identity = {
+        _trade_identity(trade): trade
+        for trade in materialized
+    }
+    accounting_revision_overlay_count = 0
+    for values in accounting_revision_rows:
+        try:
+            revision = json.loads(str(values[0]))
+        except (TypeError, ValueError, IndexError):
+            continue
+        if not isinstance(revision, Mapping) or trade_counts_for_account(revision):
+            continue
+        retained = materialized_by_identity.get(_trade_identity(revision))
+        if retained is None:
+            continue
+        for field in ACCOUNTING_AUDIT_FIELDS:
+            if field in revision:
+                retained[field] = revision[field]
+        accounting_revision_overlay_count += 1
     return materialized, {
         "database_trade_row_count": len(materialized),
         "rich_payload_trade_row_count": rich_payload_count,
         "legacy_payload_trade_row_count": legacy_payload_count,
+        "accounting_revision_overlay_count": (
+            accounting_revision_overlay_count
+        ),
     }
 
 
@@ -464,6 +550,34 @@ def decision_candidate_evidence_gaps(
             )
             if score is None:
                 gaps.add("candidate_evidence.niuone_score")
+            for field in (
+                "stock_activity_score",
+                "stock_market_amount_percentile",
+                "stock_theme_amount_percentile",
+            ):
+                value = _number(candidate.get(field))
+                if value is None or value < 0 or value > 100:
+                    gaps.add(f"candidate_evidence.{field}")
+            if not isinstance(
+                candidate.get("stock_activity_data_available"),
+                bool,
+            ):
+                gaps.add("candidate_evidence.stock_activity_data_available")
+            activity_confirmed = candidate.get("stock_activity_confirmed")
+            if not isinstance(activity_confirmed, bool):
+                gaps.add("candidate_evidence.stock_activity_confirmed")
+            elif (
+                candidate.get("eligible_for_decision") is True
+                and strategy_id
+                in {"niu_leader", "niu_pullback", "niu_emerging", "niu_reversal_probe"}
+                and activity_confirmed is not True
+            ):
+                gaps.add("candidate_evidence.stock_activity_consistency")
+            if candidate.get("eligible_for_decision") is True:
+                if niuone_turnover_blocker(candidate.get("turnover")):
+                    gaps.add("candidate_evidence.turnover")
+                if niuone_stock_activity_blocker(strategy_id, candidate):
+                    gaps.add("candidate_evidence.stock_activity_consistency")
     return tuple(sorted(gaps))
 
 
@@ -510,6 +624,7 @@ def _summarize_niuone_sell_execution(
 ) -> dict[str, Any]:
     """Audit durable model-directed NiuOne SELL quantity reductions."""
     model_sell_fill_count = 0
+    priority_replacement_sell_fill_count = 0
     automatic_sell_fill_count = 0
     auto_reduced_sell_fill_count = 0
     requested_share_count = 0
@@ -547,7 +662,11 @@ def _summarize_niuone_sell_execution(
             automatic_sell_fill_count += 1
             continue
 
-        model_sell_fill_count += 1
+        sell_execution_source = str(fill.get("sell_execution_source") or "")
+        if sell_execution_source == "priority_replacement":
+            priority_replacement_sell_fill_count += 1
+        else:
+            model_sell_fill_count += 1
         gaps: set[str] = set()
         requested = _shares(fill.get("model_requested_sell_shares"))
         available = _optional_quantity(fill.get("available_sell_shares"))
@@ -561,7 +680,10 @@ def _summarize_niuone_sell_execution(
             != FORWARD_SELL_EXECUTION_EVIDENCE_SCHEMA_VERSION
         ):
             gaps.add("durable_sell_fill.schema_version")
-        if fill.get("sell_execution_source") != "model_action":
+        if sell_execution_source not in {
+            "model_action",
+            "priority_replacement",
+        }:
             gaps.add("durable_sell_fill.sell_execution_source")
         if requested <= 0 or requested % 100:
             gaps.add("durable_sell_fill.model_requested_sell_shares")
@@ -575,16 +697,55 @@ def _summarize_niuone_sell_execution(
             and executed > available
         ):
             gaps.add("durable_sell_fill.shares")
+        staged_quantity = None
+        if sell_execution_source == "model_action":
+            evidence = fill.get("niuone_hard_exit_evidence")
+            try:
+                if not isinstance(evidence, Mapping) or evidence.get("schema_version") != 1:
+                    raise ValueError("missing hard-exit observations")
+                verified = niuone_hard_exit_evidence(
+                    strategy_id=_strategy_id(fill),
+                    current_price=float(evidence["current_price"]),
+                    structural_stop=float(evidence["structural_stop"]),
+                    market_hard_stop=evidence["market_hard_stop"] is True,
+                    theme_score=float(evidence["theme_score"]),
+                    theme_state=str(evidence["theme_state"]),
+                )
+                if (evidence.get("confirmed") is not verified["confirmed"]
+                        or evidence.get("signal") != verified["signal"]
+                        or not math.isfinite(float(fill.get("price") or 0))
+                        or abs(float(fill.get("price") or 0) - verified["current_price"]) > 0.00051):
+                    raise ValueError("inconsistent hard-exit observations")
+                if verified["confirmed"]:
+                    if fill.get("exit_signal") != verified["signal"]:
+                        raise ValueError("unverified exit signal")
+                else:
+                    stage = fill.get("soft_exit_stage")
+                    count = int(fill.get("soft_exit_confirmation_count") or 0)
+                    required = int(fill.get("soft_exit_confirmations_required") or 0)
+                    ratio = float(fill.get("soft_exit_reduce_ratio") or 0)
+                    if fill.get("exit_signal") != "model_soft_exit" or required < 2 or count < 1:
+                        raise ValueError("missing staged exit")
+                    if stage == "reduce" and 0 < ratio <= 0.75:
+                        staged_quantity = min(requested, int((available or 0) * ratio) // 100 * 100)
+                    elif stage == "exit" and count >= required:
+                        staged_quantity = available
+                    else:
+                        raise ValueError("unconfirmed staged exit")
+                    if executed != staged_quantity:
+                        raise ValueError("inconsistent staged quantity")
+            except (KeyError, TypeError, ValueError, OverflowError):
+                gaps.add("durable_sell_fill.niuone_exit_arbitration")
         if not isinstance(auto_reduced, bool):
             gaps.add("durable_sell_fill.sell_quantity_auto_reduced")
         elif auto_reduced:
             if not (
                 requested > (available or 0) > 0
                 and available % 100 == 0
-                and executed == available
+                and executed == (staged_quantity if staged_quantity is not None else available)
             ):
                 gaps.add("durable_sell_fill.sell_quantity_auto_reduced")
-        elif requested != executed:
+        elif requested != executed and staged_quantity is None:
             gaps.add("durable_sell_fill.sell_quantity_auto_reduced")
 
         requested_share_count += requested
@@ -598,9 +759,12 @@ def _summarize_niuone_sell_execution(
                 invalid_field_counts[field] += 1
 
     return {
-        "unit_of_analysis": "deduplicated_durable_model_niuone_sell_fill",
+        "unit_of_analysis": "deduplicated_durable_niuone_sell_fill",
         "schema_version": FORWARD_SELL_EXECUTION_EVIDENCE_SCHEMA_VERSION,
         "model_sell_fill_count": model_sell_fill_count,
+        "priority_replacement_sell_fill_count": (
+            priority_replacement_sell_fill_count
+        ),
         "automatic_sell_fill_count": automatic_sell_fill_count,
         "auto_reduced_sell_fill_count": auto_reduced_sell_fill_count,
         "requested_share_count": requested_share_count,
@@ -1485,6 +1649,25 @@ def _entry_attribution_gaps(row: Mapping[str, Any]) -> tuple[str, ...]:
     ):
         if _number(context.get(field)) is None:
             gaps.append(field)
+    for field, minimum in (
+        ("entry_stock_activity_score", 0),
+        ("entry_stock_market_amount_percentile", NIUONE_MATURE_MIN_MARKET_AMOUNT_PERCENTILE),
+        ("entry_stock_theme_amount_percentile", NIUONE_MATURE_MIN_THEME_AMOUNT_PERCENTILE),
+    ):
+        value = _number(context.get(field))
+        if value is None or value < minimum or value > 100:
+            gaps.append(field)
+    activity_confirmed = context.get("entry_stock_activity_confirmed")
+    if not isinstance(activity_confirmed, bool):
+        gaps.append("entry_stock_activity_confirmed")
+    elif (
+        str(row.get("entry_strategy") or "").strip()
+        in {"niu_leader", "niu_pullback", "niu_emerging", "niu_reversal_probe"}
+        and activity_confirmed is not True
+    ):
+        gaps.append("entry_stock_activity_confirmed")
+    if niuone_turnover_blocker(context.get("entry_turnover_pct")):
+        gaps.append("entry_turnover_pct")
     rank = _number(context.get("entry_same_stage_candidate_rank"))
     if rank is None or rank <= 0 or not float(rank).is_integer():
         gaps.append("entry_same_stage_candidate_rank")
@@ -1818,28 +2001,6 @@ def _entry_context(trade: Mapping[str, Any]) -> dict[str, Any]:
 def _exit_context(trade: Mapping[str, Any]) -> dict[str, Any]:
     context = trade.get("niuone_lifecycle_evidence")
     return dict(context) if isinstance(context, Mapping) else {}
-
-
-def _buy_cost(trade: Mapping[str, Any]) -> float | None:
-    explicit = _number(trade.get("total_cost"))
-    if explicit is not None and explicit > 0:
-        return explicit
-    amount = _number(trade.get("amount"))
-    fee = _number(trade.get("fee")) or 0.0
-    if amount is None or amount <= 0:
-        return None
-    return amount + fee
-
-
-def _sell_proceeds(trade: Mapping[str, Any]) -> float | None:
-    explicit = _number(trade.get("net_proceeds"))
-    if explicit is not None and explicit >= 0:
-        return explicit
-    amount = _number(trade.get("amount"))
-    fee = _number(trade.get("fee")) or 0.0
-    if amount is None or amount <= 0 or amount < fee:
-        return None
-    return amount - fee
 
 
 def _full_months(start: date, end: date) -> int:
@@ -2712,6 +2873,7 @@ def evaluate_niuone_forward(
     minimum_return_to_drawdown_ratio: float = (
         DEFAULT_MIN_RETURN_TO_DRAWDOWN_RATIO
     ),
+    maximum_open_niuone_positions: int = NIUONE_MAX_OPEN_POSITIONS,
 ) -> dict[str, Any]:
     """Evaluate only complete, post-cohort NiuOne position lifecycles.
 
@@ -2722,15 +2884,23 @@ def evaluate_niuone_forward(
     """
     start = _date_value(cohort_start, field_name="cohort_start")
     cutoff = _date_value(as_of or date.today(), field_name="as_of")
+    resolved_maximum_open_positions = int(maximum_open_niuone_positions)
+    if resolved_maximum_open_positions <= 0:
+        raise ValueError("maximum_open_niuone_positions must be positive")
     resolved_expected_operating_dates = (
         sorted({str(value)[:10] for value in expected_operating_dates})
         if expected_operating_dates is not None
         else _expected_weekday_dates(start, cutoff)
     )
     trade_rows = list(trades)
+    active_execution_rows = [
+        trade
+        for trade in trade_rows
+        if isinstance(trade, Mapping) and trade_counts_for_account(trade)
+    ]
     opportunities = summarize_niuone_forward_opportunities(
         decision_rows,
-        execution_rows=trade_rows,
+        execution_rows=active_execution_rows,
         cohort_start=start,
         as_of=cutoff,
     )
@@ -2753,168 +2923,28 @@ def evaluate_niuone_forward(
             "minimum_return_to_drawdown_ratio must be positive"
         )
 
-    normalized: list[tuple[date, int, Mapping[str, Any]]] = []
-    seen_trade_ids: set[tuple[str, ...]] = set()
-    duplicate_trade_count = 0
-    invalid_timestamp_count = 0
-    for index, trade in enumerate(trade_rows):
-        if not isinstance(trade, Mapping):
-            invalid_timestamp_count += 1
-            continue
-        identity = _trade_identity(trade)
-        if identity in seen_trade_ids:
-            duplicate_trade_count += 1
-            continue
-        seen_trade_ids.add(identity)
-        try:
-            trade_date = _date_value(trade.get("time"), field_name="trade time")
-        except ValueError:
-            invalid_timestamp_count += 1
-            continue
-        if trade_date <= cutoff:
-            normalized.append((trade_date, index, trade))
-    normalized.sort(key=lambda item: (item[0], str(item[2].get("time") or ""), item[1]))
-
-    active: dict[str, dict[str, Any]] = {}
-    completed: list[dict[str, Any]] = []
-    orphan_sell_count = 0
-    invalid_trade_count = 0
-    oversold_lifecycle_count = 0
-    unverified_open_count = 0
-    inconsistent_quantity_count = 0
-    for trade_date, _index, trade in normalized:
-        action = str(trade.get("action") or "").upper()
-        code = str(trade.get("code") or "").strip()
-        if action not in {"BUY", "SELL"} or not code:
-            continue
-        quantity = _shares(trade.get("shares"))
-        if quantity <= 0:
-            invalid_trade_count += 1
-            continue
-        if action == "BUY":
-            cost = _buy_cost(trade)
-            if cost is None:
-                invalid_trade_count += 1
-                continue
-            before_quantity = _optional_quantity(
-                trade.get("position_before_qty")
-            )
-            after_quantity = _optional_quantity(
-                trade.get("position_after_qty")
-            )
-            lifecycle = active.get(code)
-            if lifecycle is None:
-                verified_open = before_quantity == 0
-                if not verified_open:
-                    unverified_open_count += 1
-                lifecycle = {
-                    "entry_date": trade_date,
-                    "entry_time": str(trade.get("time") or ""),
-                    "entry_strategy": _strategy_id(trade),
-                    "entry_context": _entry_context(trade),
-                    "entry_fill_shares": quantity,
-                    "entry_payload_available": trade.get(
-                        "_forward_payload_available"
-                    ),
-                    "exit_context": {},
-                    "exit_payload_available": None,
-                    "quantity": before_quantity or 0,
-                    "buy_cost": 0.0,
-                    "sell_proceeds": 0.0,
-                    "transaction_count": 0,
-                    "verified_open": verified_open,
-                }
-                active[code] = lifecycle
-            elif (
-                before_quantity is not None
-                and before_quantity != int(lifecycle["quantity"])
-            ):
-                lifecycle["verified_open"] = False
-                inconsistent_quantity_count += 1
-            expected_after = int(lifecycle["quantity"]) + quantity
-            if after_quantity is not None and after_quantity != expected_after:
-                lifecycle["verified_open"] = False
-                inconsistent_quantity_count += 1
-            lifecycle["quantity"] = (
-                after_quantity if after_quantity is not None else expected_after
-            )
-            lifecycle["buy_cost"] += cost
-            lifecycle["transaction_count"] += 1
-            continue
-
-        lifecycle = active.get(code)
-        if lifecycle is None:
-            orphan_sell_count += 1
-            continue
-        proceeds = _sell_proceeds(trade)
-        if proceeds is None:
-            invalid_trade_count += 1
-            continue
-        before_quantity = _optional_quantity(trade.get("position_before_qty"))
-        after_quantity = _optional_quantity(trade.get("position_after_qty"))
-        if (
-            before_quantity is not None
-            and before_quantity != int(lifecycle["quantity"])
-        ):
-            lifecycle["verified_open"] = False
-            inconsistent_quantity_count += 1
-        if quantity > int(lifecycle["quantity"]):
-            oversold_lifecycle_count += 1
-            active.pop(code, None)
-            continue
-        expected_after = int(lifecycle["quantity"]) - quantity
-        if after_quantity is not None and after_quantity != expected_after:
-            lifecycle["verified_open"] = False
-            inconsistent_quantity_count += 1
-        lifecycle["quantity"] = (
-            after_quantity if after_quantity is not None else expected_after
-        )
-        lifecycle["sell_proceeds"] += proceeds
-        lifecycle["transaction_count"] += 1
-        lifecycle["exit_context"] = _exit_context(trade)
-        lifecycle["exit_payload_available"] = trade.get(
-            "_forward_payload_available"
-        )
-        if lifecycle["quantity"] > 0:
-            continue
-
-        active.pop(code, None)
-        entry_date = lifecycle["entry_date"]
-        entry_strategy = str(lifecycle["entry_strategy"] or "")
-        buy_cost = float(lifecycle["buy_cost"])
-        if (
-            entry_date < start
-            or entry_strategy not in NIUONE_STRATEGY_IDS
-            or buy_cost <= 0
-            or lifecycle["verified_open"] is not True
-        ):
-            continue
-        realized_pnl = float(lifecycle["sell_proceeds"]) - buy_cost
-        context = lifecycle["entry_context"]
-        completed.append({
-            "entry_date": entry_date.isoformat(),
-            "entry_time": lifecycle["entry_time"],
-            "exit_date": trade_date.isoformat(),
-            "exit_time": str(trade.get("time") or ""),
-            "entry_strategy": entry_strategy,
-            "net_return_pct": realized_pnl / buy_cost * 100.0,
-            "realized_pnl": realized_pnl,
-            "holding_calendar_days": (trade_date - entry_date).days,
-            "transaction_count": int(lifecycle["transaction_count"]),
-            "entry_context": context,
-            "entry_fill_shares": lifecycle["entry_fill_shares"],
-            "entry_payload_available": lifecycle[
-                "entry_payload_available"
-            ],
-            "exit_context": lifecycle["exit_context"],
-            "exit_payload_available": lifecycle[
-                "exit_payload_available"
-            ],
-            "required_holding_dates": [
-                value for value in resolved_expected_operating_dates
-                if entry_date.isoformat() <= value <= trade_date.isoformat()
-            ],
-        })
+    lifecycle_result = reconstruct_trade_lifecycles(
+        trade_rows, as_of=cutoff, strategy_resolver=_strategy_id,
+    )
+    normalized = lifecycle_result["normalized"]
+    active = lifecycle_result["active"]
+    completed = [
+        {**row, "required_holding_dates": [
+            value for value in resolved_expected_operating_dates
+            if row["entry_date"] <= value <= row["exit_date"]
+        ]}
+        for row in lifecycle_result["completed"]
+        if row["entry_date"] >= start.isoformat()
+        and row["entry_strategy"] in NIUONE_STRATEGY_IDS
+    ]
+    duplicate_trade_count = lifecycle_result["coverage"]["duplicate_trade_count"]
+    invalid_timestamp_count = lifecycle_result["coverage"]["invalid_timestamp_count"]
+    inactive_accounting_trade_count = lifecycle_result["coverage"]["inactive_accounting_trade_count"]
+    orphan_sell_count = lifecycle_result["coverage"]["orphan_sell_count"]
+    invalid_trade_count = lifecycle_result["coverage"]["invalid_trade_count"]
+    oversold_lifecycle_count = lifecycle_result["coverage"]["oversold_lifecycle_count"]
+    unverified_open_count = lifecycle_result["coverage"]["unverified_open_count"]
+    inconsistent_quantity_count = lifecycle_result["coverage"]["inconsistent_quantity_count"]
 
     elapsed_days = max(0, (cutoff - start).days)
     elapsed_months = _full_months(start, cutoff)
@@ -3090,6 +3120,11 @@ def evaluate_niuone_forward(
             "Exact duplicate fill rows were collapsed by the practice-ledger "
             "event identity before lifecycle reconstruction."
         )
+    if inactive_accounting_trade_count:
+        warnings.append(
+            "Rejected, voided, or reversed audit rows were retained in the raw "
+            "ledger but excluded from lifecycle and performance calculations."
+        )
     if not data_quality_gate_met:
         warnings.append(
             "Completed lifecycles with incomplete entry attribution or holding-"
@@ -3121,6 +3156,8 @@ def evaluate_niuone_forward(
             "cohort_start": start.isoformat(),
             "as_of": cutoff.isoformat(),
             "minimum_completed_trades": minimum_completed_trades,
+            "complete_trade_definition": COMPLETE_TRADE_DEFINITION,
+            "probe_chase_experiment": probe_chase_protocol(),
             "minimum_calendar_months": minimum_calendar_months,
             "historical_reference_win_rate_pct": (
                 historical_reference_win_rate_pct
@@ -3169,8 +3206,96 @@ def evaluate_niuone_forward(
                 NIUONE_MAX_NEW_POSITIONS_PER_TRADING_DAY
             ),
             "daily_new_position_limit_rule": (
-                "distinct durable NiuOne opening BUY codes per Beijing "
-                "trading date; adds and non-NiuOne openings excluded"
+                "no morning, afternoon, per-decision, or per-trading-day "
+                "NiuOne opening-count limit; portfolio capacity and risk "
+                "budgets remain binding"
+            ),
+            "maximum_open_niuone_positions": (
+                resolved_maximum_open_positions
+            ),
+            "priority_replacement_rule": (
+                "when the configured maximum-position book is full, a new "
+                "NiuOne candidate may "
+                "replace only a fully T+1-sellable NiuOne holding with a "
+                "current audited portfolio priority lower by the active "
+                "bounded feedback margin; execute "
+                "the full SELL before the BUY"
+            ),
+            "priority_replacement_minimum_margin": (
+                NIUONE_REPLACEMENT_PRIORITY_MARGIN
+            ),
+            "staged_soft_exit_rule": (
+                "non-structural no-progress, score, theme/sector weakening, "
+                "and ordinary giveback exits reduce first and close the runner "
+                "only after distinct-session confirmation; score 4-5 vetoes "
+                "the first session; hard structural and market stops bypass it"
+            ),
+            "staged_soft_exit_confirmations": SOFT_EXIT_CONFIRMATIONS,
+            "staged_soft_exit_reduce_ratio": SOFT_EXIT_REDUCE_RATIO,
+            "staged_soft_exit_score_veto_threshold": (
+                SOFT_EXIT_SCORE_VETO_THRESHOLD
+            ),
+            "post_exit_observation_rule": (
+                "durable 1/3/5/10-session forward observations store close, "
+                "MFE, MAE, benchmark excess, and replacement relative return; "
+                "five-session labels define sell-fly and avoided-loss outcomes"
+            ),
+            "post_exit_reentry_rule": (
+                "a fully closed staged soft exit remains on a five-session "
+                "shadow watch; only a full scan may reopen after reclaiming the "
+                "exit high/BBI with volume and the original thesis intact"
+            ),
+            "exit_feedback_algorithm_version": (
+                EXIT_FEEDBACK_ALGORITHM_VERSION
+            ),
+            "exit_feedback_rule": (
+                "mature five-session outcomes never downgrade; actual fills "
+                "and executed replacements plus direct allowed/blocked re-entry "
+                "shadows feed a 120-observation, same-security/day clustered, "
+                "capital-weighted 90-percent confidence gate; each cooldown "
+                "batch moves at most one declared grid step and hold evaluations "
+                "do not create policy versions; structural stops and portfolio "
+                "risk limits remain immutable"
+            ),
+            "exit_feedback_default_parameters": dict(
+                EXIT_FEEDBACK_DEFAULT_PARAMETERS
+            ),
+            "exit_feedback_parameter_bounds": {
+                name: list(values)
+                for name, values in EXIT_FEEDBACK_PARAMETER_BOUNDS.items()
+            },
+            "exit_feedback_default_minimum_samples": (
+                EXIT_FEEDBACK_DEFAULT_MIN_SAMPLES
+            ),
+            "exit_feedback_default_minimum_months": (
+                EXIT_FEEDBACK_DEFAULT_MIN_MONTHS
+            ),
+            "exit_feedback_default_cooldown_samples": (
+                EXIT_FEEDBACK_DEFAULT_COOLDOWN_SAMPLES
+            ),
+            "exit_feedback_maximum_window_samples": (
+                EXIT_FEEDBACK_MAX_WINDOW_SAMPLES
+            ),
+            "exit_feedback_confidence_level": (
+                EXIT_FEEDBACK_CONFIDENCE_LEVEL
+            ),
+            "niuone_reversal_entry_maximum_change_pct_exclusive": (
+                NIUONE_REVERSAL_ENTRY_MAX_CHANGE_PCT_EXCLUSIVE
+            ),
+            "niuone_minimum_entry_turnover_pct": NIUONE_MIN_ENTRY_TURNOVER_PCT,
+            "niuone_minimum_market_amount_percentile": NIUONE_MATURE_MIN_MARKET_AMOUNT_PERCENTILE,
+            "niuone_minimum_theme_amount_percentile": NIUONE_MATURE_MIN_THEME_AMOUNT_PERCENTILE,
+            "niuone_all_stage_activity_rule": (
+                "Every NiuOne entry and add requires actual cumulative same-day "
+                "turnover >= minimum and valid market/theme amount ranks; no "
+                "Probe or legacy opt-out. Execution rechecks quoted turnover. "
+                "Daily backtests use signal-day observed data, never next-day totals."
+            ),
+            "niuone_reversal_entry_price_rule": (
+                "First or reopened Probe BUY requires a finite positive quote "
+                "previous close and execution-price change strictly below the "
+                "maximum; scan price/percentage cannot replace that reference. "
+                "Existing-position adds and other entry strategies retain their rules."
             ),
             "niuone_reversal_minimum_recovery_ratio_inclusive": (
                 NIUONE_DAILY_V_MIN_RECOVERY_RATIO
@@ -3196,8 +3321,49 @@ def evaluate_niuone_forward(
             "niuone_reversal_daily_candidate_limit": (
                 strategy_daily_candidate_limit("niu_reversal_probe")
             ),
+            "niuone_reversal_minimum_theme_attribution_weight": (
+                NIUONE_THEME_LEADER_MIN_ATTRIBUTION_WEIGHT
+            ),
+            "niuone_reversal_primary_theme_minimum_score": (
+                NIUONE_THEME_ATTRIBUTION_CONFIDENCE_SCORE
+            ),
+            "niuone_reversal_theme_attribution_rule": (
+                "Probes require selected-theme weight >= 0.15 or the highest-"
+                "score primary theme >= 60 with matching attribution-list "
+                "evidence; invalid/missing evidence fails closed at scoring, "
+                "selection and execution; diagnostic fallback is never eligibility"
+            ),
+            "niuone_same_theme_position_count_limit": None,
+            "niuone_same_theme_capacity_rule": (
+                "no fixed same-sector or same-theme position-count limit; "
+                "theme risk, theme exposure, portfolio risk, and the configured "
+                "maximum-position book remain binding"
+            ),
             "niuone_reversal_absolute_position_cap_pct": (
                 NIUONE_ABSOLUTE_POSITION_CAP_PCT["niu_reversal_probe"]
+            ),
+            "niuone_reversal_rotation_per_trade_risk_pct": (
+                NIUONE_REVERSAL_RISK_BUDGETS["rotation"][
+                    "per_trade_risk_pct"
+                ]
+            ),
+            "niuone_reversal_rotation_max_theme_risk_pct": (
+                NIUONE_REVERSAL_RISK_BUDGETS["rotation"][
+                    "max_sector_risk_pct"
+                ]
+            ),
+            "niuone_markup_scale_in_decision_rule": (
+                "qualifying 10% early-markup and 20% confirmed-markup adds "
+                "are generated deterministically by local lifecycle rules; "
+                "explicit SELL remains exit-first and the executor rechecks "
+                "all sizing and risk ceilings"
+            ),
+            "holding_fast_cycle_rule": (
+                "when enabled, the bounded fast cycle rescans only currently "
+                "open holdings with the same active strategy scorers, model "
+                "decision policy, exit-first ordering, and execution risk "
+                "gates as a full Practice cycle; BUY is add-only and cannot "
+                "open or reopen a symbol"
             ),
             "niuone_markup_upgrade_minimum_pnl_pct": (
                 NIUONE_MARKUP_UPGRADE_MIN_PNL_PCT
@@ -3289,6 +3455,16 @@ def evaluate_niuone_forward(
                 "that available quantity; zero or non-whole-lot availability "
                 "and all non-NiuOne model SELL requests remain fail-closed"
             ),
+            "niuone_model_sell_arbitration_rule": (
+                "Model prose and supplied labels never authorize hard exits. "
+                "Verify execution price below structural/breakeven stop, inactive "
+                "theme, or market hard stop with weak theme using shared local rules. "
+                "All other model SELLs, including missing reasons, use staged soft "
+                "exits; polling preserves model confirmations and explicit HOLD "
+                "resets them. Validated priority replacements retain their policy."
+            ),
+            "niuone_hard_exit_evidence_schema_version": 1,
+            "niuone_structural_stop_price_source": "current_execution_quote",
             "performance_cluster_unit": (
                 FORWARD_PERFORMANCE_CLUSTER_UNIT
             ),
@@ -3463,6 +3639,7 @@ def evaluate_niuone_forward(
             "unverified_open_count": unverified_open_count,
             "inconsistent_quantity_count": inconsistent_quantity_count,
             "duplicate_trade_count": duplicate_trade_count,
+            "inactive_accounting_trade_count": inactive_accounting_trade_count,
             "rich_payload_trade_count": rich_payload_count,
             "legacy_payload_trade_count": legacy_payload_count,
         },

@@ -26,6 +26,7 @@ export DASHBOARD_TRADER_SCRIPT="${DASHBOARD_TRADER_SCRIPT:-$ROOT/app/entrypoints
 export DASHBOARD_PORTFOLIO_STATE="${DASHBOARD_PORTFOLIO_STATE:-$DASHBOARD_HOME/cron/output/niuniu_practice_portfolio.json}"
 export DASHBOARD_CONFIG="${DASHBOARD_CONFIG:-$DASHBOARD_HOME/config.yaml}"
 export DASHBOARD_PUSH_HISTORY_DB="${DASHBOARD_PUSH_HISTORY_DB:-$DASHBOARD_HOME/push_history.db}"
+export DASHBOARD_PROMPT_STRATEGY_DB="${DASHBOARD_PROMPT_STRATEGY_DB:-$DASHBOARD_HOME/prompt_strategies.db}"
 
 echo "牛牛1号 standalone"
 echo "  root:           $ROOT"

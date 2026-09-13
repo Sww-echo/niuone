@@ -73,12 +73,22 @@ Dashboard、定时任务、消息通知与策略研究。修改时优先保证�
 
 - `web/` 使用 Vue 3、Vue Router 与 Vite；`frontend/` 仅保留 Vue 组件复用的页面样式，不再新增原生 HTML 或控制器脚本。
 - 修改 API 字段时同步检查 Dashboard 与管理页消费者、缓存键和缓存失效逻辑。
+- 修改页面布局、组件结构或响应式样式时，必须同步优化移动端，至少覆盖 390px 常见手机宽度和
+  320px 窄屏，避免横向溢出、关键信息截断和触控目标过小；交付前使用真实页面或等效浏览器
+  视口完成移动端视觉验证，并为关键响应式规则补充测试。
 - 用户界面保持当前中文术语和标签风格；修改公开说明时同步维护对应的英文 README 或文档。
 - JavaScript 修改至少运行受影响文件的 `node --check`；Vue 组件或构建配置修改必须运行
   `pnpm --dir web run build`。
 
 ## 测试与验证
 
+- 本地集成测试、冒烟测试和部署验证统一使用 Docker Compose；不通过 `run.sh`、`run.bat`
+  或直接启动 Python 服务来运行待测程序。单元测试仍按下述命令直接执行。
+- Docker 测试使用独立的 Compose project name 隔离数据卷，例如
+  `docker compose -p niuone-smoke up -d --build`。NewsNow 必须作为 Compose sidecar 随
+  Dashboard 自动启动，不单独配置或启动。
+- 启动前确认 Compose 配置的宿主机端口可用。默认端口被占用时立即报告冲突并停止测试；
+  不得自动改用其他端口，也不得擅自停止或替换占用端口的现有服务。
 - 测试使用现有 `unittest` 风格，文件命名为 `tests/test_*.py`。
 - 每个行为修复至少增加一个能在修复前失败的回归测试。涉及并发、恢复或缓存时，同时覆盖
   重复执行、边界时间、已有真实数据和失败降级。
@@ -99,16 +109,31 @@ Dashboard、定时任务、消息通知与策略研究。修改时优先保证�
 - 全量验证包括 Python、JavaScript、Shell、Windows BAT 和全部单元测试。若本机环境导致
   既有失败，必须在未修改的 `main` 上复现并在交付说明中明确列出；不要删除断言或跳过测试
   来制造通过结果。
+- 功能代码修改完成并通过相关测试及全量验证后，交付前必须使用正式 Compose project
+  重新构建并重启受影响服务（正式 project 仅用于验证通过后的部署，不作为实验环境），例如：
+
+  ```bash
+  docker compose up -d --build dashboard scheduler
+  ```
+
+  重启后必须检查 `docker compose ps`，并验证 `/healthz`、`/readyz` 等适用的健康接口。
+  仅文档、注释或不进入运行镜像的元数据变更可以不重建容器，交付说明中必须明确该例外。
 - 文档或极小配置变更至少运行 `git diff --check`，并说明为何未运行全量测试。
 
 ## 运行数据与安全
 
 - `.local-data/`、数据库、日志、备份、状态文件和本机配置均为私有运行数据，不提交、不复制
   到文档，也不在工具输出中展示。
-- 不要直接用真实运行目录做实验。临时启动示例：
+- 不要直接用真实运行目录或正式 Compose project 做实验。Docker 冒烟测试使用独立 project：
 
   ```bash
-  DASHBOARD_HOME=/tmp/niuone-smoke DASHBOARD_PORT=8877 ./scripts/run_standalone.sh
+  docker compose -p niuone-smoke up -d --build
+  ```
+
+  测试结束后只清理这个明确命名的临时 project：
+
+  ```bash
+  docker compose -p niuone-smoke down -v
   ```
 
 - 提交前检查：
@@ -122,12 +147,17 @@ Dashboard、定时任务、消息通知与策略研究。修改时优先保证�
 
 ## Git、提交与 PR 风格
 
+- 后续默认直接在 `main` 分支完成本地修改和提交。未经用户明确要求，不得自动新建分支，
+  包括任务分支、备份分支及 worktree 附带分支。若当前位于其他分支，先核对工作区和提交
+  归属，再安全切换到 `main`；不得为切换分支丢弃或覆盖用户已有修改。
 - 提交和 PR 标题使用 Conventional Commits：`type(scope): subject`。
 - 常用 `type`：`feat`、`fix`、`refactor`、`perf`、`docs`、`test`、`chore`。
 - `scope` 取主要领域，例如：`dashboard`、`market`、`settings`、`strategy`、`trading`、
   `auction`、`container`、`run`、`readme`、`app`。修改 `app/trading/` 的行为应使用
   `fix(trading): ...`，不要退化成无 scope 的 `fix: ...`。
-- `subject` 使用简洁的英文祈使表达，小写开头，不加句号。一个提交只承载一个逻辑变更。
+- 提交信息只使用一行标题，不写正文。`subject` 使用清晰具体的英文祈使表达，小写开头，
+  不加句号；应直接说明改了什么及主要影响对象，避免只写含义宽泛的 `update`、`improve`
+  或 `unify`。一个提交只承载一个逻辑变更。
 - PR 标题必须直接可用作 squash commit 标题；执行 squash merge 前再次核对最终标题，避免
   把不合规的 PR 标题写入 `main`。
 - PR 描述至少包含：修改内容、问题原因、兼容性/影响范围、实际运行的验证命令和结果。
@@ -148,3 +178,4 @@ Dashboard、定时任务、消息通知与策略研究。修改时优先保证�
 5. `git diff --check` 及相关/全量测试结果已记录。
 6. 没有运行数据、密钥、数据库或日志进入待提交文件。
 7. 提交或 PR 标题符合 `type(scope): subject`，scope 与主要改动一致。
+8. 功能变更已重新构建并重启受影响容器并确认服务健康；适用例外已在交付说明中明确。

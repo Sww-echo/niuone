@@ -19,10 +19,12 @@ from market_data.iwencai_client import (
 
 IWENCAI_TEST_QUERY = "上证指数最新价"
 IWENCAI_TEST_FIELD_NAMES = (
+    "IWENCAI_NEWS_PRECHECK_ENABLED",
     "IWENCAI_BASE_URL",
     "IWENCAI_API_KEY",
     "IWENCAI_TIMEOUT_SECONDS",
 )
+IWENCAI_MESSAGE_TEST_STOCK = {"code": "600519", "name": "贵州茅台"}
 
 
 def iwencai_test_metadata() -> dict[str, Any]:
@@ -30,7 +32,7 @@ def iwencai_test_metadata() -> dict[str, Any]:
         "id": "iwencai",
         "group_slug": "iwencai",
         "label": "问财接口",
-        "description": "发送一次轻量只读查询，验证网关地址和 API Key。",
+        "description": "验证问财行情接口；开启消息面预检时，同时验证公告、新闻和事件技能。",
         "field_names": list(IWENCAI_TEST_FIELD_NAMES),
     }
 
@@ -65,7 +67,7 @@ def test_iwencai_connection(
     semaphore: threading.BoundedSemaphore | None = None,
     monotonic=time.monotonic,
 ) -> dict[str, Any]:
-    """Run one bounded query and return only non-sensitive diagnostics."""
+    """Run bounded read-only queries and return only non-sensitive diagnostics."""
 
     try:
         configured = IwencaiConfig.from_env(values)
@@ -90,6 +92,7 @@ def test_iwencai_connection(
         client_kwargs["semaphore"] = semaphore
     client = IwencaiClient(test_config, **client_kwargs)
     started = monotonic()
+    active_skill = "hithink-market-query"
     try:
         payload = client.query(
             IWENCAI_TEST_QUERY,
@@ -98,19 +101,53 @@ def test_iwencai_connection(
             is_cache=True,
             expand_index=False,
         )
+        tested_skills = ["hithink-market-query"]
+        news_precheck_enabled = str(
+            values.get("IWENCAI_NEWS_PRECHECK_ENABLED") or "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if news_precheck_enabled:
+            label = f"{IWENCAI_MESSAGE_TEST_STOCK['code']} {IWENCAI_MESSAGE_TEST_STOCK['name']}"
+            active_skill = "announcement-search"
+            client.comprehensive_search(
+                f"{label} 最近3日公司公告",
+                channel="announcement",
+                size=1,
+            )
+            active_skill = "news-search"
+            client.comprehensive_search(
+                f"{label} 最近3日公司新闻和重大事项",
+                channel="news",
+                size=1,
+            )
+            active_skill = "hithink-event-query"
+            client.query(
+                f"{label} 最近3日业绩预告或增发或质押或解禁或机构调研或监管函",
+                page=1,
+                limit=1,
+                is_cache=False,
+                expand_index=True,
+                skill_id="hithink-event-query",
+            )
+            tested_skills.extend((
+                "announcement-search",
+                "news-search",
+                "hithink-event-query",
+            ))
     except (IwencaiConfigurationError, IwencaiRequestError, IwencaiResponseError) as exc:
         return {
             "ok": False,
             "target": "iwencai",
-            "error": _error_message(exc),
+            "error": f"{active_skill}：{_error_message(exc)}",
             "error_code": exc.code,
+            "failed_skill": active_skill,
         }
     except Exception:
         return {
             "ok": False,
             "target": "iwencai",
-            "error": "问财接口测试失败",
+            "error": f"{active_skill}：问财接口测试失败",
             "error_code": "unexpected_error",
+            "failed_skill": active_skill,
         }
 
     elapsed_ms = max(0, int(round((monotonic() - started) * 1000)))
@@ -119,5 +156,10 @@ def test_iwencai_connection(
         "target": "iwencai",
         "elapsed_ms": elapsed_ms,
         "returned_count": len(payload.get("datas") or []),
-        "message": f"问财接口已接通（{elapsed_ms} ms）",
+        "tested_skills": tested_skills,
+        "message": (
+            f"问财行情及 3 个消息面技能均已接通（{elapsed_ms} ms）"
+            if news_precheck_enabled
+            else f"问财行情接口已接通（{elapsed_ms} ms）"
+        ),
     }

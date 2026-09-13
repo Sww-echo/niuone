@@ -52,7 +52,7 @@ print(json.dumps({{
             f"""
 import importlib.util, json
 paths = {{}}
-for name in ('cn_stock_tools', 'niuone_cron_scheduler', 'x_watchlist_daemon'):
+for name in ('cn_stock_tools', 'niuone_cron_scheduler'):
     spec = importlib.util.spec_from_file_location(name + '_relocation_test', {str(COMPAT)!r} + '/' + name + '.py')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -62,7 +62,6 @@ print(json.dumps(paths))
         )
         self.assertTrue(result["cn_stock_tools"].endswith("app/market_data/cn_stock_tools.py"))
         self.assertTrue(result["niuone_cron_scheduler"].endswith("app/automation/scheduler_service.py"))
-        self.assertTrue(result["x_watchlist_daemon"].endswith("app/monitoring/x/daemon_service.py"))
 
     def test_messaging_registry_is_shared_when_package_is_imported_first(self):
         result = self.run_python(
@@ -131,7 +130,6 @@ from app.automation.cron import cron_matches as app_cron_matches
 from app.core.paths import get_dashboard_home as app_dashboard_home
 from app.dashboard.practice_payload import downsample_sequence as app_downsample
 from app.dashboard.apis.hot_stocks import select_hot_stock_ranking as app_select_ranking
-from app.monitoring.x.config import parse_watchlist_accounts as app_parse_accounts
 from app.reports.a_share.calendar import cache_has_year as app_cache_has_year
 from app.reports.a_share.common import normalize_code as app_normalize
 from app.storage.history_records import stable_id as app_stable_id
@@ -142,7 +140,6 @@ from automation.cron import cron_matches
 from core.paths import get_dashboard_home
 from dashboard.practice_payload import downsample_sequence
 from dashboard.apis.hot_stocks import select_hot_stock_ranking
-from monitoring.x.config import parse_watchlist_accounts
 from reports.a_share.calendar import cache_has_year
 from reports.a_share.common import normalize_code
 from storage.history_records import stable_id
@@ -155,14 +152,14 @@ print(json.dumps({{
     "app": [
         str(app_dashboard_home(root)), app_cron_matches('0 8 * * 1-5', datetime(2026, 7, 10, 8)),
         app_downsample(list(range(10)), 3), app_select_ranking(dict(ranking), 'turnover')['items'],
-        app_parse_accounts('@OpenAI, openai; x_ai'), app_normalize("sh600000"),
+        app_normalize("sh600000"),
         app_cache_has_year({{'2026-07-10'}}, 2026), app_stable_id('x', 1),
         app_guidance(report), app_sell_signal("r", "s"),
     ],
     "legacy": [
         str(get_dashboard_home(root)), cron_matches('0 8 * * 1-5', datetime(2026, 7, 10, 8)),
         downsample_sequence(list(range(10)), 3), select_hot_stock_ranking(dict(ranking), 'turnover')['items'],
-        parse_watchlist_accounts('@OpenAI, openai; x_ai'), normalize_code("sh600000"),
+        normalize_code("sh600000"),
         cache_has_year({{'2026-07-10'}}, 2026), stable_id('x', 1),
         extract_decision_guidance(report), _sell_signal("r", "s"),
     ],

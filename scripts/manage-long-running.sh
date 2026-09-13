@@ -20,17 +20,14 @@ PLATFORM="$(uname -s)"
 LABELS=(
   "ai.niuone.dashboard"
   "ai.niuone.cron-scheduler"
-  "ai.niuone.x-watchlist"
 )
 PROGRAMS=(
   "$ROOT/run-dashboard.sh"
   "$ROOT/run-niuone-cron-scheduler.sh"
-  "$ROOT/run-x-watchlist-daemon.sh"
 )
 LINUX_UNITS=(
   "niuone-dashboard.service"
   "niuone-cron-scheduler.service"
-  "niuone-x-watchlist.service"
 )
 
 usage() {
@@ -168,7 +165,7 @@ generate_linux_unit() {
     printf 'After=network-online.target\n\n'
     printf '[Service]\n'
     printf 'Type=simple\n'
-    printf 'WorkingDirectory="%s"\n' "$root_value"
+    printf 'WorkingDirectory=%s\n' "$root_value"
     printf 'Environment="NIUONE_LOCAL_DATA_DIR=%s"\n' "$data_value"
     printf 'Environment="DASHBOARD_ENV_FILE=%s"\n' "$env_value"
     printf 'Environment="PYTHONDONTWRITEBYTECODE=1"\n'
@@ -201,7 +198,6 @@ install_linux() {
   mkdir -p "$unit_dir" "$LOG_DIR"
   generate_linux_unit "$unit_dir/${LINUX_UNITS[0]}" "NiuOne Dashboard" "${PROGRAMS[0]}"
   generate_linux_unit "$unit_dir/${LINUX_UNITS[1]}" "NiuOne Cron Scheduler" "${PROGRAMS[1]}"
-  generate_linux_unit "$unit_dir/${LINUX_UNITS[2]}" "NiuOne X Watchlist Daemon" "${PROGRAMS[2]}"
 
   systemctl --user daemon-reload
   systemctl --user enable "${LINUX_UNITS[@]}"

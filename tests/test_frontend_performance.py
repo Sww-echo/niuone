@@ -9,13 +9,14 @@ ROOT = Path(__file__).resolve().parents[1]
 WEB_SRC = ROOT / "web" / "src"
 VISIBLE_POLLING_PATH = WEB_SRC / "utils" / "visiblePolling.js"
 PUBLIC_PROJECTION_PATH = WEB_SRC / "composables" / "usePublicProjection.js"
+INDICES_DATA_PATH = WEB_SRC / "composables" / "useIndicesData.js"
 
 
 class FrontendPerformanceTests(unittest.TestCase):
     def test_dashboard_brand_logo_uses_bundled_vite_asset(self):
         index_source = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
-        dashboard_source = (
-            WEB_SRC / "components" / "DashboardPage.vue"
+        header_source = (
+            WEB_SRC / "components" / "DashboardHeader.vue"
         ).read_text(encoding="utf-8")
         logo_path = WEB_SRC / "assets" / "niuone-logo.png"
 
@@ -23,11 +24,11 @@ class FrontendPerformanceTests(unittest.TestCase):
         self.assertIn('href="/src/assets/niuone-logo.png"', index_source)
         self.assertIn(
             "import niuoneLogoUrl from '../assets/niuone-logo.png'",
-            dashboard_source,
+            header_source,
         )
-        self.assertIn(':src="niuoneLogoUrl"', dashboard_source)
+        self.assertIn(':src="niuoneLogoUrl"', header_source)
         self.assertNotIn('href="/favicon.png"', index_source)
-        self.assertNotIn('src="/favicon.png"', dashboard_source)
+        self.assertNotIn('src="/favicon.png"', header_source)
 
     def test_dashboard_panels_are_loaded_on_demand(self):
         source = (WEB_SRC / "components" / "DashboardPage.vue").read_text(
@@ -38,9 +39,8 @@ class FrontendPerformanceTests(unittest.TestCase):
             "IndustryFlowPanel",
             "IndicesPanel",
             "MarketMonitorPanel",
+            "OverviewPanel",
             "PracticePanel",
-            "UsRatingsPanel",
-            "XMonitorPanel",
         )
         for panel_name in panel_names:
             self.assertIn(
@@ -54,8 +54,6 @@ class FrontendPerformanceTests(unittest.TestCase):
             WEB_SRC / "composables" / "useIndicesData.js",
             WEB_SRC / "composables" / "useIndustryFlowData.js",
             WEB_SRC / "composables" / "useMarketMonitorData.js",
-            WEB_SRC / "composables" / "useUsRatingsData.js",
-            WEB_SRC / "composables" / "useXMonitorData.js",
             WEB_SRC / "components" / "DragonTigerPanel.vue",
         )
         for path in paths:
@@ -228,6 +226,159 @@ console.log(JSON.stringify({{
                 "nextDelay": 1000,
                 "hiddenAgainTimers": 0,
                 "listenerRemoved": True,
+            },
+        )
+
+    def test_index_polling_does_not_abort_slow_auxiliary_market_requests(self):
+        scenario = f"""
+const pending = new Map();
+const aborted = [];
+let indicesFetches = 0;
+let auxiliaryFetches = 0;
+globalThis.CustomEvent = class {{
+  constructor(name, options) {{ this.type = name; this.detail = options?.detail; }}
+}};
+globalThis.window = {{ dispatchEvent() {{}} }};
+globalThis.document = {{
+  visibilityState: 'visible',
+  createElement() {{ return {{}}; }},
+}};
+function response(payload) {{
+  return {{ ok: true, async json() {{ return payload; }} }};
+}}
+globalThis.fetch = (url, options = {{}}) => {{
+  if (url === '/api/indices') {{
+    indicesFetches += 1;
+    return Promise.resolve(response({{items: [{{name: '上证指数'}}]}}));
+  }}
+  auxiliaryFetches += 1;
+  return new Promise((resolve, reject) => {{
+    const abort = () => {{
+      aborted.push(url);
+      const error = new Error('aborted');
+      error.name = 'AbortError';
+      reject(error);
+    }};
+    options.signal?.addEventListener('abort', abort, {{once: true}});
+    pending.set(url, payload => resolve(response(payload)));
+  }});
+}};
+const {{ useIndicesData }} = await import(
+  {json.dumps(INDICES_DATA_PATH.as_uri())} + '?auxiliary-abort-test=1'
+);
+const api = useIndicesData();
+const first = api.refreshIndices();
+for (let index = 0; index < 5 && pending.size < 6; index += 1) {{
+  await new Promise(resolve => setImmediate(resolve));
+}}
+const second = api.refreshIndices({{background: true}});
+await new Promise(resolve => setImmediate(resolve));
+const payloads = {{
+  '/api/market_breadth': {{latest: {{}}, timeline: [{{generated_at: 'now'}}]}},
+  '/api/sectors': {{sectors: [{{name: '银行'}}]}},
+  '/api/us_sectors': {{items: [{{name: '科技'}}]}},
+  '/api/hot_stocks': {{items: [{{name: '样本股'}}]}},
+  '/api/market_flow': {{total_inflow_yi: 1}},
+  '/api/money_flow': {{inflow: [{{name: '半导体'}}], outflow: []}},
+}};
+for (const [url, resolve] of pending.entries()) resolve(payloads[url]);
+await Promise.all([first, second]);
+await new Promise(resolve => setImmediate(resolve));
+console.log(JSON.stringify({{
+  aborted,
+  indicesFetches,
+  auxiliaryFetches,
+  sector: api.state.sectors.sectors?.[0]?.name,
+}}));
+"""
+        result = subprocess.run(
+            ["node", "--input-type=module", "-e", scenario],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            cwd=ROOT,
+        )
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "aborted": [],
+                "indicesFetches": 2,
+                "auxiliaryFetches": 6,
+                "sector": "银行",
+            },
+        )
+
+    def test_slow_auxiliary_request_does_not_block_other_refresh_intervals(self):
+        scenario = f"""
+let now = 0;
+Date.now = () => now;
+const counts = new Map();
+globalThis.CustomEvent = class {{
+  constructor(name, options) {{ this.type = name; this.detail = options?.detail; }}
+}};
+globalThis.window = {{ dispatchEvent() {{}} }};
+globalThis.document = {{
+  visibilityState: 'visible',
+  createElement() {{ return {{}}; }},
+}};
+function response(payload) {{
+  return {{ ok: true, async json() {{ return payload; }} }};
+}}
+globalThis.fetch = (url, options = {{}}) => {{
+  counts.set(url, (counts.get(url) || 0) + 1);
+  if (url === '/api/indices') {{
+    return Promise.resolve(response({{items: [{{name: '上证指数'}}]}}));
+  }}
+  if (url === '/api/us_sectors') {{
+    return new Promise((resolve, reject) => {{
+      options.signal?.addEventListener('abort', () => {{
+        const error = new Error('aborted');
+        error.name = 'AbortError';
+        reject(error);
+      }}, {{once: true}});
+    }});
+  }}
+  const payloads = {{
+    '/api/market_breadth': {{latest: {{}}, timeline: [{{generated_at: 'now'}}]}},
+    '/api/sectors': {{sectors: [{{name: '银行'}}]}},
+    '/api/hot_stocks': {{items: [{{name: '样本股'}}]}},
+    '/api/market_flow': {{total_inflow_yi: 1}},
+    '/api/money_flow': {{inflow: [{{name: '半导体'}}], outflow: []}},
+  }};
+  return Promise.resolve(response(payloads[url]));
+}};
+const {{ useIndicesData }} = await import(
+  {json.dumps(INDICES_DATA_PATH.as_uri())} + '?auxiliary-independent-test=1'
+);
+const api = useIndicesData();
+await api.refreshIndices();
+await new Promise(resolve => setImmediate(resolve));
+now = 31_000;
+await api.refreshIndices({{background: true}});
+await new Promise(resolve => setImmediate(resolve));
+api.deactivateIndices();
+await new Promise(resolve => setImmediate(resolve));
+console.log(JSON.stringify(Object.fromEntries(counts)));
+"""
+        result = subprocess.run(
+            ["node", "--input-type=module", "-e", scenario],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            cwd=ROOT,
+        )
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "/api/indices": 2,
+                "/api/market_breadth": 2,
+                "/api/sectors": 1,
+                "/api/us_sectors": 1,
+                "/api/hot_stocks": 1,
+                "/api/market_flow": 2,
+                "/api/money_flow": 1,
             },
         )
 

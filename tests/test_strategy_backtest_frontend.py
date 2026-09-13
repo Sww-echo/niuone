@@ -33,9 +33,11 @@ class StrategyBacktestFrontendTests(unittest.TestCase):
         self.assertNotIn("selectedRiskProfile", source)
         self.assertIn("牛牛战法固定使用进取风险参数", source)
         self.assertIn("NIUONE_BACKTEST_PROTOCOL_VERSION", source)
-        self.assertIn("'niuone-backtest-v32'", source)
+        self.assertIn("'niuone-backtest-v43'", source)
+        self.assertIn("stock_activity: '换手率不足3%、成交额排名不足或活跃度数据缺失'", source)
         self.assertIn("staleResult", source)
-        self.assertIn("当前结果由旧版牛牛回测协议生成", source)
+        self.assertIn("当前结果由旧版回测协议生成", source)
+        self.assertIn("避免把不完整指标误认为当前结果", source)
         self.assertIn("/api/admin/backtests/latest/${encodeURIComponent(expectedStrategyId)}", source)
         self.assertIn("'X-NiuOne-Action': '1'", source)
         self.assertIn("async function restoreLatestJob()", source)
@@ -46,12 +48,23 @@ class StrategyBacktestFrontendTests(unittest.TestCase):
         self.assertIn("rebuilding_context: '重建题材截面'", source)
         self.assertIn("scoring: '执行策略评分'", source)
         self.assertIn("replaying_exits: '回放持仓退出'", source)
-        self.assertIn("本日耗时 {{ formatDuration(job.day_elapsed_seconds) }}", source)
+        self.assertIn("本交易日已耗时 {{ formatDuration(liveDayElapsedSeconds) }}", source)
         self.assertIn("预计剩余 {{ formatDuration(job.eta_seconds) }}", source)
+        self.assertIn("window.setInterval(() =>", source)
+        self.assertIn("watch(job, syncElapsedAnchor, { immediate: true })", source)
+        self.assertIn("本次区间 {{ activeRequest.start_date }} 至 {{ activeRequest.end_date }}", source)
+        self.assertIn('v-model="form.startDate" type="date" :disabled="isActive"', source)
         self.assertIn("async function cancelBacktest()", source)
         self.assertIn("/api/admin/backtests/${encodeURIComponent(currentJobId)}/cancel", source)
         self.assertIn('class="backtest-cancel"', source)
         self.assertIn("终止回测", source)
+        self.assertIn("fetch('/api/admin/backtests/cache'", source)
+        self.assertIn("fetch('/api/admin/backtests/cache/clear'", source)
+        self.assertIn("async function clearBacktestCache()", source)
+        self.assertIn("清除回测重放缓存？", source)
+        self.assertIn("清除回测缓存", source)
+        self.assertIn(':disabled="!canClearCache"', source)
+        self.assertIn("重放缓存 {{ Number(cacheUsage.entry_count || 0) }} 项", source)
         self.assertIn("background:var(--danger-button-bg)", source)
         self.assertIn("color:var(--danger-button-text)", source)
         self.assertIn(".backtest-cancel:hover:not(:disabled)", source)
@@ -61,6 +74,11 @@ class StrategyBacktestFrontendTests(unittest.TestCase):
         self.assertNotIn("localStorage", source)
         self.assertIn('role="progressbar"', source)
         self.assertIn("与模拟账户及持仓完全隔离", source)
+        self.assertIn("form.promptVersionId", source)
+        self.assertIn("prompt_strategy_version_id", source)
+        self.assertIn("冻结策略版本", source)
+        self.assertIn("结果保留版本、计划指纹和可重放审计", source)
+        self.assertIn("result.prompt_backtest.replay_verified", source)
         self.assertNotIn('class="backtest-convention"', source)
         self.assertIn("系统按历史行情自主选股；收盘信号于次日开盘买入", source)
         self.assertNotIn('class="backtest-auto-universe"', source)
@@ -143,6 +161,95 @@ class StrategyBacktestFrontendTests(unittest.TestCase):
         self.assertNotIn("const sourceRows", source)
         self.assertNotIn("{{ signal.symbol }}", source)
         self.assertNotIn("{{ item.symbol }}", source)
+
+    def test_backtest_page_uses_financial_workstation_and_tongdaxin_styles(self):
+        source = (
+            ROOT / "web" / "src" / "components" / "AdminBacktestPage.vue"
+        ).read_text(encoding="utf-8")
+        tongdaxin_styles = (
+            ROOT / "frontend" / "tongdaxin-theme.css"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "Financial-workstation presentation: dense, restrained and data-first.",
+            source,
+        )
+        self.assertIn("font-variant-numeric:tabular-nums;", source)
+        self.assertIn(".backtest-progress-track span{\n  border-radius:0;\n  background:var(--primary);", source)
+        self.assertIn(".backtest-table-wrap .is-positive{color:var(--red-text);", source)
+        self.assertIn(".backtest-table-wrap .is-negative{color:var(--green-text);", source)
+        self.assertIn("Strategy backtest: TongdaXin terminal presentation.", tongdaxin_styles)
+        self.assertIn(".backtest-progress-track span {\n  border-radius:0;\n  background:#d40000;", tongdaxin_styles)
+        self.assertIn(".backtest-table-wrap .is-positive { color:#ff4141; }", tongdaxin_styles)
+        self.assertIn(".backtest-table-wrap .is-negative { color:#00d8b4; }", tongdaxin_styles)
+        self.assertNotIn('class="backtest-strategy-dot"', source)
+        self.assertNotIn(".backtest-strategy-dot{", source)
+        self.assertNotIn("border-left:3px solid var(--strategy-color);", source)
+        self.assertNotIn("border-left:3px solid var(--red);", tongdaxin_styles)
+        self.assertNotIn("border-left:2px solid var(--accent-border)", source)
+        self.assertNotIn(
+            ":where(.rating-table tbody tr:hover,.backtest-table-wrap tbody tr:hover)",
+            tongdaxin_styles,
+        )
+        self.assertIn("background:#181000;\n  box-shadow:none;", tongdaxin_styles)
+
+    def test_trade_result_sections_follow_risk_and_capital_efficiency(self):
+        source = (
+            ROOT / "web" / "src" / "components" / "AdminBacktestPage.vue"
+        ).read_text(encoding="utf-8")
+        ordered_headings = (
+            "<h2>风险与资金效率</h2>",
+            "<h2>买卖收益</h2>",
+            "<h2>{{ isTradeLifecycle ? '子策略交易' : '子策略信号' }}</h2>",
+            "<h2>交易明细</h2>",
+            "<h2>买入未成交归因</h2>",
+        )
+
+        positions = [source.index(heading) for heading in ordered_headings]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_backtest_diagnostics_localize_warnings_and_reason_codes(self):
+        source = (
+            ROOT / "web" / "src" / "components" / "AdminBacktestPage.vue"
+        ).read_text(encoding="utf-8")
+
+        expected_reasons = {
+            "markup_rebalance_rule": "主升回补条件未满足",
+            "markup_upgrade_same_day_add": "主升升级当日不重复加仓",
+            "markup_upgrade_early_done": "启动阶段升级加仓已完成",
+            "markup_upgrade_confirmed_done": "主升阶段升级加仓已完成",
+            "markup_upgrade_rule": "主升阶段升级加仓条件未满足",
+            "markup_momentum_identity_block": "主升动量试仓不符合策略身份条件",
+            "reversal_execution_gap": "试仓次日开盘跳空超过执行上限",
+            "reversal_entry_price": "试仓成交涨幅达到3%或缺少有效前收盘价",
+            "markup_momentum_execution_gap": "主升动量试仓次日跳空超过执行上限",
+        }
+        for code, label in expected_reasons.items():
+            self.assertIn(f"{code}: '{label}'", source)
+        self.assertIn("? '其他策略限制' : value", source)
+
+        expected_warnings = {
+            "current classification fallback used: iwencai_current_industry_concept": (
+                "分类源降级"
+            ),
+            "stale current classification snapshot used": "分类快照过期",
+            "NiuOne structural stops use the completed daily low": "结构止损假设",
+            "NiuOne entries use 100% of the deterministic maximum risk-permitted": (
+                "定仓差异"
+            ),
+            "NiuOne aggressive backtest profile increases account-risk": "进取参数",
+        }
+        for legacy_text, label in expected_warnings.items():
+            self.assertIn(f"text.includes('{legacy_text}')", source)
+            self.assertIn(f"return '{label}'", source)
+        self.assertIn("牛牛结构止损使用已完成日 K 的最低价判断触发", source)
+        self.assertIn("组合收益和回撤反映最大定仓情景", source)
+        self.assertIn("不会放宽价格形态、结构止损、涨停或 T+1 规则", source)
+        self.assertIn("部分标的历史行情获取失败", source)
+        self.assertIn("当前行业/概念分类已改用问财备用源", source)
+        self.assertIn("当前行业/概念分类使用了过期快照", source)
+        self.assertIn("日期未知的过期快照", source)
+        self.assertIn("选股回放缓存未能持久化", source)
 
 
 if __name__ == "__main__":

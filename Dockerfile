@@ -5,15 +5,17 @@ FROM node:24-bookworm-slim AS web-builder
 
 WORKDIR /build/web
 
-RUN npm install --global pnpm@11.15.1
+RUN npm install --global pnpm@11.15.1 \
+    && npm cache clean --force
 
 COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml web/vite.config.js web/index.html ./
-RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
-    pnpm install --frozen-lockfile
-
 COPY web/src/ ./src/
 COPY frontend/ /build/frontend/
-RUN pnpm run build
+RUN --mount=type=cache,id=niuone-pnpm-store,target=/root/.local/share/pnpm/store,sharing=locked \
+    pnpm install --frozen-lockfile \
+    && pnpm run build \
+    && pnpm store prune \
+    && rm -rf node_modules
 
 
 FROM python:${PYTHON_VERSION}-slim-bookworm
@@ -43,8 +45,8 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY requirements.txt ./requirements.txt
-RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install --disable-pip-version-check --requirement requirements.txt
+RUN python3 -m pip install --disable-pip-version-check --no-cache-dir \
+    --requirement requirements.txt
 
 COPY app/ ./app/
 COPY frontend/ ./frontend/

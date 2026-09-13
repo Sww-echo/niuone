@@ -16,8 +16,13 @@ from urllib.parse import urlparse
 
 DEFAULT_BASE_URL = "https://openapi.iwencai.com"
 QUERY_PATH = "/v1/query2data"
+COMPREHENSIVE_SEARCH_PATH = "/v1/comprehensive/search"
 SKILL_ID = "hithink-market-query"
 SKILL_VERSION = "1.0.0"
+COMPREHENSIVE_SEARCH_SKILLS = {
+    "announcement": "announcement-search",
+    "news": "news-search",
+}
 MAX_QUERY_CHARS = 500
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 
@@ -117,6 +122,11 @@ class IwencaiConfig:
             return self.base_url
         return self.base_url + QUERY_PATH
 
+    def endpoint_for(self, path: str) -> str:
+        if self.base_url.endswith(QUERY_PATH):
+            return self.base_url[: -len(QUERY_PATH)] + path
+        return self.base_url + path
+
 
 _SEMAPHORES: dict[int, threading.BoundedSemaphore] = {}
 _SEMAPHORE_LOCK = threading.Lock()
@@ -151,6 +161,7 @@ class IwencaiClient:
         limit: int = 10,
         is_cache: bool = True,
         expand_index: bool = True,
+        skill_id: str = SKILL_ID,
     ) -> dict[str, Any]:
         query = str(query or "").strip()
         if not query:
@@ -167,26 +178,85 @@ class IwencaiClient:
                 "IWENCAI_API_KEY 未配置",
             )
 
-        payload = {
+        result = self._post_json({
             "query": query,
             "page": str(page),
             "limit": str(limit),
             "is_cache": "1" if is_cache else "0",
             "expand_index": "true" if expand_index else "false",
-        }
+        }, path=QUERY_PATH, skill_id=skill_id)
+        datas = result.get("datas")
+        if not isinstance(datas, list):
+            raise IwencaiResponseError(
+                "upstream_error",
+                "问财响应缺少 datas 列表",
+            )
+        return result
+
+    def comprehensive_search(
+        self,
+        query: str,
+        *,
+        channel: str,
+        size: int = 10,
+    ) -> dict[str, Any]:
+        """Call one official iWencai comprehensive-search skill."""
+
+        normalized_query = str(query or "").strip()
+        if not normalized_query:
+            raise ValueError("query 不能为空")
+        if len(normalized_query) > MAX_QUERY_CHARS:
+            raise ValueError(f"query 不能超过 {MAX_QUERY_CHARS} 个字符")
+        normalized_channel = str(channel or "").strip().lower()
+        skill_id = COMPREHENSIVE_SEARCH_SKILLS.get(normalized_channel)
+        if not skill_id:
+            raise ValueError("channel 仅支持 announcement 或 news")
+        if not 1 <= int(size) <= 100:
+            raise ValueError("size 必须在 1 到 100 之间")
+        if not self.config.api_key:
+            raise IwencaiConfigurationError(
+                "api_key_missing",
+                "IWENCAI_API_KEY 未配置",
+            )
+
+        result = self._post_json({
+            "query": normalized_query,
+            "channels": [normalized_channel],
+            "app_id": "AIME_SKILL",
+            "size": int(size),
+        }, path=COMPREHENSIVE_SEARCH_PATH, skill_id=skill_id)
+        if result.get("status_code") != 0:
+            raise IwencaiResponseError(
+                "upstream_error",
+                f"问财{normalized_channel}搜索返回失败状态",
+            )
+        if not isinstance(result.get("data"), list):
+            raise IwencaiResponseError(
+                "invalid_response",
+                f"问财{normalized_channel}搜索响应缺少 data 列表",
+            )
+        return result
+
+    def _post_json(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        path: str,
+        skill_id: str,
+    ) -> dict[str, Any]:
         encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         last_error: IwencaiRequestError | None = None
         for attempt in range(self.config.max_retries + 1):
             trace_id = secrets.token_hex(32)
             request = urllib.request.Request(
-                self.config.endpoint,
+                self.config.endpoint_for(path),
                 data=encoded,
                 headers={
                     "Authorization": f"Bearer {self.config.api_key}",
                     "Content-Type": "application/json",
                     "User-Agent": "NiuOne/iwencai-client",
                     "X-Claw-Call-Type": "normal" if attempt == 0 else "retry",
-                    "X-Claw-Skill-Id": SKILL_ID,
+                    "X-Claw-Skill-Id": str(skill_id or SKILL_ID),
                     "X-Claw-Skill-Version": SKILL_VERSION,
                     "X-Claw-Plugin-Id": "none",
                     "X-Claw-Plugin-Version": "none",
@@ -234,12 +304,6 @@ class IwencaiClient:
                         raise IwencaiResponseError(
                             "invalid_response",
                             "问财响应必须是 JSON 对象",
-                        )
-                    datas = parsed.get("datas")
-                    if not isinstance(datas, list):
-                        raise IwencaiResponseError(
-                            "upstream_error",
-                            "问财响应缺少 datas 列表",
                         )
                     result = dict(parsed)
                     result.setdefault("trace_id", trace_id)

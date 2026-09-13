@@ -77,6 +77,35 @@ def create_backtesting_router(
             status_code=202,
         )
 
+    @router.api_route("/api/admin/backtests/cache", methods=["GET", "HEAD"])
+    async def backtest_cache(request: Request) -> Response:
+        rejected = await require_session(request)
+        if rejected is not None:
+            return rejected
+        if request.method == "HEAD":
+            return Response(
+                status_code=200,
+                media_type="application/json",
+                headers={"Cache-Control": "no-store"},
+            )
+        payload = await run_in_threadpool(tasks.cache_usage)
+        return json_response(request, payload, cache_control="no-store")
+
+    @router.post("/api/admin/backtests/cache/clear")
+    async def clear_backtest_cache(request: Request) -> Response:
+        rejected = await access.require_action(request)
+        if rejected is not None:
+            return rejected
+        try:
+            payload = await run_in_threadpool(tasks.clear_cache)
+        except BacktestTaskError as exc:
+            return JSONResponse(
+                {"error": str(exc)},
+                status_code=409,
+                headers={"Cache-Control": "no-store"},
+            )
+        return json_response(request, payload, cache_control="no-store")
+
     @router.api_route(
         "/api/admin/backtests/latest/{strategy_id}",
         methods=["GET", "HEAD"],

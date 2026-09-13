@@ -1,18 +1,21 @@
 import { computed, reactive, ref } from 'vue'
 
-const CATEGORY_ORDER = ['practice', 'technical_analysis', 'watchlist', 'niuone_mainline', 'indices', 'market_monitor', 'dragon_tiger', 'x_monitor', 'us_ratings']
+const CATEGORY_ORDER = ['overview', 'practice', 'candidates', 'technical_analysis', 'watchlist', 'niuone_mainline', 'indices', 'market_monitor', 'realtime_news', 'dragon_tiger']
 const CATEGORY_LABELS = {
+  overview: '总览',
+  candidates: '候选股',
   practice: '模拟交易',
   watchlist: '自选股走势',
   technical_analysis: '技术分析',
   niuone_mainline: '题材强度',
   indices: '指数行情',
   market_monitor: '盘面监控',
+  realtime_news: '财经快讯',
   dragon_tiger: '龙虎榜',
-  x_monitor: '推特监控',
-  us_ratings: '美股机构买入评级',
 }
 const CATEGORY_PATHS = {
+  overview: '/',
+  candidates: '/candidates',
   practice: '/practice',
   watchlist: '/watchlist',
   technical_analysis: '/technical-analysis',
@@ -20,42 +23,30 @@ const CATEGORY_PATHS = {
   indices: '/indices',
   industry_flow: '/industry-flow',
   market_monitor: '/market-monitor',
+  realtime_news: '/realtime-news',
   dragon_tiger: '/dragon-tiger',
-  x_monitor: '/x-monitor',
-  us_ratings: '/us-ratings',
 }
 const PATH_CATEGORIES = Object.fromEntries(
   Object.entries(CATEGORY_PATHS).map(([category, path]) => [path, category]),
 )
 const LEGACY_CATEGORY_ALIASES = { b1_screen: 'practice' }
-const US_FEATURE_CATEGORIES = new Set(['x_monitor', 'us_ratings'])
-const MESSAGE_COUNT_CATEGORIES = ['market_monitor', 'x_monitor', 'us_ratings']
+const MESSAGE_COUNT_CATEGORIES = ['market_monitor']
 const REQUEST_TIMEOUT_MS = 15 * 1000
 
 const initialQueryCategory = new URLSearchParams(window.location.search).get('category') || ''
-const initialCategory = PATH_CATEGORIES[window.location.pathname]
-  || LEGACY_CATEGORY_ALIASES[initialQueryCategory]
-  || initialQueryCategory
-  || 'practice'
-const activeCategory = ref(Object.hasOwn(CATEGORY_PATHS, initialCategory) ? initialCategory : 'practice')
+const initialCategory = dashboardCategoryFromLocation(window.location.pathname, initialQueryCategory)
+const activeCategory = ref(initialCategory)
 const autoVersionCheckEnabled = ref(true)
 const currentVersion = ref('dev')
-const usFeaturesEnabled = ref(false)
 const bootstrapLoaded = ref(false)
 const bootstrapError = ref('')
 const countOverrides = reactive({
   market_monitor: '',
-  x_monitor: '',
-  us_ratings: '',
+  realtime_news: '',
 })
 let bootstrapRequest = null
 
-function categoryAvailable(category) {
-  return !US_FEATURE_CATEGORIES.has(category) || usFeaturesEnabled.value
-}
-
 const items = computed(() => CATEGORY_ORDER
-  .filter(categoryAvailable)
   .map(key => ({
     key,
     href: CATEGORY_PATHS[key],
@@ -65,19 +56,20 @@ const items = computed(() => CATEGORY_ORDER
   })))
 
 export function dashboardCategoryFromLocation(path, queryCategory = '') {
-  const category = PATH_CATEGORIES[path]
-    || LEGACY_CATEGORY_ALIASES[queryCategory]
-    || queryCategory
-    || 'practice'
-  return Object.hasOwn(CATEGORY_PATHS, category) ? category : 'practice'
+  const normalizedQuery = LEGACY_CATEGORY_ALIASES[queryCategory] || queryCategory
+  if (path === '/') {
+    const category = normalizedQuery || 'overview'
+    return Object.hasOwn(CATEGORY_PATHS, category) ? category : 'overview'
+  }
+  return PATH_CATEGORIES[path] || ''
 }
 
 export function dashboardCategoryPath(category) {
-  return CATEGORY_PATHS[LEGACY_CATEGORY_ALIASES[category] || category] || CATEGORY_PATHS.practice
+  return CATEGORY_PATHS[LEGACY_CATEGORY_ALIASES[category] || category] || CATEGORY_PATHS.overview
 }
 
 function setActiveCategory(category) {
-  activeCategory.value = dashboardCategoryFromLocation(CATEGORY_PATHS[category] || '', category)
+  activeCategory.value = Object.hasOwn(CATEGORY_PATHS, category) ? category : ''
 }
 
 function setCategoryCount(category, count) {
@@ -95,7 +87,7 @@ function applyBootstrapCounts(counts) {
 }
 
 async function initializeDashboardTabs() {
-  if (bootstrapLoaded.value) return { usFeaturesEnabled: usFeaturesEnabled.value }
+  if (bootstrapLoaded.value) return {}
   if (bootstrapRequest) return bootstrapRequest
   const controller = new AbortController()
   const timeout = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
@@ -109,16 +101,15 @@ async function initializeDashboardTabs() {
     const bootstrapVersion = String(payload.current_version || '').trim()
     if (bootstrapVersion) currentVersion.value = bootstrapVersion
     autoVersionCheckEnabled.value = payload.auto_version_check_enabled !== false
-    usFeaturesEnabled.value = payload.us_features_enabled === true
     applyBootstrapCounts(payload.message_counts)
     bootstrapError.value = ''
     bootstrapLoaded.value = true
-    return { ...payload, usFeaturesEnabled: usFeaturesEnabled.value }
+    return payload
   }).catch(error => {
     if (error?.name === 'AbortError') bootstrapError.value = '栏目配置请求超时'
     else bootstrapError.value = String(error?.message || error)
     bootstrapLoaded.value = true
-    return { usFeaturesEnabled: false, error: bootstrapError.value }
+    return { error: bootstrapError.value }
   }).finally(() => {
     window.clearTimeout(timeout)
     if (bootstrapRequest === request) bootstrapRequest = null
@@ -133,7 +124,6 @@ export function useDashboardTabs() {
     autoVersionCheckEnabled,
     bootstrapError,
     bootstrapLoaded,
-    categoryAvailable,
     currentVersion,
     initializeDashboardTabs,
     items,

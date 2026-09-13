@@ -32,7 +32,7 @@ STRATEGY_SOURCE_OPTIONS: tuple[dict[str, str], ...] = (
     {
         "id": STRATEGY_SOURCE_PRESET_TEXT,
         "label": "预设文字",
-        "desc": "由买卖决策模型把输入文字优化为本轮选股和买卖规则",
+        "desc": "由模型在创建阶段细化一次，确认后由冻结的本地规则完成选股与买卖",
         "color": "#2dd4bf",
     },
 )
@@ -209,7 +209,7 @@ STRATEGY_DEFINITIONS: dict[str, dict[str, Any]] = {
         "profile": {
             "priority": 91,
             "entry_threshold": 8.0,
-            "score_basis": "跨日主线确认/龙头梯队排名/买点质量/涨停禁买",
+            "score_basis": "跨日主线确认/龙头梯队/成交活跃度/买点质量/涨停禁买",
             "position_hint": "按有效损失距离动态定仓，单票绝对上限30%",
             "time_stop": "5个交易日未创新高或主线连续转弱退出",
             "certainty_rank": 1,
@@ -229,7 +229,7 @@ STRATEGY_DEFINITIONS: dict[str, dict[str, Any]] = {
         "profile": {
             "priority": 84,
             "entry_threshold": 8.2,
-            "score_basis": "主线仍在/核心股调整后转强/涨停禁买",
+            "score_basis": "主线仍在/核心股转强/成交活跃度/涨停禁买",
             "position_hint": "按轮动风险预算动态定仓，单票绝对上限25%",
             "time_stop": "3个交易日未恢复强势或主线确认退潮退出",
             "certainty_rank": 2,
@@ -244,14 +244,13 @@ STRATEGY_DEFINITIONS: dict[str, dict[str, Any]] = {
         "persona": "niuone",
         "scorer": "score_niu_reversal_probe",
         "display_order": 66,
-        "position_limit_pct": 6.25,
+        "position_limit_pct": 10.0,
         "aliases": ["牛牛试仓", "牛牛反转", "牛牛反转试仓", "niu_reversal_probe"],
         "profile": {
             "priority": 70,
             "entry_threshold": 7.6,
-            "daily_candidate_limit": 2,
-            "score_basis": "酝酿/主升早段路由/日线左侧回落/右侧至少2/3上涨/跌幅收复比例",
-            "position_hint": "通过延续质量门槛后按早期反转风险预算参与，单票绝对上限6.25%",
+            "score_basis": "酝酿早期路由/日线V型修复/活跃度仅提示不硬拦截",
+            "position_hint": "通过延续质量门槛后按早期反转风险预算参与，单票绝对上限10%",
             "time_stop": "3个交易日未延续右侧趋势退出",
             "certainty_rank": 4,
             "risk_reward_rank": 1,
@@ -270,7 +269,7 @@ STRATEGY_DEFINITIONS: dict[str, dict[str, Any]] = {
         "profile": {
             "priority": 76,
             "entry_threshold": 8.4,
-            "score_basis": "跨日行业延续/至少双强势股共振/龙头梯队小仓验证",
+            "score_basis": "跨日题材延续/双强势股共振/龙头梯队/成交活跃度",
             "position_hint": "观察仓，单票绝对上限15%，次日确认后才允许加仓",
             "time_stop": "T+2未升级为确认主线则退出",
             "certainty_rank": 3,
@@ -321,6 +320,26 @@ STRATEGY_DEFINITIONS: dict[str, dict[str, Any]] = {
                 "正金字塔分批：底部区域越跌越谨慎观察，涨疯了不追",
                 "杠杆毒药：高换手、融资偿还、放量破位时不买或降仓",
             ],
+        },
+    },
+    STRATEGY_SUITE_PRESET_TEXT: {
+        "label": "预设文字策略",
+        "color": "#2dd4bf",
+        "desc": "由版本化Prompt规则独立筛选中性候选并管理完整持仓生命周期",
+        "family": "prompt",
+        "persona": "prompt",
+        "scorer": "score_preset_text",
+        "display_order": 90,
+        "position_limit_pct": 100.0,
+        "aliases": ["预设文字", "预设文字策略", "文字策略", "preset_text"],
+        "profile": {
+            "priority": 50,
+            "entry_threshold": 0.0,
+            "score_basis": "中性数据完整度与流动性排序，具体准入完全由冻结Prompt规则决定",
+            "position_hint": "由文字策略解释与账户硬约束共同决定",
+            "time_stop": "按买入时冻结的文字策略快照执行",
+            "certainty_rank": 5,
+            "risk_reward_rank": 5,
         },
     },
 }
@@ -572,11 +591,32 @@ def default_trade_discipline_text(
     zettaranc_enabled: bool = True,
     sector_tide_enabled: bool = False,
     niuone_enabled: bool = False,
+    prompt_strategy_enabled: bool = False,
 ) -> str:
     position_limit_desc = str(position_limit_desc or "无固定百分比硬限制")
+    opening_count_rule = (
+        "- 牛牛新开仓数量不受盘面总结/评价、上午/下午或单轮/单日名额影响；"
+        f"只硬限制同时最多{max_open_positions}只持仓（来自设置中的最大持仓只数），"
+        "满仓时按可审计优先级执行严格先卖后买换仓。"
+        if niuone_enabled
+        else (
+            f"- 单次决策最多给{max_new_buys_per_decision}条新买入；当前持仓达到"
+            f"{max_open_positions}只时只允许卖出/持有，不能继续开新仓，避免“开超市”。"
+        )
+    )
+    market_pace_rule = (
+        "- 盘面监控仍影响牛牛的单笔风险预算、总仓、主题敞口、现金和入场质量；"
+        "盘面评价产生的动态持仓数、单轮新仓数或暂停字段不改变牛牛开仓数量，"
+        "但候选自身的复合市场硬停止仍禁止开仓。"
+        if niuone_enabled
+        else (
+            "- 今日盘面监控指引优先调整买入节奏；谨慎/防守盘面必须主动缩手"
+            f"或等待确认，不能上午把{max_open_positions}只买满。"
+        )
+    )
     position_rule = (
-        "- 牛牛战法按主线酝酿→主升→高潮→分歧→退幕识别生命周期；试仓只参与candidate/emerging早段，candidate中已成为strong强势股的名称等待启动确认，主升阶段围绕启动/领涨，高潮不追新仓，分歧只观察核心股调整后转强或减仓，持续回落不触发买点，退幕只退出。\n"
-        "- 牛牛战法由动态风险预算决定仓位：进攻/轮动/修复/防守的确认路径单笔风险预算分别为权益1.50%/1.00%/0.60%/0.30%，日线V型试仓仅0.35%/0.30%/0.25%/0.15%；防守允许开仓，复合风险硬停止才禁止新仓。试仓须满足题材至少6只强势股或酝酿连续3个交易日，每天最多2只且单票绝对上限6.25%。试仓/启动持仓浮盈处于2%～12%、仍在主升且个股保持强势领涨时，启动主线跨日延续先向10%上限加一次，主线确认后再向20%上限加一次。策略内组合未实现止损风险≤4.50%/3.00%/1.80%/0.90%，总仓≤70%/55%/35%/20%。领涨/转强/启动的30%/25%/15%仅是新开路径绝对天花板，同一主题最多2只、同时最多5只。"
+        "- 牛牛战法按主线酝酿→主升→高潮→分歧→退幕识别生命周期；试仓只参与酝酿候选和启动早段，酝酿候选中已成为强势股的名称等待启动确认，主升阶段围绕启动/领涨，高潮不追新仓，分歧只观察核心股调整后转强或减仓，持续回落不触发买点，退幕只退出。\n"
+        f"- 牛牛战法由动态风险预算决定仓位：进攻/轮动/修复/防守的确认路径单笔风险预算分别为权益1.50%/1.00%/0.60%/0.30%，日线V型试仓为0.35%/1.00%/0.25%/0.15%；防守允许开仓，复合风险硬停止才禁止新仓。试仓须满足题材至少6只强势股或酝酿连续3个交易日，单票绝对上限10%。试仓/启动持仓浮盈处于2%～12%、仍在主升且个股保持强势领涨时，启动主线跨日延续由本地规则向10%上限加一次，主线确认后再由本地规则向20%上限加一次，不依赖模型主动提出ADD。策略内组合未实现止损风险≤4.50%/3.00%/1.80%/0.90%，总仓≤70%/55%/35%/20%。领涨/转强/启动的30%/25%/15%仅是新开路径绝对天花板；不设固定同板块或同题材持仓只数上限，集中风险继续受主题风险与主题敞口预算约束，同时最多{max_open_positions}只。"
         if niuone_enabled
         else
         "- 板块潮汐由动态风险预算决定仓位：进攻/轮动/修复的单笔风险预算分别为权益0.30%/0.20%/0.10%，策略内组合未实现止损风险≤1.50%/0.80%/0.30%，总仓≤45%/30%/15%，行业敞口≤12%/10%/6%；防守禁止新仓。主线/轮动/修复的8%/6%/4%仅是单票绝对天花板，同一行业最多2只。"
@@ -603,20 +643,22 @@ def default_trade_discipline_text(
         else
         "- 板块潮汐退出：结构止损；行业分数<55连续两次；复合风险硬停止且行业转弱；主线5日/轮动3日/修复T+2不延续；达到2R先减半，余仓峰值-2ATR跟踪"
         if sector_tide_enabled
+        else "- 系统底线风控：预设文字策略退出只读取每个持仓买入时冻结的原文与结构化解释；系统不追加通用止盈、技术破位或持有期退出。"
+        if prompt_strategy_enabled
         else
         "- 系统底线风控：持仓超25日退出；Z哥按入场战法使用专属结构止损，防卖飞、卤煮、S1/S2/S3、出货五式、白线/黄线等归属于下方 Z哥卖出风控"
         if zettaranc_enabled
         else "- 系统底线风控：持仓超25日退出；其他止损止盈按当前激活策略和既有持仓标记执行"
     )
     registered_position_rule = (
-        "- 牛牛战法动态风险预算、总仓/主题敞口、最多5只持仓、领涨30%/转强25%/启动15%/试仓6.25%绝对上限，以及主升早期10%与确认主升20%的分级加仓上限，都是执行层硬限制，不是参考值。"
+        f"- 牛牛战法动态风险预算、总仓/主题敞口、最多{max_open_positions}只持仓、领涨30%/转强25%/启动15%/试仓10%绝对上限，以及主升早期10%与确认主升20%的本地确定性分级加仓上限，都是执行层硬限制，不是参考值。"
         if niuone_enabled
         else
         "- 板块潮汐动态风险预算、总仓/行业敞口和8%/6%/4%绝对上限是执行层硬限制，不是参考值。"
         if sector_tide_enabled
         else f"- 注册策略仓位纪律只作为参考：{position_limit_desc}。"
     )
-    generic_exit_rules = [] if sector_tide_enabled or niuone_enabled else [
+    generic_exit_rules = [] if sector_tide_enabled or niuone_enabled or prompt_strategy_enabled else [
         "- 移动止损：盈利>5%后进入回撤保护，回到成本附近自动退出",
         "- 信号恶化退出：持有>10天仍未站回BBI且盈利不足，或持有>12天仍亏>3%，自动离场",
     ]
@@ -624,17 +666,22 @@ def default_trade_discipline_text(
         "- A股模拟成交窗口：09:30-11:30、13:00-15:00；09:15-09:25只作开盘集合竞价观察/申报参考，09:25-09:30为静默期，不得直接按参考价记成交。",
         "- T+1：今日买入的股票今日不可卖；只能卖available_qty。",
         "- 买入必须100股整数倍；不能融资、不能做空、现金不能为负。",
-        f"- 单次决策最多给{max_new_buys_per_decision}条新买入；当前持仓达到{max_open_positions}只时只允许卖出/持有，不能继续开新仓，避免“开超市”。",
+        opening_count_rule,
         position_rule,
-        f"- 今日盘面监控指引优先调整买入节奏；谨慎/防守盘面必须主动缩手或等待确认，不能上午把{max_open_positions}只买满。",
+        market_pace_rule,
         execution_rule,
         registered_position_rule,
-        "- 综合决策参考是每次决策的必读输入：盘面监控、隔夜美股、指数/期货、板块涨跌、行业资金、热门股、消息面预检、当前仓位和现金状态都必须影响BUY/SELL/HOLD与shares。",
+        "- 综合决策参考是每次决策的必读输入：盘面监控、隔夜美股、指数/期货、板块涨跌、行业资金、热门股、有效消息面预检结果、当前仓位和现金状态都必须影响BUY/SELL/HOLD与shares。",
+        "- 消息面预检只允许已完成的有效结果参与决策；失败、超时、未检查、待判断或不可用统一按中性、权重0处理，不得降分、降优先级、缩仓或单独阻止买卖。",
         "- 当前账户JSON里的 strategy_mark/buy_strategy/entry_reason/last_exit_rule 是既有持仓的策略标记；后续加仓、减仓、清仓必须读取这些标记，按原入场策略的时间纪律和卖出规则处理，不能把 B3、B2、趋势回踩、李大霄等不同策略混同。",
         "- 对已有持仓再次输出 BUY 表示加仓/补仓，shares 是本次新增股数而不是目标总股数；只允许顺势确认加仓，不能为了摊低亏损成本而越跌越买，今日新买且T+1锁仓的票原则上不再日内加仓。",
         risk_rule,
         *generic_exit_rules,
-        "- 同板块持仓不超过2只（避免集中风险）",
+        (
+            "- 牛牛不设固定同板块或同题材持仓只数上限；集中风险由主题风险、主题敞口和组合预算限制。"
+            if niuone_enabled
+            else "- 同板块持仓不超过2只（避免集中风险）"
+        ),
         "- 必须按候选自带的“基准”判断是否达标；未达各自基准只能观察，不能因为裸分接近8就买",
         "- 策略共识只能用于排序，不能突破持仓数、T+1、现金不能为负、交易窗口等执行规则。",
         f"- 当前自适应模式：{adaptive_label}（仓位系数{adaptive_position_mult:g}x，仅作为你决定 shares 的参考）",
@@ -684,9 +731,7 @@ def enabled_strategy_ids(
 ) -> set[str]:
     enabled: set[str] = set()
     suite = active_strategy_suite(strategy_suite_raw, strategy_source_raw, enabled_persona_raw)
-    # Text strategies intentionally use only the neutral base scanner as their
-    # raw candidate pool; the model-provided rules remain the sole decision policy.
-    enabled_options = {BASIC_STRATEGY_GROUP_ID if suite == STRATEGY_SUITE_PRESET_TEXT else suite}
+    enabled_options = {suite}
     for option_id in enabled_options:
         group = STRATEGY_SUITES.get(option_id)
         if group:

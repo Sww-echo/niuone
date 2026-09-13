@@ -28,7 +28,17 @@ class ContainerDeploymentTests(unittest.TestCase):
         dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8")
         self.assertIn("FROM node:24-bookworm-slim AS web-builder", dockerfile)
         self.assertIn("pnpm install --frozen-lockfile", dockerfile)
-        self.assertIn("RUN pnpm run build", dockerfile)
+        self.assertIn("id=niuone-pnpm-store", dockerfile)
+        self.assertIn("sharing=locked", dockerfile)
+        self.assertLess(
+            dockerfile.index("COPY web/src/ ./src/"),
+            dockerfile.index("pnpm install --frozen-lockfile"),
+        )
+        self.assertIn("&& pnpm run build", dockerfile)
+        self.assertIn("&& rm -rf node_modules", dockerfile)
+        self.assertIn("&& pnpm store prune", dockerfile)
+        self.assertIn("--no-cache-dir", dockerfile)
+        self.assertNotIn("target=/root/.cache/pip", dockerfile)
         self.assertIn("COPY app/ ./app/", dockerfile)
         self.assertIn("COPY frontend/ ./frontend/", dockerfile)
         self.assertIn("COPY --from=web-builder /build/web/dist ./web/dist", dockerfile)
@@ -42,15 +52,71 @@ class ContainerDeploymentTests(unittest.TestCase):
         self.assertIn("python3 -m pip install", dockerfile)
         self.assertIn('CMD ["python3", "-c"', dockerfile)
 
-    def test_compose_runs_all_long_lived_processes_with_shared_storage(self):
+    def test_local_build_scripts_only_prune_dangling_niuone_images(self):
+        shell = (ROOT / "scripts" / "docker-build.sh").read_text(encoding="utf-8")
+        powershell = (
+            ROOT / "scripts" / "docker-build.ps1"
+        ).read_text(encoding="utf-8")
+        label_filter = "label=org.opencontainers.image.title=NiuOne"
+
+        self.assertIn("docker compose build", shell)
+        self.assertEqual(shell.count(label_filter), 1)
+        self.assertIn("docker compose build", powershell)
+        self.assertEqual(powershell.count(label_filter), 2)
+        for source in (shell, powershell):
+            self.assertIn("docker image prune --force", source)
+            self.assertNotIn("--all", source)
+            self.assertNotIn("docker system prune", source)
+            self.assertNotIn("docker builder prune", source)
+
+    def test_compose_runs_niuone_processes_with_bundled_newsnow(self):
         config = yaml.safe_load((ROOT / "compose.yaml").read_text(encoding="utf-8"))
+        fastapi_source = (
+            ROOT / "app" / "dashboard" / "fastapi_app.py"
+        ).read_text(encoding="utf-8")
         services = config["services"]
-        self.assertEqual(set(services), {"dashboard", "scheduler", "x-watchlist"})
+        self.assertEqual(set(services), {"dashboard", "scheduler", "newsnow"})
+        expected_logging = {
+            "driver": "local",
+            "options": {
+                "max-size": "5m",
+                "max-file": "3",
+                "compress": "true",
+            },
+        }
+        for service in services.values():
+            self.assertEqual(service["logging"], expected_logging)
         self.assertEqual(services["dashboard"]["command"], ["dashboard"])
         self.assertEqual(services["scheduler"]["command"], ["scheduler"])
-        self.assertEqual(services["x-watchlist"]["command"], ["x-watchlist"])
-        for service in services.values():
-            self.assertIn("niuone-data:/data", service["volumes"])
+        for name in ("dashboard", "scheduler"):
+            self.assertIn("niuone-data:/data", services[name]["volumes"])
+
+        newsnow = services["newsnow"]
+        self.assertEqual(
+            newsnow["image"],
+            "${NEWSNOW_IMAGE:-ghcr.io/ourongxing/newsnow:latest}",
+        )
+        self.assertNotIn("ports", newsnow)
+        self.assertEqual(newsnow["volumes"], ["newsnow-data:/usr/app/.data"])
+        self.assertEqual(newsnow["environment"]["HOST"], "0.0.0.0")
+        self.assertEqual(newsnow["environment"]["PORT"], "4444")
+        self.assertEqual(newsnow["environment"]["INIT_TABLE"], "true")
+        self.assertEqual(newsnow["environment"]["ENABLE_CACHE"], "true")
+        self.assertEqual(
+            services["dashboard"]["environment"]["NIUONE_BUNDLED_NEWSNOW_URL"],
+            "http://newsnow:4444/api/s",
+        )
+        self.assertEqual(
+            services["dashboard"]["environment"]["DASHBOARD_ACCESS_LOG"],
+            "0",
+        )
+        self.assertIn('os.environ.get("DASHBOARD_ACCESS_LOG", "1")', fastapi_source)
+        self.assertIn("access_log=access_log", fastapi_source)
+        self.assertEqual(
+            services["dashboard"]["depends_on"],
+            {"newsnow": {"condition": "service_started"}},
+        )
+        self.assertEqual(set(config["volumes"]), {"niuone-data", "newsnow-data"})
 
     def test_entrypoint_keeps_container_paths_and_listener_invariants(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -66,6 +132,7 @@ class ContainerDeploymentTests(unittest.TestCase):
                         "PYTHON_BIN=/host/python",
                         "DASHBOARD_CONFIG=/host/config.yaml",
                         "DASHBOARD_NIUNIU_DB=/host/niuniu.db",
+                        "NEWSNOW_BASE_URL=https://legacy-public.example/api/s",
                         "CUSTOM_FROM_ENV=loaded",
                     )
                 )
@@ -73,12 +140,14 @@ class ContainerDeploymentTests(unittest.TestCase):
                 encoding="utf-8",
             )
             env = os.environ.copy()
+            env.pop("NEWSNOW_BASE_URL", None)
             env.update(
                 {
                     "DASHBOARD_ENV_FILE": str(source_env),
                     "NIUONE_CONTAINER_DATA_DIR": str(data_dir),
                     "NIUONE_CONTAINER_HOST": "0.0.0.0",
                     "NIUONE_CONTAINER_PORT": "8787",
+                    "NIUONE_BUNDLED_NEWSNOW_URL": "http://newsnow:4444/api/s",
                     "PYTHON_BIN": sys.executable,
                 }
             )
@@ -89,7 +158,6 @@ from pathlib import Path
 sys.path[:0] = [str(Path.cwd() / 'app' / 'compat'), str(Path.cwd() / 'app')]
 import niuone_cron_scheduler
 import niuone_dashboard
-import x_watchlist_daemon
 keys = (
     'DASHBOARD_ENV_FILE', 'DASHBOARD_HOME', 'DASHBOARD_HOST',
     'DASHBOARD_PORT', 'PYTHON_BIN', 'DASHBOARD_CONFIG',
@@ -98,7 +166,9 @@ keys = (
 result = {
     'process': {key: os.environ.get(key) for key in keys},
     'scheduler': {key: niuone_cron_scheduler.parse_env_file().get(key) for key in keys},
-    'watchlist': {key: x_watchlist_daemon.parse_env_file().get(key) for key in keys},
+    'newsnow_process_base_url': os.environ.get('NEWSNOW_BASE_URL'),
+    'bundled_newsnow_url': os.environ.get('NIUONE_BUNDLED_NEWSNOW_URL'),
+    'newsnow_endpoint': niuone_dashboard.newsnow_config().endpoint,
 }
 niuone_dashboard.write_env_file_values({'DASHBOARD_RATE_LIMIT_ANON': '241'})
 result['persisted'] = Path(os.environ['DASHBOARD_ENV_FILE']).read_text()
@@ -117,7 +187,7 @@ print(json.dumps(result))
                 text=True,
             )
             values = json.loads(output)
-            for name in ("process", "scheduler", "watchlist"):
+            for name in ("process", "scheduler"):
                 runtime_values = values[name]
                 self.assertEqual(runtime_values["DASHBOARD_ENV_FILE"], str(data_dir / "dashboard.env"))
                 self.assertEqual(runtime_values["DASHBOARD_HOME"], str(data_dir / "runtime"))
@@ -130,10 +200,85 @@ print(json.dumps(result))
                 self.assertEqual(runtime_values["DASHBOARD_CONFIG"], str(data_dir / "runtime" / "config.yaml"))
                 self.assertEqual(runtime_values["DASHBOARD_NIUNIU_DB"], str(data_dir / "runtime" / "niuniu.db"))
                 self.assertEqual(runtime_values["CUSTOM_FROM_ENV"], "loaded")
+            self.assertIsNone(values["newsnow_process_base_url"])
+            self.assertEqual(values["bundled_newsnow_url"], "http://newsnow:4444/api/s")
+            self.assertEqual(values["newsnow_endpoint"], "http://newsnow:4444/api/s")
+            self.assertTrue((data_dir / "runtime" / "cron" / "output").is_dir())
             self.assertIn("DASHBOARD_RATE_LIMIT_ANON=241", values["persisted"])
             self.assertNotIn("NIUONE_ROOT=", values["persisted"])
             self.assertNotIn("DASHBOARD_LOG_DIR=", values["persisted"])
             self.assertNotIn("DASHBOARD_B1_SCANNER=", values["persisted"])
+
+    @unittest.skipIf(
+        os.name == "nt" or getattr(os, "geteuid", lambda: 0)() == 0,
+        "POSIX non-root permissions are required",
+    )
+    def test_entrypoint_rejects_unwritable_account_runtime_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            output_dir = data_dir / "runtime" / "cron" / "output"
+            output_dir.mkdir(parents=True)
+            output_dir.chmod(0o500)
+            env = os.environ.copy()
+            env.update({
+                "NIUONE_CONTAINER_DATA_DIR": str(data_dir),
+                "DASHBOARD_ENV_FILE": str(data_dir / "missing.env"),
+                "PYTHON_BIN": sys.executable,
+            })
+            try:
+                result = subprocess.run(
+                    [
+                        "bash",
+                        str(ROOT / "scripts" / "docker-entrypoint.sh"),
+                        "true",
+                    ],
+                    cwd=ROOT,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                )
+            finally:
+                output_dir.chmod(0o700)
+
+            self.assertEqual(result.returncode, 73)
+            self.assertIn("runtime directory is not writable", result.stderr)
+
+    @unittest.skipIf(
+        os.name == "nt" or getattr(os, "geteuid", lambda: 0)() == 0,
+        "POSIX non-root permissions are required",
+    )
+    def test_entrypoint_reports_uncreatable_runtime_directories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            runtime_dir = data_dir / "runtime"
+            runtime_dir.mkdir(parents=True)
+            runtime_dir.chmod(0o500)
+            env = os.environ.copy()
+            env.update({
+                "NIUONE_CONTAINER_DATA_DIR": str(data_dir),
+                "DASHBOARD_ENV_FILE": str(data_dir / "missing.env"),
+                "PYTHON_BIN": sys.executable,
+            })
+            try:
+                result = subprocess.run(
+                    [
+                        "bash",
+                        str(ROOT / "scripts" / "docker-entrypoint.sh"),
+                        "true",
+                    ],
+                    cwd=ROOT,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                )
+            finally:
+                runtime_dir.chmod(0o700)
+
+            self.assertEqual(result.returncode, 73)
+            self.assertIn(
+                "runtime directories cannot be created",
+                result.stderr,
+            )
 
     def test_release_workflow_uses_tag_trigger_and_repository_credentials(self):
         path = ROOT / ".github" / "workflows" / "docker-publish.yml"

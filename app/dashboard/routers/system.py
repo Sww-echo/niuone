@@ -16,7 +16,7 @@ LimitCheck = Callable[[Request], Awaitable[Response | None]]
 PublicLimitCheck = Callable[[Request], Response | None]
 JsonResponder = Callable[..., Response]
 SecureRequestCheck = Callable[[Request], bool]
-MESSAGE_COUNT_CATEGORIES = ("market_monitor", "x_monitor", "us_ratings")
+MESSAGE_COUNT_CATEGORIES = ("market_monitor",)
 
 
 def dashboard_message_counts(payload: dict[str, Any]) -> dict[str, int]:
@@ -147,7 +147,6 @@ def create_system_router(
             "unique": visit_stats["unique"],
             "current_version": services.CURRENT_VERSION,
             "auto_version_check_enabled": services.auto_version_check_enabled(),
-            "us_features_enabled": services.us_features_enabled(),
             "message_counts": message_counts,
             "message_counts_available": message_counts_available,
         }

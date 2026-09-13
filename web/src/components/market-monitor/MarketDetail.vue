@@ -52,7 +52,6 @@ const hasStructuredDetail = computed(() => Boolean(
       <section class="market-section wide">
         <div class="market-section-head">
           <div class="market-section-title-wrap">
-            <span class="market-section-icon">•</span>
             <span class="market-section-title">摘要</span>
           </div>
         </div>

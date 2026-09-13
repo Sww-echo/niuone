@@ -73,6 +73,14 @@ onBeforeUnmount(() => {
     </template>
     <template v-else>
       <div class="market-monitor-grid">
+        <div class="market-monitor-table-head" aria-hidden="true">
+          <span>报告</span>
+          <span>时间</span>
+          <span>核心判断</span>
+          <span>关键数据</span>
+          <span>时段</span>
+          <span></span>
+        </div>
         <MarketMonitorCard
           v-for="record in visibleRecords"
           :key="marketRecordKey(record)"

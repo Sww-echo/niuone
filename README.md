@@ -1,7 +1,5 @@
 <img width="1200" alt="NiuOne 牛牛1号" src="docs/assets/readme/niuone.webp" />
 
-# NiuOne · 牛牛1号
-
 简体中文 | [English](README_EN.md)
 
 <p align="left">
@@ -13,7 +11,7 @@
 
 ## 项目简介
 
-NiuOne（牛牛1号）是一套本地优先的市场研究与模拟交易系统，主要面向 A 股，也覆盖隔夜美股、机构评级和 X 关注源等信息。它将行情、消息、策略和模拟账户集中到一个 Web 看板中，并可接入大模型辅助整理信息和生成交易判断。
+NiuOne（牛牛1号）是一套本地优先的市场研究与模拟交易系统，主要面向 A 股，也覆盖隔夜美股信息。它将行情、消息、策略和模拟账户集中到一个 Web 看板中，并可接入大模型辅助整理信息和生成交易判断。
 
 后台任务可以按计划采集竞价、盘中和盘后行情，以及资金流向、板块表现和海外市场信息。启用模型服务后，系统会按照用户设定的策略规则完成消息检索、行情分析和模拟买卖决策。账户状态、交易记录和决策依据都保存在本地，模拟成交可通过飞书、钉钉、企业微信或 Telegram 推送。
 
@@ -28,6 +26,16 @@ NiuOne 可以运行在个人电脑或服务器上，配置和研究数据由用�
 ## 功能预览
 
 点击动图可打开对应的在线页面。
+
+### 盘面监测总览
+
+<p align="center">
+  <a href="https://niuone.cn/">
+    <img width="1200" alt="盘面监测总览交互演示：联动查看市场情绪与量能、指数、主线机会、候选池、财经快讯和板块资金" src="docs/assets/readme/overview.gif" />
+  </a>
+</p>
+
+<p align="center"><sub>市场状态、市场宽度、涨跌停、主要行业资金和账户仓位汇聚为决策摘要，并联动展示核心行情与机会。</sub></p>
 
 ### 模拟交易与账户复盘
 
@@ -79,25 +87,15 @@ NiuOne 可以运行在个人电脑或服务器上，配置和研究数据由用�
 
 <p align="center"><sub>竞价、午盘和盘后报告汇总核心判断、资金流向、热门板块、风险提示与次日关注项。</sub></p>
 
-### 推特监控
+### 财经快讯
 
 <p align="center">
-  <a href="https://niuone.cn/x-monitor">
-    <img width="1200" alt="推特监控交互演示：展开文本推文与图文推文并打开图片预览" src="docs/assets/readme/twitter-monitor.gif" />
+  <a href="https://niuone.cn/realtime-news">
+    <img width="1200" alt="财经快讯交互演示：筛选重要信息、切换新闻来源并滚动浏览 NewsNow 聚合快讯" src="docs/assets/readme/realtime-news.gif" />
   </a>
 </p>
 
-<p align="center"><sub>按时间线汇总关注账号的推文、回复、引用和图片内容。</sub></p>
-
-### 美股机构买入评级
-
-<p align="center">
-  <a href="https://niuone.cn/us-ratings">
-    <img width="1200" alt="美股机构评级交互演示：展开个股评级详情并切换历史日期" src="docs/assets/readme/us-ratings.gif" />
-  </a>
-</p>
-
-<p align="center"><sub>集中查看当前价、目标价、目标空间，以及机构观点、看多逻辑和风险点。</sub></p>
+<p align="center"><sub>聚合财联社、金十数据与华尔街见闻等可选来源，支持按来源和重要程度筛选，并在上游异常时继续显示本地缓存。</sub></p>
 
 ### 本地配置中心
 
@@ -107,13 +105,13 @@ NiuOne 可以运行在个人电脑或服务器上，配置和研究数据由用�
 
 <p align="center"><sub>数据源、模型、策略、通知和运行参数都可以在本地设置页中管理。</sub></p>
 
-> 动图中的行情与模拟账户数据仅用于界面展示，不构成投资建议。
+> 全部动图均为浅色主题下的真实页面交互；其中的行情、新闻与模拟账户数据仅用于界面展示，不构成投资建议。
 
 ## 功能概览
 
-- **市场看板**：集中展示题材强度、指数、板块、市场情绪、行业资金流、龙虎榜和历史消息。
+- **市场看板**：集中展示题材强度、指数、板块、市场情绪、行业资金流、重要财经快讯、龙虎榜和历史消息。
 - **题材与策略研究**：并排呈现今日强度和跨日结构排名，结合全市场行情、题材归因和东财即时排名观察主线。项目内置基础、Z 哥、李大霄、板块潮汐和牛牛战法，也支持用自然语言配置候选、买入、卖出、仓位与时间规则。
-- **信息聚合与模型分析**：整理 A 股竞价、午盘、盘后报告，以及隔夜美股、机构评级、X 关注源和问财龙虎榜。兼容的大模型服务可用于消息检索、摘要和结构化分析。
+- **信息聚合与模型分析**：通过 NewsNow 聚合财联社与金十实时快讯，并整理 A 股竞价、午盘、盘后报告，以及隔夜美股和问财龙虎榜。兼容的大模型服务可用于消息检索、摘要和结构化分析。
 - **模拟交易**：覆盖候选筛选、买卖决策、持仓盈亏、收益曲线和交易日志，不连接券商，也不使用真实资金。
 - **自动化与通知**：支持定时采集、报告生成、数据入库和后台监控；模拟成交可推送到飞书、钉钉、企业微信和 Telegram。
 - **本地数据管理**：配置、数据库、日志和任务输出默认保存在独立运行目录。设置页支持连接测试和版本检查，但不会自动安装更新。
@@ -127,7 +125,7 @@ NiuOne 可以运行在个人电脑或服务器上，配置和研究数据由用�
 | `/indices`、`/industry-flow` | 指数、板块、活跃股票、行业主力资金、市场情绪与量能 | 无密钥；需要行情源可访问 |
 | `/dragon-tiger` | 按交易日查看龙虎榜席位、连板/连榜及消息预检 | 需启用并配置问财；消息预检模型可选 |
 | `/market-monitor` | A 股竞价/午盘/盘后与隔夜美股摘要 | 需长期运行调度器；模型增强可选 |
-| `/x-monitor`、`/us-ratings` | X 关注源与美股机构评级 | 需开启“牛牛美股”并配置相应模型 |
+| `/realtime-news` | NewsNow 聚合的可选财经新闻来源；总览同步展示 5 条并可仅保留重要信息 | 无需 API Key；Compose 默认随附内置 NewsNow，管理页可搜索并多选财经商业来源 |
 | `/admin` | 配置、连接测试、版本与运行状态 | 始终需要管理员认证 |
 
 策略细节见[策略研究说明](docs/strategies/README.md)，代码结构和扩展约定见 [app 模块结构](docs/APP_ARCHITECTURE.md)。
@@ -153,6 +151,16 @@ Dashboard 由 Vue 3 + Vite 和 FastAPI/Uvicorn 构建。行情请求、交易决
 git clone https://github.com/kunkundi/niuone.git
 cd niuone
 ```
+
+先为每个需要长期保留数据的实例固定部署方式和数据位置：
+
+| 使用场景 | 推荐方式 | 运行数据位置 |
+|---|---|---|
+| 长期运行、服务器或希望统一依赖 | Docker Compose | 命名卷 `niuone-data` |
+| 单机直接使用、无需容器 | 原生启动器 | `.local-data/`，或 `NIUONE_LOCAL_DATA_DIR` 指定的目录 |
+| 开发、调试和验收 | 隔离实例 | 独立 Compose 项目与端口，或 `/tmp/niuone-*` 等临时目录 |
+
+Docker 与原生部署的数据不会自动同步。同一个正式实例不要在两种方式之间交替启动，否则可能看到另一套较旧的账户、配置和交易日历。开发者可以并行运行隔离实例，但必须使用不同端口和不同数据位置。
 
 macOS / Linux：
 
@@ -219,26 +227,75 @@ NIUONE_LOCAL_DATA_DIR=/path/to/private-data ./run.sh
 
 ## 容器化部署
 
-项目提供单一镜像和 Compose 编排。Compose 会启动 dashboard、定时调度器和推特关注源守护进程，并通过同一个 `niuone-data` volume 持久化配置、数据库、日志和任务输出。
+项目提供单一牛牛1号镜像和 Compose 编排。Compose 会启动 dashboard、定时调度器以及官方 NewsNow 实例。牛牛1号配置、数据库、日志和任务输出保存在 `niuone-data` volume，NewsNow 数据单独保存在 `newsnow-data` volume。
 
 从源码构建并启动：
 
 ```bash
-docker compose up -d --build
+./scripts/docker-build.sh
+docker compose up -d --no-build
 docker compose ps
 ```
 
-默认在宿主机 `127.0.0.1:8787` 提供服务；公开页面和受密码保护的 `/admin` 管理页使用同一端口。查看日志或停止服务：
+Windows PowerShell 使用 `powershell -ExecutionPolicy Bypass -File .\scripts\docker-build.ps1` 完成构建，再执行 `docker compose up -d --no-build`。构建脚本只会在构建前后清理带 NiuOne 镜像标签且已悬空的旧镜像；不会执行全局 Docker 构建缓存清理，也不会删除其他项目镜像、容器或数据卷。
+
+### Docker 日常启动与重启
+
+电脑或容器引擎重启后，先确认 Docker Engine 已运行，再从原部署目录恢复服务：
+
+```bash
+docker compose up -d
+```
+
+仅需重启现有容器时，可重启全部服务，或只重启牛牛1号的 Dashboard 与调度器：
+
+```bash
+docker compose restart
+docker compose restart dashboard scheduler
+```
+
+`docker compose restart` 不会应用 Compose、环境变量、端口或镜像变更。修改这类配置后使用 `docker compose up -d`；修改源码后需要重建镜像。使用 Docker Hub 镜像的部署则先拉取再重建容器：
+
+```bash
+# 源码构建
+./scripts/docker-build.sh
+docker compose up -d --no-build
+
+# Docker Hub 镜像
+docker compose pull
+docker compose up -d --no-build
+```
+
+每次启动或重启后检查：
+
+```bash
+docker compose ps
+docker compose port dashboard 8787
+curl -s -o /dev/null -w 'healthz=%{http_code}\n' http://127.0.0.1:8787/healthz
+curl -s -o /dev/null -w 'readyz=%{http_code}\n' http://127.0.0.1:8787/readyz
+```
+
+`dashboard` 应显示为 `healthy`，`healthz` 应返回 `200`；首次初始化期间 `readyz` 可能暂时返回 `503`，数据就绪后应变为 `200`。跨平台的端口占用检查和故障诊断见[独立运行说明](docs/STANDALONE.md#docker-服务启动重启与数据卷)。
+
+Compose 已设置 `restart: unless-stopped`，但容器引擎本身仍需启动。Docker Desktop 用户可启用登录时自动启动，Linux 管理员应确认 Docker 服务已设置为开机启动。
+
+Compose 项目名会参与物理卷名的生成，其来源可能是当前目录名、`-p` 或 `COMPOSE_PROJECT_NAME`。首次部署后应保持项目名和原部署目录稳定；更改它们可能创建一套新的空卷，让页面看起来像历史数据丢失。可用 `docker compose ls` 和 `docker compose ps` 确认当前项目。
+
+日常重启、升级和排障不要使用 `docker compose down -v` 或 `docker volume rm`。文档中的 `niuone-data` 是 Compose 逻辑卷名，实际名称通常带项目名前缀；删除该卷会同时删除模拟账户、配置和历史记录。普通的 `docker compose down`、`restart` 和 `up -d` 都会保留命名卷。
+
+默认在宿主机 `127.0.0.1:8787` 提供服务；公开页面和受密码保护的 `/admin` 管理页使用同一端口。NewsNow 只在 Compose 内网的 `newsnow:4444` 监听，不额外暴露宿主机端口；Dashboard 会自动使用它。查看日志或停止服务：
 
 ```bash
 docker compose logs -f
 docker compose down
 ```
 
+`docker compose down` 会同时停止 NewsNow 并保留两个数据卷。用户无需启动 NewsNow、填写服务地址或维护额外配置；后续再次启动牛牛1号时会自动恢复。运维人员如需锁定上游版本，可选设置 `NEWSNOW_IMAGE`。
+
 从 Docker Hub 部署指定版本：
 
 ```bash
-export NIUONE_IMAGE=kunkundi/niuone:v0.0.7
+export NIUONE_IMAGE=kunkundi/niuone:v0.0.12
 docker compose pull
 docker compose up -d --no-build
 ```
@@ -255,7 +312,7 @@ NIUONE_BIND_ADDRESS=0.0.0.0 NIUONE_PORT=8877 docker compose up -d
 
 基础页面无需模型密钥即可启动。信息检索、智能摘要和部分自动化流程需要额外配置外部服务。
 
-启动后通过页面中的设置入口完成配置；先使用配置的管理员密码或本地 bootstrap 管理密钥完成认证。配置会写入本地 `.local-data/`，无需修改源码。建议首次使用时依次完成：
+启动后通过页面中的设置入口完成配置；先使用配置的管理员密码或 bootstrap 管理密钥完成认证。原生部署把配置写入 `.local-data/`，Docker 部署写入 `niuone-data` volume；两者不会自动同步，均无需修改源码。建议首次使用时依次完成：
 
 1. 设置需要启用的数据源与自动化任务；
 2. 按需配置兼容的模型服务地址、模型名称和 API Key；

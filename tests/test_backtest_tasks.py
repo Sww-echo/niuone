@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import signal
 import tempfile
 import threading
 import time
@@ -47,6 +48,15 @@ class BacktestTaskTests(unittest.TestCase):
             "ModuleNotFoundError: No module named 'core'",
         )
 
+    def test_worker_error_message_explains_sigkill_memory_pressure(self):
+        message = _worker_error_message(
+            {},
+            -int(getattr(signal, "SIGKILL", 9)),
+        )
+
+        self.assertIn("SIGKILL", message)
+        self.assertIn("内存不足", message)
+
     def test_compatibility_fallback_does_not_hide_internal_import_errors(self):
         missing_app = ModuleNotFoundError("missing app", name="app")
         missing_dependency = ModuleNotFoundError("missing core", name="core")
@@ -60,7 +70,7 @@ class BacktestTaskTests(unittest.TestCase):
             "app.screening.multi_strategy",
         ))
 
-    def test_niuone_backtest_caps_reversal_without_capping_mature_paths(self):
+    def test_niuone_backtest_does_not_cap_reversal_candidate_count(self):
         eligible = tuple(f"sh{600000 + index:06d}" for index in range(8))
         selector = _selector_for_request(
             {
@@ -75,12 +85,17 @@ class BacktestTaskTests(unittest.TestCase):
         self.assertEqual(selector.max_signals_per_session, len(eligible))
         self.assertEqual(
             dict(selector.max_signals_per_strategy_per_session),
-            {"niu_reversal_probe": 2},
+            {},
         )
         self.assertEqual(selector.eligible_symbols, frozenset(eligible))
 
     def test_options_expose_each_suite_and_include_daily_v_reversal(self):
-        payload = backtest_strategy_options(today=date(2026, 7, 31))
+        prompt_store = Mock()
+        prompt_store.list_versions.return_value = []
+        payload = backtest_strategy_options(
+            today=date(2026, 7, 31),
+            prompt_store=prompt_store,
+        )
         by_id = {item["id"]: item for item in payload["strategies"]}
 
         self.assertEqual(payload["defaults"]["start_date"], "2026-04-27")
@@ -126,15 +141,21 @@ class BacktestTaskTests(unittest.TestCase):
                 "strategy_id": "base",
                 "source": "sina",
             })
-        fixed_aggressive = normalize_backtest_request({
-            "strategy_id": "niuone",
-            "start_date": "2026-06-01",
-            "end_date": "2026-06-30",
-            "adjustment": "qfq",
-            "source": "tencent",
-            "risk_profile": "balanced",
-        })
+        with patch.dict(
+            "os.environ",
+            {"DASHBOARD_MAX_OPEN_POSITIONS": "10"},
+            clear=False,
+        ):
+            fixed_aggressive = normalize_backtest_request({
+                "strategy_id": "niuone",
+                "start_date": "2026-06-01",
+                "end_date": "2026-06-30",
+                "adjustment": "qfq",
+                "source": "tencent",
+                "risk_profile": "balanced",
+            })
         self.assertEqual(fixed_aggressive["risk_profile"], "aggressive")
+        self.assertEqual(fixed_aggressive["max_open_positions"], 10)
         self.assertEqual(
             fixed_aggressive["protocol_version"],
             NIUONE_BACKTEST_PROTOCOL_VERSION,
@@ -177,12 +198,18 @@ class BacktestTaskTests(unittest.TestCase):
             "source": "auto",
         })
         run = Mock()
-        run.to_dict.return_value = {"selection": {}, "warnings": []}
+        run.to_dict.side_effect = AssertionError("full run serializer must not be used")
+        run.selection.to_dict.return_value = {}
+        run.warnings = ()
+        run.industry_quality = None
+        run.replay_cache = {}
         series = Mock()
         series.symbol = "sh600000"
         series.source = "eastmoney"
         series.adjustment = "qfq"
-        series.bars = ({"date": "2026-01-01"}, {"date": "2026-02-01"})
+        series.bar_count = 2
+        series.first_date = "2026-01-01"
+        series.last_date = "2026-02-01"
         series.attempts = ()
         run.data.series = {"sh600000": series}
         run.data.failures = {}
@@ -210,29 +237,77 @@ class BacktestTaskTests(unittest.TestCase):
         self.assertIsNone(call.kwargs["position_exit_strategy"])
         self.assertEqual(call.kwargs["fetch_config"].sources, ("eastmoney", "tencent"))
         self.assertEqual(call.kwargs["fetch_config"].max_workers, 16)
+        self.assertFalse(call.kwargs["retain_historical_data"])
         self.assertEqual(
             payload["universe"]["source"],
             "current_a_share_listing_interfaces",
         )
         self.assertEqual(payload["data"]["series"]["sh600000"]["name"], "浦发银行")
         self.assertEqual(payload["data"]["source_counts"], {"eastmoney": 1})
+        run.to_dict.assert_not_called()
 
-    def test_niuone_runner_uses_trade_lifecycle_exit_strategy_without_cooldown(self):
+    def test_niuone_runner_reports_the_actual_classification_fallback(self):
         request = normalize_backtest_request({
             "strategy_id": "niuone",
             "start_date": "2026-01-01",
             "end_date": "2026-02-01",
             "adjustment": "qfq",
             "source": "auto",
-            "risk_profile": "aggressive",
         })
         run = Mock()
-        run.to_dict.return_value = {"selection": {}, "warnings": []}
+        run.selection.to_dict.return_value = {}
+        run.warnings = ()
+        run.industry_quality.to_dict.return_value = {
+            "source": "iwencai_current_industry_concept",
+        }
+        run.replay_cache = {}
+        run.data.series = {}
+        run.data.failures = {}
+        universe = {
+            "reference_symbols": ("sh600000",),
+            "eligible_symbols": ("sh600000",),
+            "name_by_symbol": {"sh600000": "浦发银行"},
+            "metadata": {"mode": "strategy_auto"},
+        }
+
+        with patch(
+            "app.backtesting.tasks.run_historical_selection_backtest",
+            return_value=run,
+        ):
+            payload = run_strategy_backtest_request(
+                request,
+                universe_loader=lambda _strategy: universe,
+            )
+
+        self.assertEqual(payload["universe"]["classification_provider"], "iwencai")
+        self.assertEqual(payload["universe"]["classification_basis"], "iwencai_concept")
+
+    def test_niuone_runner_uses_trade_lifecycle_exit_strategy_without_cooldown(self):
+        with patch.dict(
+            "os.environ",
+            {"DASHBOARD_MAX_OPEN_POSITIONS": "10"},
+            clear=False,
+        ):
+            request = normalize_backtest_request({
+                "strategy_id": "niuone",
+                "start_date": "2026-01-01",
+                "end_date": "2026-02-01",
+                "adjustment": "qfq",
+                "source": "auto",
+                "risk_profile": "aggressive",
+            })
+        run = Mock()
+        run.selection.to_dict.return_value = {}
+        run.warnings = ()
+        run.industry_quality = None
+        run.replay_cache = {}
         series = Mock()
         series.symbol = "sh600000"
         series.source = "tencent"
         series.adjustment = "qfq"
-        series.bars = ({"date": "2026-01-01"},)
+        series.bar_count = 1
+        series.first_date = "2026-01-01"
+        series.last_date = "2026-01-01"
         series.attempts = ()
         run.data.series = {"sh600000": series}
         run.data.failures = {}
@@ -266,11 +341,11 @@ class BacktestTaskTests(unittest.TestCase):
         )
         self.assertEqual(
             call.kwargs["position_exit_strategy"].max_new_positions_per_session,
-            3,
+            None,
         )
         self.assertEqual(
             call.kwargs["position_exit_strategy"].max_open_positions,
-            6,
+            10,
         )
         self.assertAlmostEqual(
             call.kwargs["position_exit_strategy"].risk_budget_scale,
@@ -281,8 +356,9 @@ class BacktestTaskTests(unittest.TestCase):
             .lifecycle_climax_partial_ratio,
             1.0 / 3.0,
         )
-        self.assertIsNotNone(call.kwargs["industry_loader"])
-        self.assertIsNotNone(call.kwargs["theme_loader"])
+        self.assertIsNotNone(call.kwargs["classification_loader"])
+        self.assertNotIn("industry_loader", call.kwargs)
+        self.assertNotIn("theme_loader", call.kwargs)
         self.assertTrue(any(
             "completed daily low as the trigger" in warning
             for warning in payload["warnings"]
@@ -295,9 +371,11 @@ class BacktestTaskTests(unittest.TestCase):
                 "risk_profile": "aggressive",
                 "risk_budget_scale": 1.35,
                 "position_budget_scale": 1.15,
-                "max_new_positions_per_session": 3,
-                "max_open_positions": 6,
-                "max_industry_positions": 3,
+                "max_new_positions_per_session": None,
+                "new_position_count_limited": False,
+                "max_open_positions": 10,
+                "max_industry_positions": 10,
+                "same_theme_position_count_limited": False,
                 "board_lot": 100,
                 "model_order_units_replayed": False,
             },
@@ -363,6 +441,47 @@ class BacktestTaskTests(unittest.TestCase):
         finally:
             release.set()
             manager.shutdown()
+
+    def test_manager_clears_replay_cache_only_when_no_job_is_active(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def runner(request, *, progress_callback):
+            entered.set()
+            release.wait(timeout=2)
+            return {"request": request}
+
+        with tempfile.TemporaryDirectory(prefix="niuone-backtest-") as tmp:
+            state_dir = Path(tmp)
+            cache_file = (
+                state_dir
+                / "replay-cache"
+                / "aa"
+                / f"{'a' * 64}.json.gz"
+            )
+            cache_file.parent.mkdir(parents=True)
+            cache_file.write_bytes(b"cached replay")
+            manager = BacktestTaskManager(runner=runner, state_dir=state_dir)
+            try:
+                self.assertEqual(manager.cache_usage()["entry_count"], 1)
+                created = manager.start({
+                    "strategy_id": "base",
+                    "start_date": "2026-01-01",
+                    "end_date": "2026-02-01",
+                    "adjustment": "qfq",
+                    "source": "eastmoney",
+                })
+                self.assertTrue(entered.wait(timeout=2))
+                with self.assertRaisesRegex(BacktestTaskError, "不能清理缓存"):
+                    manager.clear_cache()
+                manager.cancel(created["id"])
+                cleared = manager.clear_cache()
+                self.assertEqual(cleared["removed_file_count"], 1)
+                self.assertEqual(cleared["entry_count"], 0)
+                self.assertFalse(cache_file.exists())
+            finally:
+                release.set()
+                manager.shutdown()
 
     def test_manager_persists_structured_day_timing_details(self):
         entered = threading.Event()

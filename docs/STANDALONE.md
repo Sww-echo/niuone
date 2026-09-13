@@ -2,7 +2,7 @@
 
 简体中文 | [English](STANDALONE_EN.md)
 
-本文说明如何在本机独立运行 NiuOne。默认运行数据保存在工程目录内的 `.local-data/`，源码和真实数据分开管理。
+本文面向在个人电脑或服务器上运行 NiuOne 的用户和开发者。原生部署默认把运行数据保存在工程目录内的 `.local-data/`；Docker Compose 部署使用命名卷 `niuone-data`。两种方式都将源码与真实数据分开管理，但彼此不会自动同步。
 
 ## 一键启动
 
@@ -97,28 +97,111 @@ $env:NIUONE_LOCAL_DATA_DIR = Join-Path $env:TEMP "niuone-smoke"
 
 测试完成后关闭进程，并按需删除 `$env:TEMP\niuone-smoke`。
 
-## 大模型配置
+开发者也可以使用独立 Compose 项目进行集成或冒烟测试。先确认示例端口 `8877` 未被占用，再执行：
 
-NiuOne 需要接入大模型后才能驱动完整工作流。没有模型配置时，本地页面和部分静态视图可以打开，但事件抓取、信息检索、X 关注列表监控、美股机构评级日报和买卖决策无法完整运行。
+macOS / Linux：
+
+```bash
+NIUONE_PORT=8877 docker compose -p niuone-smoke up -d --build
+docker compose -p niuone-smoke ps
+```
+
+Windows PowerShell：
+
+```powershell
+$env:NIUONE_PORT = "8877"
+docker compose -p niuone-smoke up -d --build
+docker compose -p niuone-smoke ps
+Remove-Item Env:NIUONE_PORT
+```
+
+测试完成后，只清理这个明确命名的临时项目：
+
+```bash
+docker compose -p niuone-smoke down -v
+```
+
+`-p niuone-smoke` 会隔离容器、网络和数据卷；请为并行测试换用唯一项目名和空闲端口。这里只允许对确认无正式数据的临时项目使用 `down -v`，不要对正式项目执行该命令。
+
+## Docker 服务启动、重启与数据卷
+
+以下命令适用于项目自带的 Compose 配置，应从首次部署所用的工程目录执行。同一个正式实例应固定使用 Docker 或原生入口；只要权威历史已经写入 Docker，就应始终通过 Compose 管理该实例。开发者可以同时运行隔离实例，但必须为每个实例分配不同端口、Compose 项目名和数据卷。
+
+| 场景 | 命令 | 是否保留 `niuone-data` |
+|---|---|---|
+| 电脑或容器引擎重启后恢复 | `docker compose up -d` | 是 |
+| 普通重启全部容器 | `docker compose restart` | 是 |
+| 只重启 Dashboard 和调度器 | `docker compose restart dashboard scheduler` | 是 |
+| 修改 Compose、环境变量或端口后应用配置 | `docker compose up -d` | 是 |
+| 修改源码后更新 | `./scripts/docker-build.sh` 后执行 `docker compose up -d --no-build` | 是 |
+| 更新 Docker Hub 镜像 | `docker compose pull` 后执行 `docker compose up -d --no-build` | 是 |
+| 停止并移除容器 | `docker compose down` | 是 |
+| 持续查看日志 | `docker compose logs -f` | 是 |
+
+`docker compose restart` 只重启当前容器，不会读取新的 Compose 配置、环境变量、端口或镜像；这些内容变化后应使用对应的 `up -d` 命令。Compose 服务使用 `restart: unless-stopped`，但容器引擎本身必须先运行。Docker Desktop 用户可启用登录时自动启动；Linux 管理员应确认 Docker 服务已设置为开机启动。
+
+每次恢复或升级后检查：
+
+```bash
+docker compose ls
+docker compose ps
+docker compose port dashboard 8787
+curl -s -o /dev/null -w 'healthz=%{http_code}\n' http://127.0.0.1:8787/healthz
+curl -s -o /dev/null -w 'readyz=%{http_code}\n' http://127.0.0.1:8787/readyz
+```
+
+`dashboard` 应为 `healthy`，`healthz` 应返回 `200`；首次初始化期间 `readyz` 可暂时返回 `503`，数据就绪后应变为 `200`。检查默认端口由哪个进程监听：
+
+macOS / Linux：
+
+```bash
+lsof -nP -iTCP:8787 -sTCP:LISTEN
+```
+
+Windows PowerShell：
+
+```powershell
+Get-NetTCPConnection -LocalPort 8787 -State Listen |
+    Select-Object LocalAddress, LocalPort, OwningProcess
+Get-Process -Id (Get-NetTCPConnection -LocalPort 8787 -State Listen |
+    Select-Object -First 1 -ExpandProperty OwningProcess)
+```
+
+Docker 部署应显示该端口由 Docker 发布；若显示工程目录中的 Python 进程，应先停止该原生实例，再执行 `docker compose up -d`。
+
+Compose 项目名可能来自当前目录名、`-p` 或 `COMPOSE_PROJECT_NAME`，并会参与物理卷名的生成。首次部署后不要随意更改项目名或改从另一份工程目录启动，否则 Compose 可能创建新的空卷。遇到历史数据突然为空时，先用以下命令确认项目和逻辑卷，不要立即复制或重建数据：
+
+```bash
+docker compose ls
+docker volume ls --filter label=com.docker.compose.volume=niuone-data
+```
+
+> 不要把 `docker compose down -v` 或 `docker volume rm` 用于普通重启、升级和排障。`niuone-data` 是逻辑卷名，实际物理卷名通常带 Compose 项目前缀；删除它会删除配置、数据库、模拟账户和历史记录。普通的 `docker compose down`、`restart` 和 `up -d` 都会保留命名卷。
+
+## 模型与数据源配置
+
+NiuOne 的盘面总结和买卖决策需要接入大模型。
 
 推荐配置：
 
-| 场景 | 推荐模型 | 主要配置项 |
+| 场景 | 推荐模型或数据源 | 主要配置项 |
 |---|---|---|
-| X 关注列表监控、美股机构评级日报 | Grok | `DASHBOARD_GROK_BASE_URL`、`DASHBOARD_GROK_API_KEY`、`DASHBOARD_GROK_MODEL`、`DASHBOARD_GROK_API_MODE`、`X_WATCHLIST_MAX_TOKENS`、`US_RATING_MAX_TOKENS` |
-| A 股盘面总结增强 | 兼容 `/chat/completions` 的模型 | `A_SHARE_MODEL_SUMMARY_BASE_URL`、`A_SHARE_MODEL_SUMMARY_API_KEY`、`A_SHARE_MODEL_SUMMARY_MODEL`、`A_SHARE_MODEL_SUMMARY_MAX_TOKENS`；留空时复用 `DASHBOARD_GROK_*` |
-| A 股候选股及龙虎榜连板/连榜消息面预检 | 具备实时搜索能力的模型 | `DASHBOARD_NEWS_BASE_URL`、`DASHBOARD_NEWS_API_KEY`、`DASHBOARD_NEWS_MODEL`、`DASHBOARD_NEWS_API_MODE`、`DASHBOARD_NEWS_MAX_TOKENS`、`DASHBOARD_NEWS_CONCURRENCY` |
-| 问财龙虎榜研究数据 | 同花顺问财 OpenAPI | `IWENCAI_ENABLED`、`IWENCAI_BASE_URL`、`IWENCAI_API_KEY`、`IWENCAI_TIMEOUT_SECONDS`、`IWENCAI_MAX_RETRIES`、`IWENCAI_MAX_CONCURRENCY`、`IWENCAI_CACHE_TTL_SECONDS`、`IWENCAI_DRAGON_TIGER_CRON` |
-| 选股后的买卖决策 | 推荐 DeepSeek，可用其他兼容模型 | `DASHBOARD_DECISION_BASE_URL`、`DASHBOARD_DECISION_API_KEY`、`DASHBOARD_DECISION_MODEL` |
+| 买卖决策、文字策略细化、消息判断及 A 股/隔夜美股盘面总结 | 共享的 OpenAI 兼容模型 | `DASHBOARD_DECISION_BASE_URL`、`DASHBOARD_DECISION_API_KEY`、`DASHBOARD_DECISION_MODEL`、`DASHBOARD_DECISION_STREAM_MODE`、`DASHBOARD_DECISION_REASONING_EFFORT`、`DASHBOARD_DECISION_CONTEXT_LENGTH`、`DASHBOARD_DECISION_MAX_TOKENS` |
+| 问财龙虎榜研究数据与消息面预检 | 同花顺问财 OpenAPI | `IWENCAI_ENABLED`、`IWENCAI_NEWS_PRECHECK_ENABLED`、`IWENCAI_BASE_URL`、`IWENCAI_API_KEY`、`IWENCAI_TIMEOUT_SECONDS`、`IWENCAI_MAX_RETRIES`、`IWENCAI_MAX_CONCURRENCY`、`IWENCAI_CACHE_TTL_SECONDS`、`IWENCAI_DRAGON_TIGER_CRON` |
 | 买卖决策情报包 | 本地聚合，不需要额外模型 | `DASHBOARD_DECISION_INTELLIGENCE_ENABLED`、`DASHBOARD_DECISION_INTELLIGENCE_TTL_SECONDS`、`DASHBOARD_DECISION_INTELLIGENCE_MAX_ITEMS` |
 
-启动后点击页面上的设置按钮，在设置页维护模型、任务时间和推文监控作者。所有需要模型和 API Key 的分组均可点击“测试模型连接”，测试页面当前填写值但不会自动保存；API Key 留空时复用已保存密钥。推文监控作者填写 X/Twitter handle，不需要 `@`。
-推文监控和美股评级相关设置由“开启牛牛美股”开关控制；关闭时这些设置会折叠隐藏，后台 X 监控和美股评级定时任务会跳过。
-`DASHBOARD_GROK_API_MODE` 默认 `auto`：Grok 4.5 使用带搜索工具的 Responses API，其他模型使用 Chat Completions；也可显式填写 `responses` 或 `chat`。`X_WATCHLIST_REQUEST_TIMEOUT_SECONDS` 默认 `45` 秒。
-`DASHBOARD_NEWS_API_MODE` 默认 `auto`：Grok 4.5 和 GPT-5 系列搜索模型使用带 `web_search` 工具的 Responses API；Grok Responses 预检模型还会加入 `x_search`。其他模型以 `web_search` 检索可公开索引的雪球/X 页面，不会回退到 `DASHBOARD_GROK_*`。
-`*_CONTEXT_LENGTH` 只表示模型上下文窗口，默认 `128000`；`*_MAX_TOKENS` 表示本次请求的最大输出长度，调用层会按 Chat 或 Responses 接口映射兼容参数。JSON 与 SSE 返回均受支持。
-消息面预检默认最多并发检查 5 只候选股；若上游限流，可把 `DASHBOARD_NEWS_CONCURRENCY` 调低到 `2` 或 `1`。
-问财数据源默认关闭；“问财数据源”设置分组可通过“测试问财接口”使用页面当前地址和密钥发送一次轻量只读查询，不会保存配置或改写龙虎榜快照。启用并保存密钥后，可在 `/dragon-tiger` 按交易日实时查询龙虎榜买卖前五的机构、营业部及问财明确标注的游资/量化席位与金额，也可通过 `/api/iwencai/dragon-tiger` 查询指定日期。问财返回涨停原因时，详情卡会将涨停原因及原因类别与上榜原因分开显示。当日数据及下一次成功查询前保留的最近数据无需密码，更早日期需要输入管理员密码；当日实时回源为空时仍展示最近成功快照。Cron 默认在 A 股交易日北京时间 18:00 更新最新快照，也可通过 `IWENCAI_DRAGON_TIGER_CRON` 调整；消息面预检以该配置对应的本次龙虎榜计划查询时间为起点，而不是上游响应的 `generated_at`，并按交易日持久化连板股票（`limit_up_streak >= 2`）或连续上榜股票（`consecutive_listed = true` 且 `consecutive_list_days >= 2`）的已检索和待检索状态。调度器启动时会追补最近应有的交易日快照，每次新拉取前也会补检上一份快照，周五遗漏因此可在周末重启或下一交易日前完成；全部完成后同日不再调用模型。最近一次非空成功查询会保留至下一次成功查询并被原子覆盖，空结果或失败继续保留上一份有效数据。下一次成功更新还会清理旧版本生成的日期归档；同日席位明细失败不会覆盖当前快照中的有效记录。密钥只保存在本机私有 `dashboard.env`，页面不会回显。
+思考强度仍允许手动填写，留空则不发送。已知常见模型会按本地能力表在保存、手动测试和运行请求前校验，表外自定义模型保持自由填写；调用层会按 Qwen、MiniMax、GLM、MiMo 等官方协议自动转换字段，并在兼容值不代表真实档位时显示映射。设置页的“查看常见模型思考强度表”及[部署手册](OPERATIONS.md#常见模型思考强度表)列出当前值和兼容映射。
+
+“财经快讯”不依赖大模型、API Key 或服务地址配置。Compose 部署会随牛牛1号自动启动、停止和恢复官方 NewsNow 容器，Dashboard 通过私有容器网络读取，用户无需管理独立端口或进程；NewsNow 数据保存在独立的 `newsnow-data` volume。管理设置页仅提供财经商业分类下 12 个实际来源的搜索与多选，默认来源为财联社电报、金十数据和华尔街见闻快讯。总览页会在右下角纵向展示最近 5 条快讯，默认仅显示重要信息；关闭“在总览中仅显示重要信息”后会显示全部类型，但不改变完整财经快讯页。使用 `run.sh` / `run.bat` 的原生部署也无需配置，未运行容器 sidecar 时会自动使用公共服务兜底。Dashboard 只向浏览器暴露规范化后的同源 `/api/realtime-news`，成功刷新按 ID 合并并默认有界保留 300 条滚动历史，其中优先保留最多 50 条重要快讯；上游失败时继续使用 `.local-data/runtime/news/realtime_news_latest.json` 中的已保存历史并标记缓存状态。
+
+启动后点击页面上的设置按钮，在独立的“模型配置”栏目维护共享模型；买卖决策和盘面监控不再分别配置模型。该栏目可点击“测试模型连接”。测试使用页面当前填写值但不会自动保存，API Key 留空时复用已保存密钥。
+共享模型的 `DASHBOARD_DECISION_STREAM_MODE` 默认 `auto`：通常使用非流式，只有网关明确要求 `stream=true` 时自动切换；也可设置 `stream` 或 `non_stream` 强制传输方式。流式内容会先完整拼接再校验和使用。
+文字策略的 AI 细化复用共享模型；为了在浏览器实时展示输出，该交互流程在 `auto` 下保持流式，选择 `non_stream` 后改为整段返回。
+`DASHBOARD_DECISION_CONTEXT_LENGTH` 只表示模型上下文窗口，默认 `128000`；`DASHBOARD_DECISION_MAX_TOKENS` 表示本次请求的最大输出长度，调用层会按 Chat 或 Responses 接口映射兼容参数。JSON 与 SSE 返回均受支持。
+`IWENCAI_NEWS_PRECHECK_ENABLED` 默认关闭，可在“问财数据源”设置分组开启。开启后复用已保存的 `IWENCAI_*` 检索配置和 `DASHBOARD_DECISION_*` 买卖决策模型配置。问财公告、新闻和事件技能返回的最近 3 天证据经过身份校验和去重后，由买卖决策模型判断利好、利空或中性；没有证据时直接记为中性。模型失败时标记判断不可用，绝不回退关键词规则，也不拿价格或资金流替代消息。旧 `DASHBOARD_NEWS_*` 配置不再读取。
+问财数据源默认关闭；“问财数据源”设置分组可通过“测试问财接口”验证行情及三个消息面技能，不保存配置或改写快照。额外开启消息面预检后，符合条件的股票会组合查询问财证据并由买卖决策模型判断；关闭时完全跳过。检索或判断失败不会影响龙虎榜主体快照。密钥只保存在本机私有 `dashboard.env`，页面不会回显。
+
+管理员策略回测优先使用完整东方财富行业/概念快照并允许复用已校验的旧快照。首次部署没有任何东方财富快照时，已启用并配置密钥的问财数据源会作为冷启动备用源，完整分页获取当前 A 股的同花顺行业与概念；只有通过上游总数与去重代码完整性校验才写入独立私有缓存并参与回测。结果会标注实际来源，两个来源都失败时不会用空分类伪造结果。
 
 买卖决策情报包默认开启，会把盘面监控、隔夜美股、指数/期货、板块涨跌、行业资金、热门股、候选消息面和账户仓位摘要一起写入每次模拟交易决策 prompt 与日志；单个行情源失败时只记录状态，不会阻断本轮决策。
 
@@ -151,6 +234,12 @@ NiuOne 需要接入大模型后才能驱动完整工作流。没有模型配置�
 | `DASHBOARD_HOME` | `.local-data/runtime` | 运行数据根目录 |
 | `DASHBOARD_HOST` | `127.0.0.1` | 监听地址 |
 | `DASHBOARD_PORT` | `8787` | 监听端口 |
+| `NEWSNOW_DECISION_ENABLED` | `1` | 重要财经快讯辅助买卖决策；15:00 后及休市日信息归入下一交易日；运行时热生效 |
+| `NEWSNOW_OVERVIEW_IMPORTANT_ONLY` | `1` | 总览快讯条仅显示重要信息；运行时热生效 |
+| `NEWSNOW_SOURCES` | `cls-telegraph,jin10,wallstreetcn-quick` | 财经快讯来源，使用英文逗号分隔 |
+| `NEWSNOW_MAX_ITEMS` | `300` | 滚动历史总上限，允许 1～3000 条；运行时热生效 |
+| `NEWSNOW_MAX_IMPORTANT_ITEMS` | `50` | 重要快讯上限，允许 1～1000 条且不得大于总上限；运行时热生效 |
+| `NEWSNOW_REFRESH_SECONDS` | `60` | NiuOne 本地检查间隔，允许 15～1800 秒；运行时热生效 |
 | `DASHBOARD_ADMIN_PASSWORD` | 空 | 设置页管理员密码；为空时使用 `$DASHBOARD_HOME/dashboard_admin_token.txt` 中的 bootstrap 管理密钥 |
 | `PYTHON_BIN` | `.local-data/.venv/bin/python` 或 Windows venv Python | Python 可执行文件 |
 | `DASHBOARD_CONFIG` | `$DASHBOARD_HOME/config.yaml` | 模型服务商和模型 YAML 配置 |
@@ -159,14 +248,19 @@ NiuOne 需要接入大模型后才能驱动完整工作流。没有模型配置�
 | `DASHBOARD_NIUONE_FORWARD_PREFLIGHT_CRON` | `5 9 * * 1-5` | Scheduler 启动时立即预检，周一至周五 09:05 再校验严格前向协议 |
 | `DASHBOARD_NIUONE_EQUITY_SNAPSHOT_CRON` | `15 15 * * 1-5` | 实际 A 股运行日盘后刷新行情并保存无交易副作用的账户权益快照 |
 | `DASHBOARD_NIUONE_FORWARD_CRON` | `20 15 * * 1-5` | 周一至周五盘后从耐久成交账本重算牛牛严格前向报告；下一轮 Cron 生效 |
-| `DASHBOARD_NIUONE_FORWARD_COHORT_START` | `2026-08-04` | 严格前向队列起始日；修改规则时归档旧协议锁并从新交易日重新累计 |
+| `DASHBOARD_NIUONE_FORWARD_COHORT_START` | `2026-09-03` | 严格前向队列起始日；修改规则时归档旧协议锁并从新交易日重新累计 |
+| `DASHBOARD_EXIT_FEEDBACK_AUTO_TUNE_ENABLED` | `1` | 默认启用受约束的 5 日卖后自动调参；设为 `0` 可关闭，下一轮盘后复盘生效 |
+| `DASHBOARD_EXIT_FEEDBACK_MIN_SAMPLES` | `30` | 自动调参要求的 5 日独立有效样本簇数，允许 20～500 |
+| `DASHBOARD_EXIT_FEEDBACK_MIN_MONTHS` | `3` | 自动调参样本最少覆盖月份，允许 2～12 |
+| `DASHBOARD_EXIT_FEEDBACK_COOLDOWN_SAMPLES` | `10` | 两次评估检查点之间要求的新增退出/再入样本数，允许 5～100 |
 | `DASHBOARD_ACTIVE_STRATEGY` | `niuone` | 当前独立策略；保存后下一轮扫描热生效 |
 | `DASHBOARD_PRACTICE_SCHEDULE_TIMES` | `09:25,10:00,10:30,11:00,11:20,13:00,13:30,14:00,14:30,14:50` | 盘面总结、选股和模拟决策的共享时间点 |
+| `DASHBOARD_PRACTICE_FAST_CYCLE_ENABLED` | `0` | 是否启用仅重评当前持仓的同策略快周期；运行时热生效，默认关闭 |
+| `DASHBOARD_PRACTICE_FAST_CYCLE_INTERVAL_SECONDS` | `300` | 持仓快周期触发间隔，允许 60～900 秒；运行时热生效 |
 | `DASHBOARD_KLINE_BOOTSTRAP_ENABLED` | `1` | 首次部署或缓存过期后立即准备全市场日 K；重启生效 |
 | `DASHBOARD_KLINE_READINESS_MIN_COVERAGE_PERCENT` | `90` | 实战扫描放行所需的日期有效日 K 覆盖率；允许 90～100，重启生效 |
 | `DASHBOARD_TENCENT_QUOTE_STAGE_TIMEOUT_SECONDS` | `90` | 全市场实时行情阶段总预算；允许 15～300 秒，重启生效 |
 | `DASHBOARD_MANUAL_DATA_INITIALIZATION_TIMEOUT_SECONDS` | `660` | 手动任务等待日 K 初始化完成的最长秒数；重启生效 |
-| `X_WATCHLIST_ACCOUNTS` | 空 | 推文监控作者列表，使用英文逗号分隔 |
 | `DASHBOARD_DECISION_INTELLIGENCE_ENABLED` | `1` | 买卖决策是否启用全局情报包 |
 | `DASHBOARD_TRADE_DISCIPLINE_TEXT` | 空 | 买卖决策 prompt 的交易纪律文本；为空使用内置默认纪律 |
 | `DASHBOARD_MAX_TOTAL_POSITION_PCT` | `80` | 全局总仓上限；`zettaranc` 和 `sector_tide` 在执行层取全局限制与策略套件硬上限中的更严格值，其他套件主要作为模型参考 |
@@ -177,15 +271,16 @@ NiuOne 需要接入大模型后才能驱动完整工作流。没有模型配置�
 
 保存设置后，运行时可热应用的配置会立即用于后续请求；需要重启的配置请重启本地服务。
 
+开启持仓快周期后，Dashboard 只把当前持仓作为增量评分范围，但继续复用完整周期的当前策略评分器、统一盘面总结、模型决策、SELL 优先和成交风控。快周期不会发现新股票，BUY 只允许对执行时仍存在的持仓加仓；首次建仓和同轮卖出后回补都会失败关闭。行情或日 K 不完整时仍执行正常 SELL/HOLD 检查，但不给予快周期 BUY 资格。快慢周期共享账户决策锁，发生重叠时快周期直接跳过。
+
 ## 独立进程与长期运行
 
-完整后台运行通常由三个相互独立的进程组成：
+完整后台运行通常由两个相互独立的进程组成：
 
 | 进程 | macOS / Linux 入口 | Windows 入口 | 是否必需 |
 |---|---|---|---|
 | Dashboard | `run-dashboard.sh` | `run.bat --no-browser --skip-install` | 是 |
 | 定时调度器 | `run-niuone-cron-scheduler.sh` | `.local-data\.venv\Scripts\python.exe app\entrypoints\niuone_cron_scheduler.py` | 启用自动摘要、数据库入库或模拟持仓自动离场检查时需要 |
-| 关注源守护进程 | `run-x-watchlist-daemon.sh` | `.local-data\.venv\Scripts\python.exe app\entrypoints\x_watchlist_daemon.py` | 启用 X 关注列表时需要 |
 
 实战 B1 选股计划运行在 Dashboard 进程内；每个计划时间会在买卖决策前同步生成统一的“此刻盘面总结与评价”，其风险标签直接作为实战交易上下文。页面按钮和手动选股与交易链路也使用同一生成器。定时调度器不负责选股，但会在启动时及工作日 09:05、首轮 09:25 决策之前冻结/校验严格前向协议和起始日前零持仓账户基线，随后负责独立的模拟持仓自动离场检查、15:15 无交易盘后净值快照，并在 15:20 从 `niuniu.db` 完整成交、候选机会集、每日权益与决策 payload 加最近 JSON 日志生成私有牛牛严格前向报告。协议 v18 要求每个 Practice 槽不仅终态为 `ok`，还必须有结构完整的 SQLite 决策证据；延迟成交沿用原槽候选分母，报告按五阶段输出观察、入选、模型 BUY、实际 BUY、定仓利用率和拒单分类。落盘或 schema 校验失败会使该槽或自动退出任务失败。冻结指纹覆盖三个前向 Cron、耐久数据库/恢复状态/运行审计/交易所日历缓存有效路径和调度/存储/评估源码；路径只保存摘要，`--as-of` 不能改变锁的实际冻结日期。只有全部完成生命周期的入口归因完整、并且起始日至截止日每个实际 A 股运行日的预检、全部 Practice 槽及其决策账本、开盘/尾盘退出、盘后权益和评估都成功，30 笔交易或 3 个完整自然月的样本门才可进入运营复核；无可信日历缓存时保守退回周一至周五。满三个月但不足 30 笔只检查频率和运行。最终高胜率且正收益声明还必须有至少 30 笔交易，同时通过冻结历史胜率参考、交易级 Wilson 95% 下界、首次入场日期×行业的唯一簇数和 Herfindahl 有效簇数、簇等权胜率及其 95% 下界、费用后收益质量、纯牛牛账户归因、正组合收益、最大回撤不超过 6%、收益/回撤不低于 1 及运行/机会完整性；同日同业的批量交易只计一个唯一簇。归因缺失为 `data_quality_blocked`，运行日缺失为 `operations_blocked`。代码或锁定配置变化后报告同样停止晋级，必须归档旧报告/锁并从新的 `DASHBOARD_NIUONE_FORWARD_COHORT_START` 重新累计。要让模拟账户完整走通“协议预检—定时选股—盘面总结评价—决策—自动离场—净值快照—前向归因”，Dashboard 与定时调度器都必须持续运行。v18 还从首次 BUY 起记录持仓阶段路径、在每次主线扫描时更新，并由真实 SELL 冻结退出阶段；缺少任一实际运行日观察或入口/退出阶段对不上路径时，生命周期不能进入人工复核。
 
@@ -225,6 +320,38 @@ v30 新增 20 日市场中性化收益波形归因，用目标股票与排除自
 
 v31 修复多概念股票在龙头资格和排序中的重复稀释：15% 权重线继续过滤普通弱分支，单股归因分最高且不低于 60 的首要题材保留唯一低份额例外；结构/今日龙头分别按原始强度/当日涨幅排序，归因分只作同值次序。题材广度、资金、集中度和全部交易风控仍使用原规则。题材上下文/专用缓存为 v12/v10，独立部署严格前向/回测协议为 `niuone-strict-forward-v31`/`niuone-backtest-v32`；部署前必须归档旧协议锁、报告和回测结果。
 
+v32 为成熟主线路径增加个股资金活跃门：领涨、转强和启动要求全市场成交额分位 ≥60 且动作所选题材内成交额分位 ≥50，成交额缺失失败关闭；试仓保留早期发现能力但明确提示活跃度不足。强势分中的成交额权重提高到 15%、5 日强度降为 20%，不直接按市值或换手率加分。题材上下文/专用缓存为 v13/v11，候选证据 schema 为 v2，独立部署严格前向/回测协议为 `niuone-strict-forward-v32`/`niuone-backtest-v33`；部署前归档旧锁、报告和回测结果。
+
+v33 仅本地化面向用户的内部枚举。提示词使用中文阶段、角色和主线模式名；持久化与历史展示只转换中文策略上下文中的独立小写枚举，并覆盖二次取舍嵌套理由。专名、英文技术表达、错误文本、缩写和标识符保持原样，策略门槛和风控不变。展示映射纳入协议指纹，独立部署严格前向协议升级为 `niuone-strict-forward-v33`，默认新队列从 `2026-08-13` 开始；部署前归档 v32 锁和报告。
+
+管理员回测 v34 将信号期后的最终平仓日计入权益曲线及风险指标，并改进长耗时回放的当前交易日计时和剩余时间估算。牛牛协议升级为 `niuone-backtest-v34`，预设文字策略协议同步升级为 `prompt-backtest-v2`；独立部署升级后旧结果会失效并要求重跑。策略规则、成交精度和资金计算不变。
+
+v34 取消牛牛上午/下午、单轮和单日新开仓数量限制，固定最多持有 5 只。满仓时以可审计优先级比较新候选和最低优先级牛牛持仓，仅在新候选严格更高且旧仓全部满足 T+1 可卖时先卖后买；风险预算和主题容量不变。严格前向/管理员回测协议升级为 `niuone-strict-forward-v34`/`niuone-backtest-v35`，默认新队列从 `2026-08-19` 开始；部署前归档旧锁、报告和回测。
+
+v35 增加同股同战法的评分阶梯加仓。每笔实际 BUY 都更新持仓期买入评分最高水位；后续信号只有评分严格创新高才获得加仓资格，平分、降分或评分缺失均失败关闭。试仓当日禁加、亏损不补，成熟路径的主升/强领涨/2%～12% 浮盈窗口和全部组合风控继续执行；阶段升级及真实减仓后的波段回补保持独立。严格前向/管理员回测协议升级为 `niuone-strict-forward-v35`/`niuone-backtest-v36`，默认队列仍为尚未开始的 `2026-08-19`。
+
+v36 将此刻盘面总结/评价与牛牛开仓数量解耦。盘面生成的动态持仓数、单轮新仓数和暂停字段不再限制牛牛，模型提示、二次取舍及成交复核统一只执行最多 5 只和满仓优先级换仓；单笔/组合/主题风险预算、总仓、现金、候选自身复合硬停止及日内亏损预算继续有效。独立部署严格前向协议升级为 `niuone-strict-forward-v36`，管理员回测保持已采用相同容量规则的 `niuone-backtest-v36`，默认队列日期仍为 `2026-08-19`。
+
+v37 将消息面预检失败与买卖决策权重解耦。失败、超时、未检查、待判断或不可用记录不进入决策消息证据，候选摘要统一按中性、权重 0 处理，不得因此降分、降优先级、缩仓或形成不开仓/HOLD/SELL 理由。有效利好、利空和中性结果仍正常参与决策。独立部署严格前向协议升级为 `niuone-strict-forward-v37`，管理员回测保持 `niuone-backtest-v36`，默认队列日期仍为 `2026-08-19`。
+
+v38 解除牛牛试仓每日 2 个候选和同板块/同题材 2 只持仓的固定数量限制；最多 5 只持仓及单票、主题风险、主题敞口、组合风险、总仓、现金、涨停、T+1 继续有效，板块潮汐规则不变。独立部署严格前向/管理员回测协议升级为 `niuone-strict-forward-v38`/`niuone-backtest-v37`，默认新队列日期为 `2026-08-21`；部署前归档旧锁、报告和回测结果。
+
+v39 将共享盘面提示中的午盘数量和午后保留名额明确限定为非牛牛规则，牛牛 BUY/HOLD 只与 5 只硬上限比较。独立部署严格前向协议升级为 `niuone-strict-forward-v39`，管理员回测仍为 `niuone-backtest-v37`，默认新队列日期为 `2026-08-24`；部署前归档 v38 锁和报告。
+
+v40 将牛牛试仓绝对上限提高到 10%，轮动试仓单笔权益风险和单主题风险同步提高到 1%；本地生命周期规则对满足跨日主升、强势领涨且浮盈 2%～12% 的持仓确定性生成 10%/20% 分级加仓，明确 SELL 仍退出优先，原风险、敞口、现金与 T+1 边界继续有效。独立部署严格前向/管理员回测协议升级为 `niuone-strict-forward-v40`/`niuone-backtest-v38`，默认队列日期保持 `2026-08-24`；部署前归档 v39 锁、报告和旧回测结果。
+
+v41 增加默认关闭的持仓快周期，只缩小增量评分范围，不改变当前策略评分、统一盘面总结、模型决策、SELL 优先或成交风控。快周期 BUY 只允许加到执行时仍存在的持仓，不能发现、首次买入或卖后回补新仓；运行来源以 `holding_fast` 耐久归因，开关和 60～900 秒间隔进入协议指纹。独立部署严格前向协议升级为 `niuone-strict-forward-v41`，管理员日线回测仍为 `niuone-backtest-v38`，默认新队列从 `2026-08-27` 开始；部署前归档 v40 锁和报告。
+
+v42 将牛牛同时持仓上限改为设置中的 `DASHBOARD_MAX_OPEN_POSITIONS`。模型提示、剩余槽位、满仓换仓、最终成交复核、管理员回测和严格前向协议共用该配置；午盘前上限及盘面动态数量仍不约束牛牛，其他风险预算保持不变。独立部署严格前向/管理员回测升级为 `niuone-strict-forward-v42`/`niuone-backtest-v39`，默认队列仍从 `2026-08-27` 开始；部署前归档 v41 锁、报告和旧回测结果。
+
+v43 将未兑现、卖出评分、题材/行业转弱和普通盈利回撤统一纳入分段软退出：首次减仓 50%，余仓至少等待下一交易日确认，4～5 分评分首日否决；结构止损、主线失活和市场硬停止仍即时退出。满仓换仓新增 3 分优先级滞回门槛。SQLite 按每笔 SELL 持久更新 1/3/5/10 日 MFE、MAE、收盘/基准超额及换仓相对收益，5 日窗口完成后再标记卖飞或避免续亏；软退出清仓后的 5 个交易日影子观察要求完整扫描同时确认站回退出高点/BBI、量能和原题材逻辑。独立部署严格前向/管理员回测升级为 `niuone-strict-forward-v43`/`niuone-backtest-v40`，新队列从 `2026-08-28` 开始；部署前归档 v42 锁、报告和旧回测结果。
+
+v44 增加默认关闭的卖后自动反馈。启用后，5 日完整样本达到配置的数量和跨月门槛，每累计一批新增样本最多移动一个受审计档位；只调软退出、换仓优势和卖后再入确认，结构止损、T+1、账户/组合/主题风险及仓位上限冻结。成交保存版本与参数，SQLite 原子切换版本，显著恶化时自动回退。独立部署严格前向升级为 `niuone-strict-forward-v44`，回测仍为固定默认参数的 `niuone-backtest-v40`，新队列从 `2026-08-31` 开始。
+v45 把自动反馈升级为 v2：完成复盘单向成熟，收益锚定真实成交，换仓只使用实际 BUY，再入放行与拦截都保存直接影子结果；最近 120 个有效样本按同股同日簇去重、按成交资金加权并使用 90% 置信区间。无参数变化的评估不再生成版本，活动 SQLite 版本在加载账户时自动对账。所有硬止损和组合风险边界保持冻结；独立部署严格前向升级为 `niuone-strict-forward-v45`，队列仍从 `2026-08-31` 开始。
+v46 默认开启受约束的 5 日卖后自动调参；未显式配置的独立部署会在下一轮盘后复盘进入学习或评估，设置 `DASHBOARD_EXIT_FEEDBACK_AUTO_TUNE_ENABLED=0` 仍可关闭。样本门槛、有界网格、自动回滚和冻结风控均不变；独立部署严格前向升级为 `niuone-strict-forward-v46`，队列仍从 `2026-08-31` 开始。
+v47 让独立部署在首次盘后复盘前也能观察反馈状态：模拟交易页固定显示卖后 5 日复盘区域，并以当前运行配置覆盖旧账户快照中的启用标记。默认开启时显示等待首次复盘，显式关闭时显示未启用；严格前向升级为 `niuone-strict-forward-v47`。
+v48 修复持仓快周期使用压缩主线缓存后无法形成加仓候选的问题。快周期使用最新分钟题材/市场状态，并只从同日完整扫描补齐个股 `strong_score`、`theme_profiles` 等评分画像；跨日、缺失或异常仍失败关闭，异常只持久化类型和数量。加仓门槛、退出优先和全部组合风控不变；严格前向升级为 `niuone-strict-forward-v48`，新队列从 `2026-09-03` 开始。
+
 ### 一键启用
 
 `--service` 会先执行与普通启动相同的目录初始化、虚拟环境创建和依赖安装，再注册当前平台的原生服务并立即启动。重复执行会更新已有注册，适合代码或配置变更后重新部署。
@@ -251,7 +378,7 @@ run.bat --service
 run.bat --service --port 8877 --no-browser
 ```
 
-三个进程都会被注册。关闭“牛牛美股”功能后，X 关注源守护进程会跳过采集并保持低频休眠，无需单独卸载。
+两个进程都会被注册。
 
 ### 更新源码部署
 
@@ -262,14 +389,14 @@ git pull --ff-only
 ./run.sh --service --no-browser
 ```
 
-重复运行 `--service` 会更新并重启三个原生服务，同时保留 `.local-data/` 中的配置、数据库和日志。已经安装长期运行服务时，普通执行 `./run.sh`（Windows 为 `run.bat`）也会自动重启托管进程，避免新前端由旧后端提供。尚未安装长期运行服务的前台运行方式使用：
+重复运行 `--service` 会更新并重启两个原生服务，同时保留 `.local-data/` 中的配置、数据库和日志。已经安装长期运行服务时，普通执行 `./run.sh`（Windows 为 `run.bat`）也会自动重启托管进程，避免新前端由旧后端提供。尚未安装长期运行服务的前台运行方式使用：
 
 ```bash
 git pull --ff-only
 ./run.sh --no-browser
 ```
 
-启动器会在虚拟环境新建或 `requirements.txt` 哈希变化时安装 Python 依赖，并在前端源码、样式或锁文件变化时重新构建 Vue。`--skip-install` 只跳过 Python 依赖安装检查，不会跳过缺失或过期的前端构建。容器升级请固定新的 `NIUONE_IMAGE` 版本标签，再执行 `docker compose pull` 和 `docker compose up -d --no-build`；完整备份、验证和回滚步骤见[部署、验证和回滚手册](OPERATIONS.md)。
+启动器会在虚拟环境新建或 `requirements.txt` 哈希变化时安装 Python 依赖，并在前端源码、样式或锁文件变化时重新构建 Vue。`--skip-install` 只跳过 Python 依赖安装检查，不会跳过缺失或过期的前端构建。容器升级请固定新的 `NIUONE_IMAGE` 版本标签，如需锁定 NewsNow 版本则同时设置 `NEWSNOW_IMAGE`，再执行 `docker compose pull` 和 `docker compose up -d --no-build`；两个持久卷都会保留。完整备份、验证和回滚步骤见[部署、验证和回滚手册](OPERATIONS.md)。
 
 ### 状态、重启与卸载
 

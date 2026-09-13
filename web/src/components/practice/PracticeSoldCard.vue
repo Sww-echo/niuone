@@ -1,9 +1,11 @@
 <script setup>
 import { computed } from 'vue'
 import {
+  finitePracticeNumber,
   formatPracticeAmount,
   formatPracticeNumber,
   inferPracticeExitRules,
+  localizePracticeReason,
   PRACTICE_EXIT_NAMES,
   practiceValueColor,
   signedPracticeAmount,
@@ -13,11 +15,11 @@ import {
 } from '../../utils/practiceDisplay.js'
 
 const props = defineProps({ sold: { type: Object, required: true } })
-const realized = computed(() => Number(props.sold.realized_pnl))
-const realizedPct = computed(() => Number(props.sold.realized_pnl_pct))
-const afterPnl = computed(() => Number(props.sold.after_sell_pnl))
-const afterPct = computed(() => Number(props.sold.change_after_sell_pct))
-const currentPct = computed(() => Number(props.sold.current_change_pct))
+const realized = computed(() => finitePracticeNumber(props.sold.realized_pnl))
+const realizedPct = computed(() => finitePracticeNumber(props.sold.realized_pnl_pct))
+const afterPnl = computed(() => finitePracticeNumber(props.sold.after_sell_pnl))
+const afterPct = computed(() => finitePracticeNumber(props.sold.change_after_sell_pct))
+const currentPct = computed(() => finitePracticeNumber(props.sold.current_change_pct))
 const realizedText = computed(() => Number.isFinite(realized.value)
   ? `${signedPracticeAmount(realized.value)}${Number.isFinite(realizedPct.value) ? ` / ${signedPracticeNumber(realizedPct.value)}` : ''}`
   : '--')
@@ -27,7 +29,7 @@ const afterText = computed(() => Number.isFinite(afterPnl.value)
 const observation = computed(() => Number.isFinite(afterPnl.value)
   ? (afterPnl.value > 0 ? '卖出后上涨' : afterPnl.value < 0 ? '卖出后回落' : '卖出后持平')
   : '等待行情')
-const reasonText = computed(() => String(props.sold.reason || '').trim())
+const reasonText = computed(() => localizePracticeReason(props.sold.reason || '').trim())
 const exitRuleLabels = computed(() => {
   const rawRules = Array.isArray(props.sold.exit_rules) && props.sold.exit_rules.length
     ? props.sold.exit_rules
@@ -41,6 +43,9 @@ const exitRuleLabels = computed(() => {
 const afterColor = computed(() => Number.isFinite(afterPnl.value)
   ? (afterPnl.value > 0 ? 'var(--yellow-text)' : afterPnl.value < 0 ? 'var(--green-text)' : 'var(--muted)')
   : 'var(--muted)')
+const currentColor = computed(() => Number.isFinite(currentPct.value)
+  ? practiceValueColor(currentPct.value)
+  : 'var(--muted)')
 </script>
 
 <template>
@@ -51,10 +56,10 @@ const afterColor = computed(() => Number.isFinite(afterPnl.value)
     </div>
     <div class="position-metrics">
       <div class="position-metric"><div class="position-label">卖出/现价</div><div class="position-value combo">{{ formatPracticeNumber(sold.avg_sell_price) }} / {{ sold.current_price == null ? '--' : formatPracticeNumber(sold.current_price) }}</div></div>
-      <div class="position-metric"><div class="position-label">已实现盈亏</div><div class="position-value strong combo" :style="`color:${practiceValueColor(realized)}`">{{ realizedText }}</div></div>
+      <div class="position-metric realized-return-metric" title="本轮累计已实现盈亏 ÷ 本轮累计买入成本（含费用）"><div class="position-label">已实现盈亏 / 收益率</div><div class="position-value strong combo" :style="`color:${practiceValueColor(realized)}`">{{ realizedText }}</div></div>
       <div class="position-metric"><div class="position-label">卖后变化</div><div class="position-value strong combo" :style="`color:${afterColor}`">{{ afterText }}</div></div>
       <div class="position-metric"><div class="position-label">观察</div><div class="position-value strong" :style="`color:${afterColor}`">{{ observation }}</div></div>
-      <div class="position-metric"><div class="position-label">实时涨幅</div><div class="position-value strong" :style="`color:${practiceValueColor(currentPct)}`">{{ Number.isFinite(currentPct) ? signedPracticeNumber(currentPct) : '--' }}</div></div>
+      <div class="position-metric"><div class="position-label">实时涨幅</div><div class="position-value strong" :style="`color:${currentColor}`">{{ Number.isFinite(currentPct) ? signedPracticeNumber(currentPct) : '--' }}</div></div>
       <div class="position-metric"><div class="position-label">卖出金额</div><div class="position-value">{{ formatPracticeAmount(sold.sell_amount) }}</div></div>
       <div class="position-metric"><div class="position-label">到账金额</div><div class="position-value">{{ formatPracticeAmount(sold.net_proceeds) }}</div></div>
       <div class="position-metric"><div class="position-label">费用</div><div class="position-value secondary">{{ formatPracticeAmount(sold.fee) }}</div></div>

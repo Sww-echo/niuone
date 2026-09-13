@@ -3,12 +3,11 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { RouterLink, useRoute } from 'vue-router'
 import AdminLogin from './AdminLogin.vue'
 import AdminPageTitle from './AdminPageTitle.vue'
-import ThemeToggle from './ThemeToggle.vue'
 import { useAdminConfig } from '../composables/useAdminConfig.js'
 
 document.title = '牛牛1号 · 策略回测'
 
-const NIUONE_BACKTEST_PROTOCOL_VERSION = 'niuone-backtest-v32'
+const NIUONE_BACKTEST_PROTOCOL_VERSION = 'niuone-backtest-v43'
 
 const route = useRoute()
 const { state, errorMessage, refresh, authenticate } = useAdminConfig()
@@ -17,16 +16,27 @@ const options = ref(null)
 const optionsError = ref('')
 const starting = ref(false)
 const cancelling = ref(false)
+const clearingCache = ref(false)
+const cacheUsage = ref(null)
+const cacheMessage = ref('')
 const taskError = ref('')
 const job = ref(null)
+const elapsedTick = ref(0)
+const elapsedAnchor = reactive({ key: '', base: 0, startedAt: 0 })
 const form = reactive({
   startDate: '', endDate: '', adjustment: 'qfq', source: 'auto',
+  promptVersionId: '',
 })
 let pollTimer = 0
+let elapsedTimer = 0
 
 const strategy = computed(() => (
   (options.value?.strategies || []).find(item => item.id === strategyId.value) || null
 ))
+const promptVersions = computed(() => strategy.value?.prompt_versions || [])
+const selectedPromptVersion = computed(() => promptVersions.value.find(
+  item => item.version_id === form.promptVersionId,
+) || null)
 const limits = computed(() => options.value?.limits || {})
 const expectedProtocolVersion = computed(() => (
   strategy.value?.id === 'niuone'
@@ -94,16 +104,45 @@ const qualitySummary = computed(() => {
   const biasCount = qualityWarnings.value.length - (coverage ? 1 : 0)
   return biasCount > 0 ? `${coverageText} · ${biasCount} 项偏差提示` : coverageText
 })
+const adjustmentLabels = { qfq: '前复权', hfq: '后复权', none: '不复权' }
+const sourceLabels = { eastmoney: '东方财富', tencent: '腾讯', sina: '新浪' }
 const isActive = computed(() => ['queued', 'running'].includes(job.value?.status))
+const liveDayElapsedSeconds = computed(() => {
+  const raw = Number(job.value?.day_elapsed_seconds)
+  if (!Number.isFinite(raw) || raw < 0) return null
+  const key = elapsedJobKey(job.value)
+  if (!isActive.value || !key || elapsedAnchor.key !== key) return raw
+  const now = elapsedTick.value || monotonicNow()
+  return elapsedAnchor.base + Math.max(0, (now - elapsedAnchor.startedAt) / 1000)
+})
+const activeRequest = computed(() => job.value?.request || {})
+const activeRequestAdjustment = computed(() => (
+  adjustmentLabels[String(activeRequest.value.adjustment || '')]
+  || String(activeRequest.value.adjustment || '')
+))
+const activeRequestSources = computed(() => (
+  (Array.isArray(activeRequest.value.sources) ? activeRequest.value.sources : [])
+    .map(value => sourceLabels[String(value || '')] || String(value || ''))
+    .filter(Boolean)
+    .join(' → ')
+))
 const canStart = computed(() => (
   state.value === 'ready'
   && strategy.value?.supported
   && form.startDate
   && form.endDate
+  && (strategy.value?.id !== 'preset_text' || Boolean(form.promptVersionId))
   && !starting.value
   && !isActive.value
 ))
 const canCancel = computed(() => isActive.value && !cancelling.value)
+const canClearCache = computed(() => (
+  state.value === 'ready'
+  && cacheUsage.value?.available
+  && Number(cacheUsage.value?.file_count || 0) > 0
+  && !isActive.value
+  && !clearingCache.value
+))
 const strategyLabels = computed(() => {
   const ids = strategy.value?.strategy_ids || []
   const labels = strategy.value?.strategy_labels || []
@@ -121,14 +160,39 @@ const statusLabels = {
 }
 const signalStatusLabels = { evaluated: '已评估', skipped: '已跳过', rejected: '不可评估' }
 const signalStatusReasonLabels = {
+  unknown: '未记录具体原因',
   cooldown: '冷却期内重复信号',
+  unknown_symbol: '候选股票不在历史行情范围',
+  no_next_session: '回测区间内没有下一交易日',
+  missing_next_session_bar: '缺少下一交易日行情',
+  suspended_or_zero_volume: '下一交易日停牌或成交量为零',
+  insufficient_forward_data: '缺少完整的后续收益区间',
   open_at_limit_up: '次日开盘涨停，无法按规则成交',
   position_open: '已有持仓，不重复买入',
   entry_pending: '已有待执行买入信号',
+  holding_upgrade_missing_position: '阶段升级信号缺少对应持仓',
+  markup_upgrade_same_day_add: '主升升级当日不重复加仓',
+  markup_upgrade_early_done: '启动阶段升级加仓已完成',
+  markup_upgrade_confirmed_done: '主升阶段升级加仓已完成',
+  markup_upgrade_rule: '主升阶段升级加仓条件未满足',
+  markup_rebalance_rule: '主升回补条件未满足',
+  signal_score_baseline_missing: '缺少上次实际买入评分',
+  signal_score_missing: '本次买入信号缺少评分',
+  signal_score_not_improved: '本次评分未刷新持仓期买入最高分',
+  signal_score_add_stage: '评分递增加仓所需生命周期未满足',
+  signal_score_add_loss: '评分递增但持仓仍亏损，不摊低成本',
+  signal_score_add_pnl_window: '评分递增加仓超出允许浮盈窗口',
   reversal_same_day_add: '牛牛试仓当日不重复加仓',
   reversal_upgrade_unconfirmed: '试仓尚未满足启动/主线升级条件',
   emerging_upgrade_unconfirmed: '启动观察仓尚未确认升级为主线',
   mixed_strategy_add: '不允许混合不同阶段的加仓路径',
+  unsupported_strategy: '策略类型不支持组合定仓',
+  markup_momentum_identity_block: '主升动量试仓不符合策略身份条件',
+  missing_signal_close: '缺少信号日收盘价，无法校验次日执行',
+  reversal_execution_gap: '试仓次日开盘跳空超过执行上限',
+  reversal_entry_price: '试仓成交涨幅达到3%或缺少有效前收盘价',
+  stock_activity: '换手率不足3%、成交额排名不足或活跃度数据缺失',
+  markup_momentum_execution_gap: '主升动量试仓次日跳空超过执行上限',
   max_open_positions: '已达到当前风险档位的持仓数量上限',
   max_new_positions: '当日新仓数量已达当前风险档位上限',
   max_industry_positions: '同一主题持仓数量已达当前风险档位上限',
@@ -140,6 +204,14 @@ const signalStatusReasonLabels = {
   target_position_reached: '当前持仓已达到该阶段风险仓位上限',
   below_board_lot: '风险预算不足 1 手，未成交',
   insufficient_cash: '现金不足或低于策略现金储备',
+  entry_risk_rejected: '买入未通过风险定仓规则',
+  prompt_entry_false: '冻结文字策略买入条件不成立',
+  prompt_entry_unknown: '冻结文字策略买入数据不足',
+  prompt_add_disabled: '冻结文字策略禁止加仓',
+  prompt_max_new_positions: '冻结文字策略本轮新仓已达上限',
+  prompt_position_too_small: '冻结文字策略仓位不足一手',
+  prompt_single_position_limit: '冻结文字策略单票仓位超过系统上限',
+  prompt_total_position_limit: '冻结文字策略总仓位或现金储备超过系统上限',
 }
 const diagnosticFamilyLabels = {
   risk_structure: '结构风险', daily_v_structure: '日线 V 型结构', price_structure: '价格结构',
@@ -158,11 +230,45 @@ function responseError(payload, fallback) {
   return new Error(String(payload?.error || fallback))
 }
 
+function formatBytes(value) {
+  const bytes = Math.max(0, Number(value) || 0)
+  if (bytes < 1024) return `${bytes} B`
+  const units = ['KB', 'MB', 'GB', 'TB']
+  let amount = bytes / 1024
+  let index = 0
+  while (amount >= 1024 && index < units.length - 1) {
+    amount /= 1024
+    index += 1
+  }
+  return `${amount.toFixed(amount >= 10 ? 1 : 2)} ${units[index]}`
+}
+
+async function loadCacheUsage() {
+  try {
+    const response = await fetch('/api/admin/backtests/cache', {
+      credentials: 'same-origin', cache: 'no-store',
+    })
+    if (response.status === 403) {
+      await refresh()
+      return
+    }
+    const payload = await response.json().catch(() => null)
+    if (!response.ok || !payload) throw responseError(payload, '回测缓存状态加载失败')
+    cacheUsage.value = payload
+  } catch (error) {
+    cacheMessage.value = error instanceof Error ? error.message : '回测缓存状态加载失败'
+  }
+}
+
 function applyDefaults() {
   const defaults = options.value?.defaults || {}
   if (!form.startDate) form.startDate = String(defaults.start_date || '')
   if (!form.endDate) form.endDate = String(defaults.end_date || '')
   if (!form.adjustment) form.adjustment = String(defaults.adjustment || 'qfq')
+  if (strategy.value?.id === 'preset_text' && !form.promptVersionId) {
+    const preferred = promptVersions.value.find(item => item.active) || promptVersions.value[0]
+    form.promptVersionId = String(preferred?.version_id || '')
+  }
 }
 
 async function loadOptions() {
@@ -182,6 +288,7 @@ async function loadOptions() {
     options.value = payload
     applyDefaults()
     setTitle(strategy.value ? `${strategy.value.label}回测` : '策略回测')
+    await loadCacheUsage()
     if (strategy.value) await restoreLatestJob()
   } catch (error) {
     optionsError.value = error instanceof Error ? error.message : '回测配置加载失败'
@@ -210,6 +317,8 @@ async function loadServerJob(expectedStrategyId = strategyId.value) {
     job.value = payload.job || null
     if (['queued', 'running'].includes(payload.job?.status)) {
       pollTimer = window.setTimeout(() => loadServerJob(expectedStrategyId), 1200)
+    } else {
+      await loadCacheUsage()
     }
   } catch (error) {
     if (expectedStrategyId !== strategyId.value) return
@@ -239,6 +348,9 @@ async function startBacktest() {
       adjustment: form.adjustment,
       source: form.source,
     })
+    if (strategy.value?.id === 'preset_text') {
+      body.set('prompt_strategy_version_id', form.promptVersionId)
+    }
     const response = await fetch('/api/admin/backtests', {
       method: 'POST',
       credentials: 'same-origin',
@@ -294,6 +406,34 @@ async function cancelBacktest() {
   }
 }
 
+async function clearBacktestCache() {
+  if (!canClearCache.value) return
+  const confirmed = window.confirm('清除回测重放缓存？下次回测会重新计算选股回放。')
+  if (!confirmed) return
+  clearingCache.value = true
+  cacheMessage.value = ''
+  try {
+    const response = await fetch('/api/admin/backtests/cache/clear', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'X-NiuOne-Action': '1' },
+    })
+    if (response.status === 403) {
+      await refresh()
+      return
+    }
+    const payload = await response.json().catch(() => null)
+    if (!response.ok || !payload) throw responseError(payload, '回测缓存清理失败')
+    cacheUsage.value = payload
+    cacheMessage.value = `已删除 ${Number(payload.removed_file_count || 0)} 个缓存文件，释放 ${formatBytes(payload.removed_byte_count)}`
+  } catch (error) {
+    cacheMessage.value = error instanceof Error ? error.message : '回测缓存清理失败'
+    await loadCacheUsage()
+  } finally {
+    clearingCache.value = false
+  }
+}
+
 function formatPercent(value) {
   if (value === null || value === undefined || Number.isNaN(Number(value))) return '—'
   const number = Number(value)
@@ -337,6 +477,50 @@ function formatDuration(value) {
   const minutes = Math.floor(seconds / 60)
   const remaining = Math.round(seconds % 60)
   return `${minutes} 分 ${remaining} 秒`
+}
+
+function monotonicNow() {
+  return window.performance?.now?.() ?? Date.now()
+}
+
+function elapsedJobKey(value) {
+  if (!['queued', 'running'].includes(value?.status) || !value?.trading_date) return ''
+  return `${String(value?.id || '')}|${String(value.trading_date)}`
+}
+
+function syncElapsedAnchor(value) {
+  const raw = Number(value?.day_elapsed_seconds)
+  const key = elapsedJobKey(value)
+  if (!key || !Number.isFinite(raw) || raw < 0) {
+    elapsedAnchor.key = ''
+    elapsedAnchor.base = 0
+    elapsedAnchor.startedAt = 0
+    return
+  }
+  const now = monotonicNow()
+  const localElapsed = elapsedAnchor.key === key
+    ? elapsedAnchor.base + Math.max(0, (now - elapsedAnchor.startedAt) / 1000)
+    : -1
+  if (elapsedAnchor.key !== key || raw > localElapsed) {
+    elapsedAnchor.key = key
+    elapsedAnchor.base = raw
+    elapsedAnchor.startedAt = now
+  }
+  elapsedTick.value = now
+}
+
+function startElapsedClock() {
+  if (elapsedTimer) return
+  elapsedTick.value = monotonicNow()
+  elapsedTimer = window.setInterval(() => {
+    elapsedTick.value = monotonicNow()
+  }, 500)
+}
+
+function stopElapsedClock() {
+  if (!elapsedTimer) return
+  window.clearInterval(elapsedTimer)
+  elapsedTimer = 0
 }
 
 function stockCode(value) {
@@ -456,7 +640,9 @@ function compactDiagnosticReasons(values, actionable = false) {
 
 function signalStatusReason(reason) {
   const value = String(reason || '')
-  return signalStatusReasonLabels[value] || value
+  if (!value) return '未记录具体原因'
+  return signalStatusReasonLabels[value]
+    || (/^[a-z][a-z0-9_]*$/.test(value) ? '其他策略限制' : value)
 }
 
 function warningSymbolCount(value) {
@@ -471,9 +657,22 @@ function warningText(value) {
     const count = warningSymbolCount(text)
     return count ? `部分标的发生行情源降级：${count} 只` : '部分标的发生行情源降级。'
   }
+  if (text.includes('partial universe fetched because')) return '部分标的历史行情获取失败，本次回测仅使用成功获取的标的。'
+  if (text.includes('current classification fallback used: iwencai_current_industry_concept')) return '当前行业/概念分类已改用问财备用源。'
+  if (text.includes('stale current classification snapshot used')) {
+    const snapshotDate = text.split(':').slice(1).join(':').trim()
+    return snapshotDate && snapshotDate !== 'unknown date'
+      ? `当前行业/概念分类使用了过期快照：${snapshotDate}。`
+      : '当前行业/概念分类使用了日期未知的过期快照。'
+  }
   if (text.includes('survivorship bias')) return '自动候选范围使用当前上市状态，无法补回已退市股票或精确还原历史上市成员，结果可能存在幸存者偏差。'
+  if (text.includes('NiuOne structural stops use the completed daily low')) return '牛牛结构止损使用已完成日 K 的最低价判断触发，并以止损价或开盘价作为成交参考；其他退出使用收盘价。日 K 无法还原盘中精确触发时点与排队优先级。'
+  if (text.includes('NiuOne entries use 100% of the deterministic maximum risk-permitted')) return '牛牛回测按风控允许的确定性最大整手数量下单；模拟交易使用模型指定股数，超出上限时会拒单而非自动缩量。因此本回测的组合收益和回撤反映最大定仓情景。'
+  if (text.includes('NiuOne aggressive backtest profile increases account-risk')) return '牛牛进取回测参数提高账户风险、组合/题材敞口与持仓数量预算，但不会放宽价格形态、结构止损、涨停或 T+1 规则。'
   if (text.includes('completed daily bars at the close')) return '卖出规则使用每日收盘后可见的日 K 数据回放，触发时按当日收盘价估算成交；日 K 无法还原盘中精确触发时点与排队次序。'
+  if (text.includes('prompt strategy backtests enforce the static system position')) return '文字策略回测执行系统静态持仓、单票、总仓和现金储备上限；生产盘面指引可能进一步收紧这些上限，历史回测不会伪造缺失的盘面指引快照。'
   if (text.includes('historical universe coverage')) return `历史行情覆盖率：${text.split(':').slice(1).join(':').trim()}`
+  if (text.includes('selection replay cache could not be persisted')) return '选股回放缓存未能持久化；本次回测已使用内存中的回放数据正常完成。'
   return text
 }
 
@@ -482,7 +681,15 @@ function warningLabel(value) {
   if (text.includes('look-ahead bias')) return '前视偏差'
   if (text.includes('survivorship bias')) return '幸存者偏差'
   if (text.includes('fallback source')) return '行情源降级'
+  if (text.includes('partial universe fetched because')) return '行情缺失'
+  if (text.includes('current classification fallback used: iwencai_current_industry_concept')) return '分类源降级'
+  if (text.includes('stale current classification snapshot used')) return '分类快照过期'
+  if (text.includes('NiuOne structural stops use the completed daily low')) return '结构止损假设'
+  if (text.includes('NiuOne entries use 100% of the deterministic maximum risk-permitted')) return '定仓差异'
+  if (text.includes('NiuOne aggressive backtest profile increases account-risk')) return '进取参数'
   if (text.includes('completed daily bars at the close')) return '卖出成交假设'
+  if (text.includes('prompt strategy backtests enforce the static system position')) return '静态风控假设'
+  if (text.includes('selection replay cache could not be persisted')) return '缓存降级'
   return '其他提示'
 }
 
@@ -497,6 +704,8 @@ watch(strategyId, async () => {
   job.value = null
   taskError.value = ''
   if (options.value) {
+    form.promptVersionId = ''
+    applyDefaults()
     setTitle(strategy.value ? `${strategy.value.label}回测` : '策略回测')
     if (strategy.value) await restoreLatestJob()
   }
@@ -506,8 +715,16 @@ watch(() => form.adjustment, value => {
   if (value !== 'none' && form.source === 'sina') form.source = 'auto'
 })
 
-onMounted(refresh)
-onBeforeUnmount(stopPolling)
+watch(job, syncElapsedAnchor, { immediate: true })
+
+onMounted(() => {
+  startElapsedClock()
+  refresh()
+})
+onBeforeUnmount(() => {
+  stopPolling()
+  stopElapsedClock()
+})
 </script>
 
 <template>
@@ -515,7 +732,6 @@ onBeforeUnmount(stopPolling)
     <div class="admin-header-inner">
       <div><div class="eyebrow">牛牛1号 · 策略历史回测</div><AdminPageTitle /></div>
       <div class="admin-header-actions">
-        <ThemeToggle button-id="backtestThemeToggle" button-class="admin-theme-toggle" />
         <RouterLink class="toplink" to="/admin/settings/stock-strategy">返回策略设置</RouterLink>
         <a class="toplink" href="/">返回首页</a>
       </div>
@@ -535,7 +751,6 @@ onBeforeUnmount(stopPolling)
       <template v-else>
         <section class="backtest-hero" :style="{'--strategy-color': strategy.color || '#60a5fa'}">
           <div class="backtest-hero-copy">
-            <span class="backtest-strategy-dot" />
             <div><h2>{{ strategy.label }}</h2><p>{{ strategy.desc }}</p></div>
           </div>
           <div v-if="strategy.strategy_labels?.length" class="backtest-tags">
@@ -550,27 +765,43 @@ onBeforeUnmount(stopPolling)
         <template v-else>
           <form class="backtest-form" @submit.prevent="startBacktest">
             <div class="backtest-form-head">
-              <div><h2>回测参数</h2><p v-if="strategy.id === 'niuone'">无需输入股票，系统按历史行情自主选股；牛牛战法固定使用进取风险参数和 100 万元独立初始资金，严格回放风险定仓、阶段升级加仓、T+1、持仓/主题/总仓约束及策略卖出。回测与模拟账户完全隔离，历史日 K 实时获取且不使用本地缓存。</p><p v-else>无需输入股票，系统按历史行情自主选股；收盘信号于次日开盘买入，与模拟账户及持仓完全隔离。历史日 K 按所选区间实时获取，不使用本地日 K 缓存。</p></div>
+              <div><h2>回测参数</h2><p v-if="strategy.id === 'niuone'">无需输入股票，系统按历史行情自主选股；牛牛战法固定使用进取风险参数和 100 万元独立初始资金，严格回放风险定仓、阶段升级、同股评分递增加仓、T+1、持仓/主题/总仓约束及策略卖出。回测与模拟账户完全隔离，历史日 K 实时获取且不使用本地缓存。</p><p v-else-if="strategy.id === 'preset_text'">选择一个已激活的冻结版本后，系统按该版本独立执行选股、次日开盘买入、持仓逐日监测和规则卖出；全程不调用模型，也不读写模拟账户。结果保留版本、计划指纹和可重放审计。</p><p v-else>无需输入股票，系统按历史行情自主选股；收盘信号于次日开盘买入，与模拟账户及持仓完全隔离。历史日 K 按所选区间实时获取，不使用本地日 K 缓存。</p></div>
               <span>最长 {{ limits.max_range_days || 366 }} 天</span>
             </div>
             <div class="backtest-fields">
-              <label><span>开始日期</span><input v-model="form.startDate" type="date" required></label>
-              <label><span>结束日期</span><input v-model="form.endDate" type="date" required></label>
+              <label v-if="strategy.id === 'preset_text'">
+                <span>冻结策略版本</span>
+                <select v-model="form.promptVersionId" :disabled="isActive" required>
+                  <option v-for="item in promptVersions" :key="item.version_id" :value="item.version_id">
+                    v{{ item.revision }} · {{ item.name }}{{ item.active ? '（当前）' : '' }}
+                  </option>
+                </select>
+                <small v-if="selectedPromptVersion">SHA-256 {{ selectedPromptVersion.plan_sha256?.slice(0, 16) }}…</small>
+              </label>
+              <label><span>开始日期</span><input v-model="form.startDate" type="date" :disabled="isActive" required></label>
+              <label><span>结束日期</span><input v-model="form.endDate" type="date" :disabled="isActive" required></label>
               <label>
                 <span>复权方式</span>
-                <select v-model="form.adjustment">
+                <select v-model="form.adjustment" :disabled="isActive">
                   <option value="qfq">前复权</option><option value="hfq">后复权</option><option value="none">不复权</option>
                 </select>
               </label>
               <label>
                 <span>行情来源</span>
-                <select v-model="form.source">
+                <select v-model="form.source" :disabled="isActive">
                   <option value="auto">自动（东方财富 → 腾讯 → 新浪）</option><option value="eastmoney">东方财富</option><option value="tencent">腾讯</option>
-                  <option value="sina" :disabled="form.adjustment !== 'none'">新浪（仅不复权）</option>
+                  <option value="sina" :disabled="isActive || form.adjustment !== 'none'">新浪（仅不复权）</option>
                 </select>
               </label>
             </div>
             <div class="backtest-actions">
+              <div class="backtest-cache-control">
+                <button class="backtest-cache-clear" type="button" :disabled="!canClearCache" @click="clearBacktestCache">
+                  {{ clearingCache ? '正在清理…' : '清除回测缓存' }}
+                </button>
+                <small v-if="cacheUsage?.available">重放缓存 {{ Number(cacheUsage.entry_count || 0) }} 项 · {{ formatBytes(cacheUsage.byte_count) }}</small>
+                <small v-if="cacheMessage" :class="{ 'is-error': !cacheUsage?.available }">{{ cacheMessage }}</small>
+              </div>
               <button v-if="isActive" class="backtest-cancel" type="button" :disabled="!canCancel" @click="cancelBacktest">
                 {{ cancelling ? '正在终止…' : '终止回测' }}
               </button>
@@ -596,8 +827,11 @@ onBeforeUnmount(stopPolling)
             </div>
             <div class="backtest-timestamps">
               <span>开始于 {{ compactDateTime(job.started_at || job.created_at) }}</span>
+              <span v-if="activeRequest.start_date && activeRequest.end_date">本次区间 {{ activeRequest.start_date }} 至 {{ activeRequest.end_date }}</span>
+              <span v-if="activeRequestAdjustment">复权 {{ activeRequestAdjustment }}</span>
+              <span v-if="activeRequestSources">行情 {{ activeRequestSources }}</span>
               <span v-if="job.trading_date">交易日 {{ job.trading_date }}</span>
-              <span v-if="job.day_elapsed_seconds !== null && job.day_elapsed_seconds !== undefined">本日耗时 {{ formatDuration(job.day_elapsed_seconds) }}</span>
+              <span v-if="liveDayElapsedSeconds !== null">本交易日已耗时 {{ formatDuration(liveDayElapsedSeconds) }}</span>
               <span v-if="job.eta_seconds !== null && job.eta_seconds !== undefined">预计剩余 {{ formatDuration(job.eta_seconds) }}</span>
             </div>
             <div v-if="job.error" class="errmsg">{{ job.error }}</div>
@@ -610,10 +844,16 @@ onBeforeUnmount(stopPolling)
           </section>
 
           <div v-if="staleResult" class="backtest-notice is-warning">
-            当前结果由旧版牛牛回测协议生成，已停止展示，避免把阶段错配结果误认为当前策略。请重启 Dashboard 后重新运行回测。
+            当前结果由旧版回测协议生成，已停止展示，避免把不完整指标误认为当前结果。请重启 Dashboard 后重新运行回测。
           </div>
 
           <template v-if="result">
+            <section v-if="result.prompt_backtest" class="backtest-notice">
+              冻结版本 {{ result.prompt_backtest.strategy_version_id }} · 计划指纹
+              {{ result.prompt_backtest.plan_sha256?.slice(0, 16) }}… ·
+              {{ result.prompt_backtest.audit_count || 0 }} 条审计
+              {{ result.prompt_backtest.replay_verified ? '已全部重放校验' : '存在重放失败' }}。
+            </section>
             <details v-if="qualityWarnings.length" class="backtest-quality">
               <summary>
                 <span class="backtest-quality-icon">!</span>
@@ -669,6 +909,87 @@ onBeforeUnmount(stopPolling)
                   <td>{{ formatUnsignedPercent(portfolio.annualized_volatility_pct) }}</td>
                   <td>{{ formatRatio(portfolio.sharpe_ratio) }}</td><td>{{ formatRatio(portfolio.sortino_ratio) }}</td><td>{{ formatRatio(portfolio.calmar_ratio) }}</td>
                   <td>{{ formatUnsignedPercent(portfolio.average_exposure_pct) }}</td><td>{{ formatUnsignedPercent(portfolio.max_exposure_pct) }}</td><td>{{ formatUnsignedPercent(portfolio.turnover_pct) }}</td>
+                </tr></tbody>
+              </table></div>
+            </section>
+
+            <section v-if="isTradeLifecycle" class="backtest-result-card">
+              <div class="backtest-result-head"><div><h2>买卖收益</h2><p>仅统计已触发卖出并完成离场的持仓周期，净收益已计入全部买卖批次、滑点、佣金、过户费与卖出印花税。</p></div></div>
+              <div class="backtest-table-wrap"><table>
+                <thead><tr><th>完整交易</th><th>平均净收益</th><th>中位净收益</th><th>胜率</th><th>最好</th><th>最差</th><th>平均持有</th></tr></thead>
+                <tbody><tr>
+                  <td>{{ statistics.completed_trade_count || 0 }}</td>
+                  <td :class="percentClass(statistics.average_net_return_pct)">{{ formatPercent(statistics.average_net_return_pct) }}</td>
+                  <td :class="percentClass(statistics.median_net_return_pct)">{{ formatPercent(statistics.median_net_return_pct) }}</td>
+                  <td>{{ formatPercent(statistics.win_rate_pct) }}</td>
+                  <td :class="percentClass(statistics.best_net_return_pct)">{{ formatPercent(statistics.best_net_return_pct) }}</td>
+                  <td :class="percentClass(statistics.worst_net_return_pct)">{{ formatPercent(statistics.worst_net_return_pct) }}</td>
+                  <td>{{ statistics.average_holding_sessions == null ? '—' : `${statistics.average_holding_sessions} 个交易日` }}</td>
+                </tr></tbody>
+              </table></div>
+            </section>
+
+            <section v-else class="backtest-result-card">
+              <div class="backtest-result-head"><div><h2>整体收益</h2><p>净收益已计入滑点、佣金、过户费与卖出印花税。</p></div></div>
+              <div class="backtest-table-wrap"><table>
+                <thead><tr><th>持有日</th><th>样本</th><th>平均净收益</th><th>中位净收益</th><th>胜率</th><th>最好</th><th>最差</th></tr></thead>
+                <tbody><tr v-for="row in horizonRows" :key="row.holding">
+                  <td>{{ row.holding }} 日</td><td>{{ row.sample_count }}</td>
+                  <td :class="percentClass(row.average_net_return_pct)">{{ formatPercent(row.average_net_return_pct) }}</td>
+                  <td :class="percentClass(row.median_net_return_pct)">{{ formatPercent(row.median_net_return_pct) }}</td>
+                  <td>{{ formatPercent(row.win_rate_pct) }}</td>
+                  <td :class="percentClass(row.best_net_return_pct)">{{ formatPercent(row.best_net_return_pct) }}</td>
+                  <td :class="percentClass(row.worst_net_return_pct)">{{ formatPercent(row.worst_net_return_pct) }}</td>
+                </tr></tbody>
+              </table></div>
+            </section>
+
+            <section v-if="strategyRows.length" class="backtest-result-card">
+              <div class="backtest-result-head"><div><h2>{{ isTradeLifecycle ? '子策略交易' : '子策略信号' }}</h2><p>{{ isTradeLifecycle ? '对比各入场路径的实际买入与卖出表现。' : '用于确认组合中实际触发信号的规则。' }}</p></div></div>
+              <div v-if="isTradeLifecycle" class="backtest-table-wrap"><table>
+                <thead><tr><th>子策略</th><th>信号数</th><th>实际买入</th><th>完整交易</th><th>期末持仓</th><th>平均净收益</th><th>胜率</th><th>平均持有</th></tr></thead>
+                <tbody><tr v-for="row in strategyRows" :key="row.id">
+                  <td>{{ strategyLabel(row.id) }}</td><td>{{ row.signal_count }}</td><td>{{ row.evaluated_signal_count }}</td><td>{{ row.completed_trade_count }}</td><td>{{ row.open_trade_count }}</td>
+                  <td :class="percentClass(row.average_net_return_pct)">{{ formatPercent(row.average_net_return_pct) }}</td><td>{{ formatPercent(row.win_rate_pct) }}</td>
+                  <td>{{ row.average_holding_sessions == null ? '—' : `${row.average_holding_sessions} 日` }}</td>
+                </tr></tbody>
+              </table></div>
+              <div v-else class="backtest-table-wrap"><table>
+                <thead><tr><th>子策略</th><th>信号数</th><th>可评估</th><th>5 日平均净收益</th><th>10 日平均净收益</th><th>20 日平均净收益</th></tr></thead>
+                <tbody><tr v-for="row in strategyRows" :key="row.id">
+                  <td>{{ strategyLabel(row.id) }}</td><td>{{ row.signal_count }}</td><td>{{ row.evaluated_signal_count }}</td>
+                  <td :class="percentClass(row.by_horizon?.['5']?.average_net_return_pct)">{{ formatPercent(row.by_horizon?.['5']?.average_net_return_pct) }}</td>
+                  <td :class="percentClass(row.by_horizon?.['10']?.average_net_return_pct)">{{ formatPercent(row.by_horizon?.['10']?.average_net_return_pct) }}</td>
+                  <td :class="percentClass(row.by_horizon?.['20']?.average_net_return_pct)">{{ formatPercent(row.by_horizon?.['20']?.average_net_return_pct) }}</td>
+                </tr></tbody>
+              </table></div>
+            </section>
+
+            <section v-if="isTradeLifecycle" class="backtest-result-card">
+              <div class="backtest-result-head"><div><h2>交易明细</h2><p>{{ trades.length }} 个持仓周期；阶段升级会记录为同一周期内的加仓，全部卖出后再次入选才生成新周期。</p></div></div>
+              <div v-if="!trades.length" class="backtest-empty">策略在该历史区间内没有可成交的买入信号。</div>
+              <div v-else class="backtest-table-wrap"><table>
+                <thead><tr><th>信号日</th><th>买入日</th><th>卖出日</th><th>股票</th><th>代码</th><th>策略路径</th><th>买/卖批次</th><th>状态</th><th>持有</th><th>买入均价</th><th>卖出均价</th><th>实际净收益</th><th>期末浮动</th><th>卖出原因</th></tr></thead>
+                <tbody><tr v-for="trade in trades" :key="trade.id">
+                  <td>{{ trade.signal_date }}</td><td>{{ trade.entry_date }}</td><td>{{ trade.exit_date || '—' }}</td><td>{{ stockName(trade) }}</td><td>{{ stockCode(trade.symbol) }}</td><td>{{ strategyPathLabel(trade) }}</td><td>{{ trade.entry_legs?.length || 1 }} / {{ trade.exit_legs?.length || 0 }}</td>
+                  <td>{{ trade.status === 'completed' ? '已卖出' : '期末持仓' }}</td><td>{{ trade.holding_sessions == null ? '—' : `${trade.holding_sessions} 日` }}</td>
+                  <td>{{ formatPrice(trade.entry_price) }}</td><td>{{ formatPrice(trade.exit_price) }}</td>
+                  <td :class="percentClass(trade.net_return_pct)">{{ formatPercent(trade.net_return_pct) }}</td><td :class="percentClass(trade.mark_net_return_pct)">{{ formatPercent(trade.mark_net_return_pct) }}</td>
+                  <td><small>{{ trade.exit_reason || '尚未触发卖出规则' }}</small></td>
+                </tr></tbody>
+              </table></div>
+            </section>
+
+            <section v-else class="backtest-result-card">
+              <div class="backtest-result-head"><div><h2>信号明细</h2><p>{{ signals.length }} 条收盘后选股信号，收益从下一交易日开盘起算。</p></div></div>
+              <div v-if="!signals.length" class="backtest-empty">策略在该历史区间内没有自主选出符合条件的股票。</div>
+              <div v-else class="backtest-table-wrap"><table>
+                <thead><tr><th>信号日</th><th>股票名称</th><th>代码</th><th>子策略</th><th>状态</th><th>入场日</th><th>1日</th><th>3日</th><th>5日</th><th>10日</th><th>20日</th></tr></thead>
+                <tbody><tr v-for="(signal, index) in signals" :key="`${signal.signal_date}-${signal.symbol}-${signal.strategy_id}-${index}`">
+                  <td>{{ signal.signal_date }}</td><td>{{ stockName(signal) }}</td><td>{{ stockCode(signal.symbol) }}</td><td>{{ strategyLabel(signal.strategy_id) }}</td>
+                  <td>{{ signalStatusLabels[signal.status] || signal.status }}<small v-if="signal.status_reason"> · {{ signalStatusReason(signal.status_reason) }}</small></td>
+                  <td>{{ signal.entry_date || '—' }}</td>
+                  <td v-for="holding in ['1', '3', '5', '10', '20']" :key="holding" :class="percentClass(signalReturn(signal, holding))">{{ formatPercent(signalReturn(signal, holding)) }}</td>
                 </tr></tbody>
               </table></div>
             </section>
@@ -767,87 +1088,6 @@ onBeforeUnmount(stopPolling)
                 </details>
               </div>
             </section>
-
-            <section v-if="isTradeLifecycle" class="backtest-result-card">
-              <div class="backtest-result-head"><div><h2>买卖收益</h2><p>仅统计已触发卖出并完成离场的持仓周期，净收益已计入全部买卖批次、滑点、佣金、过户费与卖出印花税。</p></div></div>
-              <div class="backtest-table-wrap"><table>
-                <thead><tr><th>完整交易</th><th>平均净收益</th><th>中位净收益</th><th>胜率</th><th>最好</th><th>最差</th><th>平均持有</th></tr></thead>
-                <tbody><tr>
-                  <td>{{ statistics.completed_trade_count || 0 }}</td>
-                  <td :class="percentClass(statistics.average_net_return_pct)">{{ formatPercent(statistics.average_net_return_pct) }}</td>
-                  <td :class="percentClass(statistics.median_net_return_pct)">{{ formatPercent(statistics.median_net_return_pct) }}</td>
-                  <td>{{ formatPercent(statistics.win_rate_pct) }}</td>
-                  <td :class="percentClass(statistics.best_net_return_pct)">{{ formatPercent(statistics.best_net_return_pct) }}</td>
-                  <td :class="percentClass(statistics.worst_net_return_pct)">{{ formatPercent(statistics.worst_net_return_pct) }}</td>
-                  <td>{{ statistics.average_holding_sessions == null ? '—' : `${statistics.average_holding_sessions} 个交易日` }}</td>
-                </tr></tbody>
-              </table></div>
-            </section>
-
-            <section v-else class="backtest-result-card">
-              <div class="backtest-result-head"><div><h2>整体收益</h2><p>净收益已计入滑点、佣金、过户费与卖出印花税。</p></div></div>
-              <div class="backtest-table-wrap"><table>
-                <thead><tr><th>持有日</th><th>样本</th><th>平均净收益</th><th>中位净收益</th><th>胜率</th><th>最好</th><th>最差</th></tr></thead>
-                <tbody><tr v-for="row in horizonRows" :key="row.holding">
-                  <td>{{ row.holding }} 日</td><td>{{ row.sample_count }}</td>
-                  <td :class="percentClass(row.average_net_return_pct)">{{ formatPercent(row.average_net_return_pct) }}</td>
-                  <td :class="percentClass(row.median_net_return_pct)">{{ formatPercent(row.median_net_return_pct) }}</td>
-                  <td>{{ formatPercent(row.win_rate_pct) }}</td>
-                  <td :class="percentClass(row.best_net_return_pct)">{{ formatPercent(row.best_net_return_pct) }}</td>
-                  <td :class="percentClass(row.worst_net_return_pct)">{{ formatPercent(row.worst_net_return_pct) }}</td>
-                </tr></tbody>
-              </table></div>
-            </section>
-
-            <section v-if="strategyRows.length" class="backtest-result-card">
-              <div class="backtest-result-head"><div><h2>{{ isTradeLifecycle ? '子策略交易' : '子策略信号' }}</h2><p>{{ isTradeLifecycle ? '对比各入场路径的实际买入与卖出表现。' : '用于确认组合中实际触发信号的规则。' }}</p></div></div>
-              <div v-if="isTradeLifecycle" class="backtest-table-wrap"><table>
-                <thead><tr><th>子策略</th><th>信号数</th><th>实际买入</th><th>完整交易</th><th>期末持仓</th><th>平均净收益</th><th>胜率</th><th>平均持有</th></tr></thead>
-                <tbody><tr v-for="row in strategyRows" :key="row.id">
-                  <td>{{ strategyLabel(row.id) }}</td><td>{{ row.signal_count }}</td><td>{{ row.evaluated_signal_count }}</td><td>{{ row.completed_trade_count }}</td><td>{{ row.open_trade_count }}</td>
-                  <td :class="percentClass(row.average_net_return_pct)">{{ formatPercent(row.average_net_return_pct) }}</td><td>{{ formatPercent(row.win_rate_pct) }}</td>
-                  <td>{{ row.average_holding_sessions == null ? '—' : `${row.average_holding_sessions} 日` }}</td>
-                </tr></tbody>
-              </table></div>
-              <div v-else class="backtest-table-wrap"><table>
-                <thead><tr><th>子策略</th><th>信号数</th><th>可评估</th><th>5 日平均净收益</th><th>10 日平均净收益</th><th>20 日平均净收益</th></tr></thead>
-                <tbody><tr v-for="row in strategyRows" :key="row.id">
-                  <td>{{ strategyLabel(row.id) }}</td><td>{{ row.signal_count }}</td><td>{{ row.evaluated_signal_count }}</td>
-                  <td :class="percentClass(row.by_horizon?.['5']?.average_net_return_pct)">{{ formatPercent(row.by_horizon?.['5']?.average_net_return_pct) }}</td>
-                  <td :class="percentClass(row.by_horizon?.['10']?.average_net_return_pct)">{{ formatPercent(row.by_horizon?.['10']?.average_net_return_pct) }}</td>
-                  <td :class="percentClass(row.by_horizon?.['20']?.average_net_return_pct)">{{ formatPercent(row.by_horizon?.['20']?.average_net_return_pct) }}</td>
-                </tr></tbody>
-              </table></div>
-            </section>
-
-            <section v-if="isTradeLifecycle" class="backtest-result-card">
-              <div class="backtest-result-head"><div><h2>交易明细</h2><p>{{ trades.length }} 个持仓周期；阶段升级会记录为同一周期内的加仓，全部卖出后再次入选才生成新周期。</p></div></div>
-              <div v-if="!trades.length" class="backtest-empty">策略在该历史区间内没有可成交的买入信号。</div>
-              <div v-else class="backtest-table-wrap"><table>
-                <thead><tr><th>信号日</th><th>买入日</th><th>卖出日</th><th>股票</th><th>代码</th><th>策略路径</th><th>买/卖批次</th><th>状态</th><th>持有</th><th>买入均价</th><th>卖出均价</th><th>实际净收益</th><th>期末浮动</th><th>卖出原因</th></tr></thead>
-                <tbody><tr v-for="trade in trades" :key="trade.id">
-                  <td>{{ trade.signal_date }}</td><td>{{ trade.entry_date }}</td><td>{{ trade.exit_date || '—' }}</td><td>{{ stockName(trade) }}</td><td>{{ stockCode(trade.symbol) }}</td><td>{{ strategyPathLabel(trade) }}</td><td>{{ trade.entry_legs?.length || 1 }} / {{ trade.exit_legs?.length || 0 }}</td>
-                  <td>{{ trade.status === 'completed' ? '已卖出' : '期末持仓' }}</td><td>{{ trade.holding_sessions == null ? '—' : `${trade.holding_sessions} 日` }}</td>
-                  <td>{{ formatPrice(trade.entry_price) }}</td><td>{{ formatPrice(trade.exit_price) }}</td>
-                  <td :class="percentClass(trade.net_return_pct)">{{ formatPercent(trade.net_return_pct) }}</td><td :class="percentClass(trade.mark_net_return_pct)">{{ formatPercent(trade.mark_net_return_pct) }}</td>
-                  <td><small>{{ trade.exit_reason || '尚未触发卖出规则' }}</small></td>
-                </tr></tbody>
-              </table></div>
-            </section>
-
-            <section v-else class="backtest-result-card">
-              <div class="backtest-result-head"><div><h2>信号明细</h2><p>{{ signals.length }} 条收盘后选股信号，收益从下一交易日开盘起算。</p></div></div>
-              <div v-if="!signals.length" class="backtest-empty">策略在该历史区间内没有自主选出符合条件的股票。</div>
-              <div v-else class="backtest-table-wrap"><table>
-                <thead><tr><th>信号日</th><th>股票名称</th><th>代码</th><th>子策略</th><th>状态</th><th>入场日</th><th>1日</th><th>3日</th><th>5日</th><th>10日</th><th>20日</th></tr></thead>
-                <tbody><tr v-for="(signal, index) in signals" :key="`${signal.signal_date}-${signal.symbol}-${signal.strategy_id}-${index}`">
-                  <td>{{ signal.signal_date }}</td><td>{{ stockName(signal) }}</td><td>{{ stockCode(signal.symbol) }}</td><td>{{ strategyLabel(signal.strategy_id) }}</td>
-                  <td>{{ signalStatusLabels[signal.status] || signal.status }}<small v-if="signal.status_reason"> · {{ signalStatusReason(signal.status_reason) }}</small></td>
-                  <td>{{ signal.entry_date || '—' }}</td>
-                  <td v-for="holding in ['1', '3', '5', '10', '20']" :key="holding" :class="percentClass(signalReturn(signal, holding))">{{ formatPercent(signalReturn(signal, holding)) }}</td>
-                </tr></tbody>
-              </table></div>
-            </section>
           </template>
         </template>
       </template>
@@ -856,19 +1096,253 @@ onBeforeUnmount(stopPolling)
 </template>
 
 <style src="../../../frontend/admin.css"></style>
+<style src="../../../frontend/tongdaxin-theme.css"></style>
 <style scoped>
 .backtest-page{gap:12px}.backtest-hero,.backtest-form,.backtest-progress-card,.backtest-job-summary,.backtest-result-card{border:1px solid var(--line);border-radius:10px;background:var(--surface);box-shadow:var(--page-shadow)}
-.backtest-hero{display:flex;justify-content:space-between;align-items:center;gap:18px;padding:15px 18px}.backtest-hero-copy{display:flex;align-items:flex-start;gap:12px;min-width:0}.backtest-hero-copy h2,.backtest-form h2,.backtest-progress-card h2,.backtest-result-card h2{margin:0;color:var(--text);font-size:18px}.backtest-hero-copy p,.backtest-form-head p,.backtest-progress-card p,.backtest-result-head p{margin-top:5px;color:var(--muted);font-size:13px;line-height:1.5}.backtest-strategy-dot{width:12px;height:12px;margin-top:5px;border-radius:4px;background:var(--strategy-color);flex:0 0 auto}.backtest-tags{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:6px}.backtest-tags span{padding:5px 8px;border:1px solid var(--line);border-radius:999px;background:var(--surface2);color:var(--soft);font-size:11px;font-weight:800}
+.backtest-hero{display:flex;justify-content:space-between;align-items:center;gap:18px;padding:15px 18px}.backtest-hero-copy{display:flex;align-items:flex-start;gap:12px;min-width:0}.backtest-hero-copy h2,.backtest-form h2,.backtest-progress-card h2,.backtest-result-card h2{margin:0;color:var(--text);font-size:18px}.backtest-hero-copy p,.backtest-form-head p,.backtest-progress-card p,.backtest-result-head p{margin-top:5px;color:var(--muted);font-size:13px;line-height:1.5}.backtest-tags{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:6px}.backtest-tags span{padding:5px 8px;border:1px solid var(--line);border-radius:999px;background:var(--surface2);color:var(--soft);font-size:11px;font-weight:800}
 .backtest-notice{padding:11px 13px;border:1px solid var(--accent-border);border-radius:8px;background:var(--accent-soft);color:var(--accent-text);font-size:13px;line-height:1.55}.backtest-notice.is-warning{border-color:var(--yellow-border);background:var(--yellow-soft);color:var(--yellow-text)}
 .backtest-quality{overflow:hidden;border:1px solid var(--yellow-border);border-radius:9px;background:var(--yellow-soft);color:var(--yellow-text)}.backtest-quality summary{display:flex;align-items:center;gap:10px;padding:12px 14px;cursor:pointer;list-style:none}.backtest-quality summary::-webkit-details-marker{display:none}.backtest-quality summary::after{content:'展开';flex:0 0 auto;color:var(--yellow-text);font-size:11px;font-weight:800}.backtest-quality[open] summary::after{content:'收起'}.backtest-quality-icon{display:grid;width:22px;height:22px;place-items:center;border:1px solid var(--yellow-border);border-radius:999px;background:var(--surface);font-size:12px;font-weight:950}.backtest-quality-copy{display:grid;min-width:0;gap:2px;flex:1}.backtest-quality-copy strong{font-size:13px}.backtest-quality-copy small{overflow:hidden;color:var(--yellow-text);font-size:11px;opacity:.86;text-overflow:ellipsis;white-space:nowrap}.backtest-quality-count{flex:0 0 auto;padding:3px 7px;border:1px solid var(--yellow-border);border-radius:999px;background:var(--surface);font-size:10px;font-weight:850}.backtest-quality-details{display:grid;gap:0;border-top:1px solid var(--yellow-border);background:color-mix(in srgb,var(--surface) 72%,var(--yellow-soft))}.backtest-quality-details>div{display:grid;grid-template-columns:90px minmax(0,1fr);gap:12px;padding:10px 14px;border-bottom:1px solid var(--yellow-border)}.backtest-quality-details>div:last-child{border-bottom:0}.backtest-quality-details strong{font-size:11px}.backtest-quality-details span{color:var(--soft);font-size:11px;line-height:1.5;overflow-wrap:anywhere}
 .backtest-form{padding:16px}.backtest-form-head,.backtest-result-head,.backtest-progress-head{display:flex;justify-content:space-between;align-items:flex-start;gap:14px}.backtest-form-head>span{color:var(--muted);font-size:12px;font-weight:800;white-space:nowrap}.backtest-fields{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:14px}.backtest-fields label{display:grid;gap:7px;color:var(--text);font-size:13px;font-weight:850}.backtest-fields input,.backtest-fields select{width:100%}.backtest-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:14px}.backtest-start,.backtest-cancel{display:inline-flex;min-width:150px;min-height:44px;align-items:center;justify-content:center;gap:8px;margin:0}.backtest-start{background:var(--primary);color:var(--primary-text);box-shadow:none}.backtest-cancel{border:1px solid var(--danger-button-border);background:var(--danger-button-bg);color:var(--danger-button-text);box-shadow:0 5px 14px rgba(127,29,29,.28),0 1px 0 rgba(255,255,255,.18) inset;transition:background .12s ease,border-color .12s ease,box-shadow .12s ease,transform .12s ease}.backtest-cancel::before{content:'■';font-size:9px;line-height:1}.backtest-cancel:hover:not(:disabled){background:var(--danger-button-hover);box-shadow:0 7px 18px rgba(127,29,29,.36),0 1px 0 rgba(255,255,255,.20) inset;transform:translateY(-1px)}.backtest-cancel:focus-visible{outline:3px solid var(--red);outline-offset:3px}.backtest-cancel:active:not(:disabled){box-shadow:0 2px 7px rgba(127,29,29,.34) inset;transform:translateY(1px)}.backtest-start:disabled,.backtest-cancel:disabled{cursor:not-allowed;opacity:.65}
 .backtest-progress-card{padding:18px}.backtest-progress-head strong{color:var(--accent);font-size:28px}.backtest-status{display:inline-flex;margin-bottom:7px;padding:3px 7px;border:1px solid var(--accent-border);border-radius:999px;background:var(--accent-soft);color:var(--accent-text);font-size:11px;font-weight:900}.backtest-status.is-succeeded{border-color:var(--green-border);background:var(--green-soft);color:var(--green-text)}.backtest-status.is-failed,.backtest-status.is-cancelled{border-color:var(--red-border);background:var(--red-soft);color:var(--red-text)}.backtest-progress-track{height:10px;margin-top:16px;overflow:hidden;border-radius:999px;background:var(--surface2);border:1px solid var(--line)}.backtest-progress-track span{display:block;height:100%;border-radius:inherit;background:linear-gradient(90deg,var(--primary),var(--green));transition:width .25s ease}.backtest-timestamps{display:flex;flex-wrap:wrap;gap:8px 18px;margin-top:10px;color:var(--muted);font-size:11px}
 .backtest-job-summary{display:flex;align-items:center;flex-wrap:wrap;gap:10px;padding:9px 12px}.backtest-job-summary .backtest-status{margin:0}.backtest-job-summary>strong{color:var(--text);font-size:12px}.backtest-job-summary>small{margin-left:auto;color:var(--muted);font-size:11px}.backtest-job-summary>.errmsg{flex-basis:100%;margin:0}.backtest-overview{display:grid;grid-template-columns:minmax(220px,1.35fr) repeat(4,minmax(120px,1fr));gap:10px}.backtest-overview>div{display:grid;gap:4px;padding:12px 14px;border:1px solid var(--line);border-radius:9px;background:var(--surface)}.backtest-overview span{color:var(--muted);font-size:11px}.backtest-overview strong{color:var(--text);font-size:22px}.backtest-scope-summary strong{font-size:15px}.backtest-scope-summary small{color:var(--soft);font-size:10px}.backtest-result-card{overflow:hidden}.backtest-result-head{padding:15px 17px;border-bottom:1px solid var(--line);background:var(--surface2)}.backtest-table-wrap{max-width:100%;overflow:auto}.backtest-table-wrap table{width:100%;border-collapse:collapse;font-size:12px;white-space:nowrap}.backtest-table-wrap th,.backtest-table-wrap td{padding:10px 12px;border-bottom:1px solid var(--line);text-align:right}.backtest-table-wrap th{position:sticky;top:0;background:var(--surface2);color:var(--muted);font-size:11px}.backtest-table-wrap th:first-child,.backtest-table-wrap td:first-child{text-align:left}.backtest-table-wrap td{color:var(--soft)}.backtest-table-wrap td small{color:var(--muted)}.backtest-table-wrap .is-positive{color:var(--green-text);font-weight:800}.backtest-table-wrap .is-negative{color:var(--red-text);font-weight:800}.backtest-empty{padding:28px;color:var(--muted);text-align:center;font-size:13px}
-.backtest-diagnostic-groups{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;padding:15px}.backtest-diagnostic-groups article{min-width:0;padding:14px;border:1px solid var(--line);border-radius:9px;background:var(--surface2)}.backtest-diagnostic-groups h3{margin:0;color:var(--text);font-size:14px}.backtest-diagnostic-section{display:grid;gap:8px;margin-top:13px}.backtest-diagnostic-section>strong{color:var(--muted);font-size:11px}.backtest-blockers,.backtest-near-misses{display:grid;gap:7px;margin:0;padding:0;list-style:none}.backtest-blockers li{display:flex;justify-content:space-between;gap:8px;padding:7px 8px;border-radius:7px;background:var(--surface)}.backtest-blockers span{min-width:0;color:var(--soft);font-size:11px;line-height:1.4}.backtest-blockers b{flex:0 0 auto;color:var(--yellow-text);font-size:10px}.backtest-near-misses li{display:grid;gap:3px;padding-left:9px;border-left:2px solid var(--accent-border)}.backtest-near-misses span{color:var(--text);font-size:11px;font-weight:800}.backtest-near-misses small{color:var(--muted);font-size:10px;line-height:1.45;overflow-wrap:anywhere}.backtest-diagnostic-empty{margin:13px 0 0;color:var(--muted);font-size:11px}
+.backtest-diagnostic-groups{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;padding:15px}.backtest-diagnostic-groups article{min-width:0;padding:14px;border:1px solid var(--line);border-radius:9px;background:var(--surface2)}.backtest-diagnostic-groups h3{margin:0;color:var(--text);font-size:14px}.backtest-diagnostic-section{display:grid;gap:8px;margin-top:13px}.backtest-diagnostic-section>strong{color:var(--muted);font-size:11px}.backtest-blockers,.backtest-near-misses{display:grid;gap:7px;margin:0;padding:0;list-style:none}.backtest-blockers li{display:flex;justify-content:space-between;gap:8px;padding:7px 8px;border-radius:7px;background:var(--surface)}.backtest-blockers span{min-width:0;color:var(--soft);font-size:11px;line-height:1.4}.backtest-blockers b{flex:0 0 auto;color:var(--yellow-text);font-size:10px}.backtest-near-misses li{display:grid;gap:3px}.backtest-near-misses span{color:var(--text);font-size:11px;font-weight:800}.backtest-near-misses small{color:var(--muted);font-size:10px;line-height:1.45;overflow-wrap:anywhere}.backtest-diagnostic-empty{margin:13px 0 0;color:var(--muted);font-size:11px}
 .backtest-monthly-diagnostics{display:grid;gap:10px;padding:15px}.backtest-month-diagnostic{overflow:hidden;border:1px solid var(--line);border-radius:9px;background:var(--surface2)}.backtest-month-diagnostic>summary{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px 13px;cursor:pointer;list-style:none}.backtest-month-diagnostic>summary::-webkit-details-marker{display:none}.backtest-month-diagnostic>summary strong{color:var(--text);font-size:12px}.backtest-month-diagnostic>summary span{color:var(--muted);font-size:11px}.backtest-month-diagnostic-body{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;padding:0 12px 12px;border-top:1px solid var(--line)}.backtest-month-diagnostic-body>.backtest-table-wrap{margin-top:12px;border:1px solid var(--line);border-radius:7px;background:var(--surface)}.backtest-month-diagnostic-body>.backtest-branch-table{grid-column:1/-1}.backtest-month-diagnostic-body td{white-space:normal}.backtest-month-diagnostic-body td:first-child{font-weight:750}.backtest-month-diagnostic-body td small{font-size:10px}
 .backtest-branch-table tr.is-stock-group-start:not(:first-child)>td{border-top:2px solid var(--line)}.backtest-branch-table .backtest-stock-group{min-width:112px;vertical-align:top;background:var(--surface2)}.backtest-stock-group strong{color:var(--text);font-size:12px}.backtest-stock-group small{display:inline-block;margin-top:3px}
 @media(max-width:980px){.backtest-fields{grid-template-columns:repeat(2,minmax(0,1fr))}.backtest-overview{grid-template-columns:repeat(2,minmax(0,1fr))}.backtest-scope-summary{grid-column:1/-1}}
 @media(max-width:980px){.backtest-diagnostic-groups{grid-template-columns:1fr}}
 @media(max-width:980px){.backtest-month-diagnostic-body{grid-template-columns:1fr}.backtest-month-diagnostic-body>.backtest-branch-table{grid-column:auto}}
 @media(max-width:620px){.backtest-hero,.backtest-form-head,.backtest-progress-head{align-items:stretch;flex-direction:column}.backtest-tags{justify-content:flex-start}.backtest-fields,.backtest-overview{grid-template-columns:1fr}.backtest-actions{flex-direction:column}.backtest-start,.backtest-cancel{width:100%}.backtest-job-summary{align-items:flex-start;flex-wrap:wrap}.backtest-job-summary>small{width:100%;margin-left:0}.backtest-quality-count{display:none}.backtest-quality-details>div{grid-template-columns:1fr;gap:4px}}
+
+/* Financial-workstation presentation: dense, restrained and data-first. */
+.backtest-page{
+  gap:8px;
+  font-variant-numeric:tabular-nums;
+}
+.backtest-hero,
+.backtest-form,
+.backtest-progress-card,
+.backtest-job-summary,
+.backtest-result-card{
+  border-radius:var(--settings-panel-radius,6px);
+  box-shadow:none;
+}
+.backtest-hero{
+  min-height:64px;
+  padding:10px 13px;
+  background:var(--surface);
+}
+.backtest-hero-copy{align-items:center;gap:10px}
+.backtest-hero-copy h2,
+.backtest-form h2,
+.backtest-progress-card h2,
+.backtest-result-card h2{
+  font-size:14px;
+  line-height:1.3;
+  letter-spacing:.01em;
+}
+.backtest-hero-copy p,
+.backtest-form-head p,
+.backtest-progress-card p,
+.backtest-result-head p{
+  margin-top:3px;
+  font-size:11px;
+  line-height:1.45;
+}
+.backtest-tags{gap:4px}
+.backtest-tags span{
+  padding:3px 7px;
+  border-radius:var(--settings-control-radius,3px);
+  background:var(--surface2);
+  font-size:10px;
+  font-weight:750;
+}
+.backtest-notice{
+  padding:8px 10px;
+  border-radius:var(--settings-control-radius,4px);
+  background:var(--surface);
+  font-size:11px;
+  line-height:1.5;
+}
+.backtest-quality{
+  border-radius:var(--settings-panel-radius,5px);
+  background:var(--surface);
+}
+.backtest-quality summary{gap:8px;padding:8px 10px}
+.backtest-quality-icon{
+  width:18px;
+  height:18px;
+  border-radius:2px;
+  background:transparent;
+  font-size:10px;
+}
+.backtest-quality-copy strong{font-size:11px}
+.backtest-quality-copy small{font-size:10px}
+.backtest-quality-count{border-radius:2px;background:transparent}
+.backtest-quality-details{background:var(--surface)}
+.backtest-quality-details>div{
+  grid-template-columns:100px minmax(0,1fr);
+  gap:10px;
+  padding:7px 10px;
+}
+.backtest-form{overflow:hidden;padding:0}
+.backtest-form-head,
+.backtest-result-head,
+.backtest-progress-head{
+  padding:9px 11px;
+  border-bottom:1px solid var(--line);
+  background:var(--surface2);
+}
+.backtest-form-head>span{font-size:10px;font-weight:750}
+.backtest-fields{
+  gap:8px;
+  margin:0;
+  padding:10px 11px;
+}
+.backtest-fields label{gap:5px;font-size:11px;font-weight:750}
+.backtest-fields label>small{color:var(--muted);font-size:9px;font-weight:500}
+.backtest-fields input,
+.backtest-fields select{
+  min-height:32px;
+  border-radius:var(--settings-control-radius,4px);
+  font-size:11px;
+}
+.backtest-actions{
+  gap:7px;
+  margin:0;
+  padding:8px 11px;
+  border-top:1px solid var(--line);
+  background:var(--surface2);
+}
+.backtest-cache-control{display:grid;gap:3px;margin-right:auto}
+.backtest-cache-control small{color:var(--muted);font-size:10px}
+.backtest-cache-control small.is-error{color:var(--danger)}
+.backtest-cache-clear{
+  min-height:32px;
+  border:1px solid var(--line);
+  border-radius:var(--settings-control-radius,4px);
+  padding:6px 10px;
+  background:var(--surface);
+  color:var(--text);
+  font-size:11px;
+  font-weight:750;
+}
+.backtest-cache-clear:disabled{cursor:not-allowed;opacity:.55}
+.backtest-start,
+.backtest-cancel{
+  min-width:112px;
+  min-height:32px;
+  border-radius:var(--settings-control-radius,4px);
+  padding:6px 12px;
+  box-shadow:none;
+  font-size:11px;
+  font-weight:800;
+}
+.backtest-cancel:hover:not(:disabled){box-shadow:none;transform:none}
+.backtest-cancel:focus-visible{outline-width:2px;outline-offset:2px}
+.backtest-cancel:active:not(:disabled){box-shadow:none;transform:none}
+.backtest-progress-card{overflow:hidden;padding:0}
+.backtest-progress-head strong{color:var(--accent-text);font-size:22px}
+.backtest-status{
+  margin-bottom:4px;
+  padding:2px 6px;
+  border-radius:2px;
+  font-size:9px;
+  letter-spacing:.04em;
+}
+.backtest-progress-track{
+  height:5px;
+  margin:10px 11px 0;
+  border-radius:0;
+}
+.backtest-progress-track span{
+  border-radius:0;
+  background:var(--primary);
+}
+.backtest-timestamps{
+  gap:5px 16px;
+  margin-top:8px;
+  padding:7px 11px 9px;
+  border-top:1px solid var(--line);
+  font-size:10px;
+}
+.backtest-job-summary{gap:8px;padding:7px 10px}
+.backtest-job-summary>strong{font-size:11px}
+.backtest-job-summary>small{font-size:10px}
+.backtest-overview{
+  grid-template-columns:minmax(220px,1.35fr) repeat(4,minmax(110px,1fr));
+  gap:0;
+  overflow:hidden;
+  border:1px solid var(--line);
+  border-radius:var(--settings-panel-radius,6px);
+  background:var(--surface);
+}
+.backtest-overview>div{
+  min-height:68px;
+  align-content:center;
+  padding:8px 11px;
+  border:0;
+  border-left:1px solid var(--line);
+  border-radius:0;
+  background:transparent;
+}
+.backtest-overview>div:first-child{border-left:0}
+.backtest-overview span{font-size:10px}
+.backtest-overview strong{font-size:19px;line-height:1.15}
+.backtest-scope-summary strong{font-size:13px}
+.backtest-scope-summary small{font-size:9px}
+.backtest-result-card{border-radius:var(--settings-panel-radius,6px)}
+.backtest-result-head{padding:8px 11px}
+.backtest-table-wrap table{font-size:11px;font-variant-numeric:tabular-nums}
+.backtest-table-wrap th,
+.backtest-table-wrap td{height:30px;padding:6px 8px}
+.backtest-table-wrap th{
+  color:var(--soft);
+  font-size:10px;
+  font-weight:750;
+  letter-spacing:.01em;
+}
+.backtest-table-wrap tbody tr:nth-child(even){background:color-mix(in srgb,var(--surface2) 55%,transparent)}
+.backtest-table-wrap tbody tr:hover{background:var(--accent-soft)}
+.backtest-table-wrap .is-positive{color:var(--red-text);font-weight:800}
+.backtest-table-wrap .is-negative{color:var(--green-text);font-weight:800}
+.backtest-empty{padding:20px;font-size:11px}
+.backtest-diagnostic-groups{gap:0;padding:0;border-top:1px solid var(--line)}
+.backtest-diagnostic-groups article{
+  padding:10px;
+  border:0;
+  border-left:1px solid var(--line);
+  border-radius:0;
+  background:var(--surface);
+}
+.backtest-diagnostic-groups article:first-child{border-left:0}
+.backtest-diagnostic-groups h3{font-size:12px}
+.backtest-diagnostic-section{gap:6px;margin-top:9px}
+.backtest-blockers,.backtest-near-misses{gap:4px}
+.backtest-blockers li{padding:5px 6px;border-radius:2px}
+.backtest-near-misses li{gap:2px}
+.backtest-monthly-diagnostics{gap:6px;padding:8px}
+.backtest-month-diagnostic{border-radius:var(--settings-control-radius,4px)}
+.backtest-month-diagnostic>summary{padding:7px 9px}
+.backtest-month-diagnostic-body{gap:8px;padding:0 8px 8px}
+.backtest-month-diagnostic-body>.backtest-table-wrap{
+  margin-top:8px;
+  border-radius:var(--settings-control-radius,3px);
+}
+.backtest-branch-table .backtest-stock-group{min-width:104px}
+@media(max-width:980px){
+  .backtest-overview>div:nth-child(odd){border-left:0}
+  .backtest-overview>div{border-bottom:1px solid var(--line)}
+  .backtest-overview>div:nth-last-child(-n+2){border-bottom:0}
+  .backtest-diagnostic-groups article{border-top:1px solid var(--line);border-left:0}
+  .backtest-diagnostic-groups article:first-child{border-top:0}
+}
+@media(max-width:620px){
+  .backtest-overview>div{border-bottom:1px solid var(--line);border-left:0}
+  .backtest-overview>div:nth-last-child(-n+2){border-bottom:1px solid var(--line)}
+  .backtest-overview>div:last-child{border-bottom:0}
+  .backtest-fields{padding:9px}
+  .backtest-actions{padding:8px 9px}
+  .backtest-cache-control{width:100%;margin-right:0}
+  .backtest-cache-clear{width:100%}
+}
 </style>

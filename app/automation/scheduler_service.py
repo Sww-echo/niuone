@@ -39,6 +39,8 @@ DASHBOARD_ENV_FILE = get_dashboard_env_file(PROJECT_ROOT)
 DASHBOARD_HOME = get_dashboard_home(PROJECT_ROOT)
 LOG_DIR = Path(os.environ.get("DASHBOARD_LOG_DIR") or str(DASHBOARD_HOME / "logs")).expanduser()
 LOG_PATH = LOG_DIR / "niuone_cron_scheduler.log"
+LOG_MAX_BYTES = 2 * 1024 * 1024
+LOG_BACKUP_COUNT = 3
 STATE_PATH = DASHBOARD_HOME / "cron" / "state" / "niuone_cron_scheduler.json"
 CN_TZ = ZoneInfo("Asia/Shanghai")
 STOP = False
@@ -76,7 +78,6 @@ JOBS = (
     Job("DASHBOARD_TIME_EXIT_TIME", "45 14 * * 1-5", "fc4f23b79591", "牛牛尾盘离场检查", ("niuniu_practice_trader.py", "--auto-exits"), 120),
     NIUONE_EQUITY_SNAPSHOT_JOB,
     Job("DASHBOARD_NIUONE_FORWARD_CRON", "20 15 * * 1-5", "d419bc090808", "牛牛严格前向证据评估", ("evaluate_niuone_forward.py", "--runtime"), 30),
-    Job("DASHBOARD_US_RATING_CRON", "0 11 * * *", "fd0b807138f4", "每日美股机构买入评级汇报", ("us_rating_report.py", "--store-only"), 300),
 )
 IWENCAI_STARTUP_CATCH_UP_JOB = Job(
     "IWENCAI_DRAGON_TIGER_CRON",
@@ -88,10 +89,36 @@ IWENCAI_STARTUP_CATCH_UP_JOB = Job(
 )
 
 
+def _rotate_log_if_needed(incoming_bytes: int) -> None:
+    try:
+        current_bytes = LOG_PATH.stat().st_size
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+    if current_bytes + max(0, incoming_bytes) <= LOG_MAX_BYTES:
+        return
+    for index in range(LOG_BACKUP_COUNT, 0, -1):
+        source = (
+            LOG_PATH
+            if index == 1
+            else LOG_PATH.with_name(f"{LOG_PATH.name}.{index - 1}")
+        )
+        target = LOG_PATH.with_name(f"{LOG_PATH.name}.{index}")
+        try:
+            source.replace(target)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return
+
+
 def log(message: str) -> None:
+    line = f"{datetime.now(CN_TZ).isoformat()} {message}\n"
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _rotate_log_if_needed(len(line.encode("utf-8")))
     with LOG_PATH.open("a", encoding="utf-8") as f:
-        f.write(f"{datetime.now(CN_TZ).isoformat()} {message}\n")
+        f.write(line)
         f.flush()
 
 
@@ -124,17 +151,11 @@ def read_int_setting(env_values: dict[str, str], name: str, default: int, *, min
     return max(min_value, min(max_value, value))
 
 
-def us_features_enabled(env_values: dict[str, str] | None = None) -> bool:
-    values = env_values if env_values is not None else parse_env_file()
-    raw = values.get("DASHBOARD_US_FEATURES_ENABLED") or os.environ.get("DASHBOARD_US_FEATURES_ENABLED") or "0"
-    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
-
-
 def job_enabled(job: Job, env_values: dict[str, str]) -> bool:
-    if job.env_name == "DASHBOARD_US_RATING_CRON":
-        return us_features_enabled(env_values)
     if job.env_name == "IWENCAI_DRAGON_TIGER_CRON":
-        raw = env_values.get("IWENCAI_ENABLED") or os.environ.get("IWENCAI_ENABLED") or "0"
+        # Callers pass the fully resolved dashboard.env mapping. Do not leak a
+        # separately inherited process value into explicit test/runtime snapshots.
+        raw = env_values.get("IWENCAI_ENABLED") or "0"
         return str(raw).strip().lower() in {"1", "true", "yes", "on"}
     return True
 

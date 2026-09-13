@@ -3,7 +3,9 @@ import { computed } from 'vue'
 import {
   formatPracticeAmount,
   formatPracticeNumber,
+  localizePracticeReason,
   PRACTICE_BUY_NAMES,
+  practicePositionQuotePresentation,
   practiceValueColor,
   signedPracticeAmount,
   signedPracticeNumber,
@@ -16,6 +18,7 @@ const props = defineProps({
   totalEquity: { type: Number, default: 0 },
   brief: Boolean,
   strategyMeta: { type: Object, default: () => ({}) },
+  currentDate: { type: String, default: '' },
 })
 
 const marketValue = computed(() => Number(props.position.market_value))
@@ -43,7 +46,13 @@ const buyStrategyLabels = computed(() => {
   for (const [key, meta] of Object.entries(props.strategyMeta || {})) names[key] = meta?.label || names[key] || key
   return uniquePracticeLabels(splitPracticeTags(props.position.buy_strategy).map(key => names[key] || key))
 })
-const buyReasonText = computed(() => String(props.position.entry_reason || props.position.buy_reason || '').trim())
+const buyReasonText = computed(() => localizePracticeReason(
+  props.position.entry_reason || props.position.buy_reason || '',
+).trim())
+const quotePresentation = computed(() => practicePositionQuotePresentation(
+  props.position,
+  props.currentDate,
+))
 </script>
 
 <template>
@@ -57,13 +66,14 @@ const buyReasonText = computed(() => String(props.position.entry_reason || props
   <div v-else class="position-card">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
       <span style="font-weight:700;font-size:16px;color:var(--text)">{{ position.code }} {{ position.name || '' }}</span>
+      <span v-if="quotePresentation.historical" class="position-quote-status">{{ quotePresentation.statusLabel }}</span>
     </div>
     <div class="position-metrics">
-      <div class="position-metric"><div class="position-label">成本/现价</div><div class="position-value combo">{{ formatPracticeNumber(position.avg_cost) }} / {{ formatPracticeNumber(position.last_price) }}</div></div>
+      <div class="position-metric"><div class="position-label">{{ quotePresentation.priceLabel }}</div><div class="position-value combo">{{ formatPracticeNumber(position.avg_cost) }} / {{ formatPracticeNumber(position.last_price) }}</div></div>
       <div class="position-metric"><div class="position-label">盈亏</div><div class="position-value strong combo" :style="`color:${practiceValueColor(pnlValue)}`">{{ pnlText }}</div></div>
-      <div class="position-metric"><div class="position-label">实时涨幅</div><div class="position-value strong" :style="`color:${practiceValueColor(changePct)}`">{{ Number.isFinite(changePct) ? signedPracticeNumber(changePct) : '--' }}</div></div>
-      <div class="position-metric"><div class="position-label">最低/最高</div><div class="position-value strong combo"><span :style="`color:${practiceValueColor(lowPct)}`">{{ Number.isFinite(lowPct) ? signedPracticeNumber(lowPct) : '--' }}</span><span class="position-value-separator">/</span><span :style="`color:${practiceValueColor(highPct)}`">{{ Number.isFinite(highPct) ? signedPracticeNumber(highPct) : '--' }}</span></div></div>
-      <div class="position-metric"><div class="position-label">今日收益</div><div class="position-value strong" :style="`color:${practiceValueColor(todayPnl)}`">{{ todayText }}</div></div>
+      <div class="position-metric"><div class="position-label">{{ quotePresentation.changeLabel }}</div><div class="position-value strong" :style="`color:${practiceValueColor(changePct)}`">{{ Number.isFinite(changePct) ? signedPracticeNumber(changePct) : '--' }}</div></div>
+      <div class="position-metric"><div class="position-label">{{ quotePresentation.rangeLabel }}</div><div class="position-value strong combo"><span :style="`color:${practiceValueColor(lowPct)}`">{{ Number.isFinite(lowPct) ? signedPracticeNumber(lowPct) : '--' }}</span><span class="position-value-separator">/</span><span :style="`color:${practiceValueColor(highPct)}`">{{ Number.isFinite(highPct) ? signedPracticeNumber(highPct) : '--' }}</span></div></div>
+      <div class="position-metric"><div class="position-label">{{ quotePresentation.pnlLabel }}</div><div class="position-value strong" :style="`color:${practiceValueColor(todayPnl)}`">{{ todayText }}</div></div>
       <div class="position-metric"><div class="position-label">市值</div><div class="position-value">{{ formatPracticeAmount(position.market_value) }}</div></div>
       <div class="position-metric"><div class="position-label">仓位占比</div><div class="position-value">{{ positionText }}</div></div>
       <div class="position-metric"><div class="position-label">可卖/持有</div><div class="position-value secondary">{{ position.available_qty ?? 0 }} / {{ position.qty ?? 0 }}</div></div>

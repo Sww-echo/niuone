@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import copy
 import os
 import json
 import subprocess
@@ -8,6 +9,7 @@ import threading
 import time
 import types
 import unittest
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 
@@ -33,6 +35,17 @@ def permissive_market_context() -> dict:
         "min_cash_reserve_pct": trader.MIN_CASH_RESERVE_PCT,
         "buy_budget_multiplier": 1.0,
         "allow_new_buys": True,
+    }
+
+
+def complete_preset_interpretation() -> dict[str, list[str]]:
+    return {
+        "selection_rules": ["选择放量站上20日线的股票"],
+        "entry_rules": ["回踩20日线企稳后买入"],
+        "exit_rules": ["收盘跌破20日线卖出"],
+        "position_rules": ["单票不超过账户权益10%"],
+        "time_rules": ["信号次一交易时段执行"],
+        "ambiguities": [],
     }
 
 
@@ -80,6 +93,76 @@ class SellStrategyRuleTests(unittest.TestCase):
         self.assertEqual([p["minute"] for p in points], [0, 120, 120, 240])
         self.assertEqual(points[-1]["pct"], 8.0)
 
+    def test_tencent_quote_uses_provider_timestamp_instead_of_wall_clock(self):
+        parts = [""] * 38
+        parts[1] = "测试股"
+        parts[3] = "10.50"
+        parts[4] = "10.00"
+        parts[5] = "10.10"
+        parts[6] = "1234"
+        parts[30] = "20260825161452"
+        parts[33] = "10.80"
+        parts[34] = "9.90"
+        parts[37] = "2000"
+
+        quote = trader.parse_tencent_quote_line(
+            f'v_sh600000="{"~".join(parts)}";'
+        )
+
+        self.assertEqual(quote["quote_time"], "2026-08-25 16:14:52")
+
+    def test_startup_mark_refresh_preserves_concurrent_account_state(self):
+        fetched_state = {
+            "cash": 100000.0,
+            "positions": {
+                "600000": {
+                    "qty": 1000,
+                    "avg_cost": 10.0,
+                    "last_price": 10.0,
+                }
+            },
+            "trade_log": [],
+            "equity_history": [{"time": "2026-08-11 15:00:00", "equity": 100000.0}],
+        }
+        canonical_state = copy.deepcopy(fetched_state)
+        canonical_state["cash"] = 90000.0
+        canonical_state["positions"]["600000"]["qty"] = 800
+        canonical_state["trade_log"] = [{"time": "2026-08-26 09:35:00", "action": "SELL"}]
+        saved = []
+        load_results = iter([copy.deepcopy(fetched_state), canonical_state])
+        originals = {
+            "load_state": trader.load_state,
+            "save_state": trader.save_state,
+            "refresh_realtime_prices": trader.refresh_realtime_prices,
+            "state_file_write_lock": trader.state_file_write_lock,
+        }
+
+        def refresh_marks(state):
+            state["positions"]["600000"].update({
+                "last_price": 10.8,
+                "quote_time": "2026-08-25 16:14:52",
+                "quote_source": "test",
+            })
+            state["last_quote_refresh"] = {"updated": 1}
+            return state["last_quote_refresh"]
+
+        try:
+            trader.load_state = lambda: next(load_results)
+            trader.save_state = lambda state: saved.append(copy.deepcopy(state))
+            trader.refresh_realtime_prices = refresh_marks
+            trader.state_file_write_lock = nullcontext
+
+            self.assertTrue(trader.refresh_position_marks_without_trading())
+        finally:
+            for name, value in originals.items():
+                setattr(trader, name, value)
+
+        self.assertEqual(saved[0]["cash"], 90000.0)
+        self.assertEqual(saved[0]["positions"]["600000"]["qty"], 800)
+        self.assertEqual(saved[0]["positions"]["600000"]["last_price"], 10.8)
+        self.assertEqual(saved[0]["trade_log"], canonical_state["trade_log"])
+        self.assertEqual(saved[0]["equity_history"], fetched_state["equity_history"])
+
     def test_realtime_high_low_pct_are_exposed_in_portfolio_rows(self):
         state = {
             "cash": 0.0,
@@ -116,7 +199,7 @@ class SellStrategyRuleTests(unittest.TestCase):
                 }
             }, {"channel_counts": {"tencent": 1}, "errors": []})
 
-            trader.refresh_realtime_prices(state)
+            refresh_meta = trader.refresh_realtime_prices(state)
             row = trader.enrich_portfolio(state)["positions"][0]
         finally:
             trader.fetch_realtime_quotes = original_fetch
@@ -130,6 +213,7 @@ class SellStrategyRuleTests(unittest.TestCase):
         self.assertEqual(row["today_buy_qty"], 0)
         self.assertEqual(row["buy_strategy"], "b3_accelerate")
         self.assertEqual(row["entry_reason"], "B3中继评分10.0达标")
+        self.assertEqual(refresh_meta["quote_time"], "2026-06-24 10:00:00")
 
     def test_portfolio_marks_only_today_bought_positions(self):
         original_today_key = trader.today_key
@@ -244,6 +328,163 @@ class SellStrategyRuleTests(unittest.TestCase):
         self.assertEqual(row["today_pnl"], 2340.0)
         self.assertEqual(row["today_pnl_pct"], 0.9)
 
+    def test_mixed_position_today_pnl_uses_exact_same_day_trade_cost(self):
+        original_today_key = trader.today_key
+        try:
+            trader.today_key = lambda: "2026-06-24"
+            state = {
+                "initial_cash": 100_000.0,
+                "cash": 83_999.4,
+                "positions": {
+                    "600000": {
+                        "code": "600000",
+                        "name": "测试股",
+                        "qty": 1500,
+                        "avg_cost": 11.0671,
+                        "last_price": 12.5,
+                        "prev_close": 11.0,
+                        "buy_date_lots": {
+                            "2026-06-23": 1000,
+                            "2026-06-24": 500,
+                        },
+                    }
+                },
+                "trade_log": [{
+                    "time": "2026-06-24 10:00:00",
+                    "action": "BUY",
+                    "code": "600000",
+                    "shares": 500,
+                    "price": 12.0,
+                    "amount": 6000.0,
+                    "fee": 0.6,
+                    "total_cost": 6000.6,
+                }],
+                "decision_log": [],
+                "equity_history": [],
+            }
+
+            payload = trader.enrich_portfolio(state)
+        finally:
+            trader.today_key = original_today_key
+
+        row = payload["positions"][0]
+        self.assertEqual(row["today_pnl"], 1749.4)
+        self.assertEqual(row["today_pnl_pct"], 10.29)
+        self.assertEqual(payload["daily_pnl"], 1749.4)
+        self.assertEqual(payload["daily_pnl_pct"], 1.732)
+
+    def test_account_today_pnl_does_not_inherit_stale_prior_equity_when_idle(self):
+        original_today_key = trader.today_key
+        try:
+            trader.today_key = lambda: "2026-06-24"
+            payload = trader.enrich_portfolio({
+                "initial_cash": 100_000.0,
+                "cash": 102_000.0,
+                "positions": {},
+                "trade_log": [],
+                "decision_log": [],
+                "equity_history": [{
+                    "time": "2026-06-23 14:59:00",
+                    "equity": 100_000.0,
+                }],
+                "daily_equity_history": [{
+                    "time": "2026-06-23 14:59:00",
+                    "equity": 100_000.0,
+                }],
+            })
+        finally:
+            trader.today_key = original_today_key
+
+        self.assertEqual(payload["daily_pnl"], 0.0)
+        self.assertEqual(payload["daily_pnl_pct"], 0.0)
+
+    def test_current_day_cash_replay_recovers_missing_auto_sell_proceeds(self):
+        state = {
+            "initial_cash": 70_000.0,
+            "cash": 59_499.0,
+            "positions": {},
+            "trade_log": [
+                {
+                    "time": "2026-06-24 10:00:00",
+                    "action": "SELL",
+                    "code": "600000",
+                    "shares": 1000,
+                    "amount": 10_500.0,
+                    "fee": 1.0,
+                    "net_proceeds": 10_499.0,
+                },
+                {
+                    "time": "2026-06-24 10:30:00",
+                    "action": "SELL",
+                    "code": "600001",
+                    "shares": 1000,
+                    "amount": 9500.0,
+                    "fee": 1.0,
+                    "net_proceeds": 9499.0,
+                },
+            ],
+            "decision_log": [],
+            "daily_equity_history": [{
+                "time": "2026-06-23 15:00:00",
+                "equity": 70_000.0,
+                "cash": 50_000.0,
+                "market_value": 20_000.0,
+            }],
+            "equity_history": [{
+                "time": "2026-06-24 09:31:00",
+                "equity": 70_000.0,
+                "cash": 50_000.0,
+                "market_value": 20_000.0,
+            }],
+        }
+
+        changed = trader.reconcile_current_day_cash_from_ledger(
+            state,
+            today="2026-06-24",
+        )
+        daily_pnl, daily_pnl_pct = trader.account_today_pnl(
+            state,
+            today="2026-06-24",
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(state["cash"], 69_998.0)
+        self.assertEqual(daily_pnl, -2.0)
+        self.assertAlmostEqual(daily_pnl_pct, -2 / 70_000 * 100)
+
+    def test_current_day_cash_replay_requires_verified_pretrade_cash(self):
+        state = {
+            "cash": 60_000.0,
+            "positions": {},
+            "trade_log": [{
+                "time": "2026-06-24 10:00:00",
+                "action": "SELL",
+                "code": "600000",
+                "shares": 1000,
+                "amount": 10_000.0,
+                "fee": 1.0,
+                "net_proceeds": 9999.0,
+            }],
+            "daily_equity_history": [{
+                "time": "2026-06-23 15:00:00",
+                "equity": 70_000.0,
+                "cash": 50_000.0,
+            }],
+            "equity_history": [{
+                "time": "2026-06-24 09:31:00",
+                "equity": 71_000.0,
+                "cash": 51_000.0,
+            }],
+        }
+
+        changed = trader.reconcile_current_day_cash_from_ledger(
+            state,
+            today="2026-06-24",
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual(state["cash"], 60_000.0)
+
     def test_execute_actions_rechecks_trading_time_before_order(self):
         original_execution_time = trader.is_a_share_execution_time
         try:
@@ -353,6 +594,391 @@ class SellStrategyRuleTests(unittest.TestCase):
         self.assertEqual(compact_pos["strategy_mark_id"], "b3_accelerate")
         self.assertEqual(compact_pos["position_pct"], 10.0)
         self.assertEqual(compact_pos["strategy_mark_history"][-1]["action"], "BUY")
+
+    def test_preset_text_buy_freezes_auditable_policy_snapshot(self):
+        saved_active = os.environ.get(trader.ACTIVE_STRATEGY_ENV)
+        saved_text = os.environ.get(trader.PRESET_STRATEGY_TEXT_ENV)
+        original_execution_time = trader.is_a_share_execution_time
+        original_quote = trader.execution_quote
+        try:
+            os.environ[trader.ACTIVE_STRATEGY_ENV] = "preset_text"
+            os.environ[trader.PRESET_STRATEGY_TEXT_ENV] = "放量站上20日线买入\\n收盘跌破20日线卖出"
+            trader.is_a_share_execution_time = lambda dt=None: (True, "连续竞价交易时段")
+            trader.execution_quote = lambda code: {"price": 10.0, "name": "测试股", "source": "test"}
+            candidates = [{
+                "code": "600000",
+                "name": "测试股",
+                "best_strategy": "preset_text",
+                "best_score": 8.0,
+                "entry_threshold": 0.0,
+                "actionable": True,
+                "hard_blockers": [],
+                "return_20d_pct": 8.5,
+                "above_ema20": True,
+                "risk_flags": [],
+            }]
+            snapshot = trader.build_preset_strategy_snapshot(
+                trader.current_preset_strategy_text(),
+                captured_at="2026-06-24 10:00:00",
+            )
+            audit = trader.build_preset_decision_audit(
+                snapshot=snapshot,
+                candidates=candidates,
+                interpretation=complete_preset_interpretation(),
+                prompt="frozen prompt",
+                generated_at="2026-06-24 10:00:01",
+            )
+            state = {"cash": 100000.0, "positions": {}, "trade_log": []}
+            decision = {
+                "strategy_interpretation": complete_preset_interpretation(),
+                "preset_strategy_audit": audit,
+                "actions": [{
+                    "action": "BUY",
+                    "code": "600000",
+                    "name": "测试股",
+                    "shares": 1000,
+                    "reason": "预设文字策略：放量站上20日线且回踩企稳，仓位10%，跌破20日线失效",
+                }],
+            }
+
+            executed = trader.execute_actions(
+                state,
+                decision,
+                candidates,
+                True,
+                "连续竞价交易时段",
+                permissive_market_context(),
+            )
+        finally:
+            trader.is_a_share_execution_time = original_execution_time
+            trader.execution_quote = original_quote
+            if saved_active is None:
+                os.environ.pop(trader.ACTIVE_STRATEGY_ENV, None)
+            else:
+                os.environ[trader.ACTIVE_STRATEGY_ENV] = saved_active
+            if saved_text is None:
+                os.environ.pop(trader.PRESET_STRATEGY_TEXT_ENV, None)
+            else:
+                os.environ[trader.PRESET_STRATEGY_TEXT_ENV] = saved_text
+
+        self.assertEqual(len(executed), 1)
+        pos = state["positions"]["600000"]
+        self.assertEqual(pos["buy_strategy"], "preset_text")
+        self.assertEqual(pos["strategy_mark"]["strategy_id"], "preset_text")
+        self.assertEqual(pos["preset_strategy_snapshot"]["text"], "放量站上20日线买入\n收盘跌破20日线卖出")
+        self.assertEqual(
+            pos["preset_strategy_snapshot"]["text_sha256"],
+            executed[0]["preset_strategy_snapshot"]["text_sha256"],
+        )
+        self.assertEqual(
+            pos["preset_strategy_candidate_pool_sha256"],
+            executed[0]["preset_strategy_candidate_pool_sha256"],
+        )
+        self.assertEqual(
+            trader.preset_position_policy_context(state)[0]["snapshot"]["text"],
+            "放量站上20日线买入\n收盘跌破20日线卖出",
+        )
+
+    def test_preset_text_buy_fails_closed_without_complete_audit(self):
+        saved_active = os.environ.get(trader.ACTIVE_STRATEGY_ENV)
+        saved_text = os.environ.get(trader.PRESET_STRATEGY_TEXT_ENV)
+        original_execution_time = trader.is_a_share_execution_time
+        original_quote = trader.execution_quote
+        try:
+            os.environ[trader.ACTIVE_STRATEGY_ENV] = "preset_text"
+            os.environ[trader.PRESET_STRATEGY_TEXT_ENV] = "只买强趋势"
+            trader.is_a_share_execution_time = lambda dt=None: (True, "连续竞价交易时段")
+            trader.execution_quote = lambda code: {"price": 10.0, "name": "测试股", "source": "test"}
+            state = {"cash": 100000.0, "positions": {}, "trade_log": []}
+            candidates = [{
+                "code": "600000",
+                "name": "测试股",
+                "best_strategy": "preset_text",
+                "best_score": 8.0,
+                "entry_threshold": 0.0,
+                "actionable": True,
+                "hard_blockers": [],
+            }]
+            decision = {"actions": [{
+                "action": "BUY", "code": "600000", "name": "测试股",
+                "shares": 1000, "reason": "模型要求买入",
+            }]}
+
+            executed = trader.execute_actions(
+                state,
+                decision,
+                candidates,
+                True,
+                "连续竞价交易时段",
+                permissive_market_context(),
+            )
+        finally:
+            trader.is_a_share_execution_time = original_execution_time
+            trader.execution_quote = original_quote
+            if saved_active is None:
+                os.environ.pop(trader.ACTIVE_STRATEGY_ENV, None)
+            else:
+                os.environ[trader.ACTIVE_STRATEGY_ENV] = saved_active
+            if saved_text is None:
+                os.environ.pop(trader.PRESET_STRATEGY_TEXT_ENV, None)
+            else:
+                os.environ[trader.PRESET_STRATEGY_TEXT_ENV] = saved_text
+
+        self.assertEqual(executed, [])
+        self.assertEqual(state["positions"], {})
+        self.assertIn("决策审计", decision["execution_blocked_reason"])
+
+    def test_preset_text_buy_audit_detects_candidate_fact_drift(self):
+        text = "放量站上20日线买入"
+        candidates = [{
+            "code": "600000",
+            "name": "测试股",
+            "price": 10.0,
+            "return_20d_pct": 8.5,
+            "above_ema20": True,
+        }]
+        snapshot = trader.build_preset_strategy_snapshot(
+            text,
+            captured_at="2026-06-24 10:00:00",
+        )
+        audit = trader.build_preset_decision_audit(
+            snapshot=snapshot,
+            candidates=candidates,
+            interpretation=complete_preset_interpretation(),
+            prompt="frozen prompt",
+            generated_at="2026-06-24 10:00:01",
+        )
+        changed_candidates = [{**candidates[0], "return_20d_pct": 9.5}]
+
+        error = trader.validate_preset_buy_audit(
+            audit,
+            code="600000",
+            candidates=changed_candidates,
+            current_text=text,
+        )
+
+        self.assertIn("候选池审计不一致", error or "")
+
+    def test_preset_text_add_trade_links_current_decision_audit(self):
+        saved_active = os.environ.get(trader.ACTIVE_STRATEGY_ENV)
+        saved_text = os.environ.get(trader.PRESET_STRATEGY_TEXT_ENV)
+        original_execution_time = trader.is_a_share_execution_time
+        original_quote = trader.execution_quote
+        text = "放量站上20日线买入，收盘跌破20日线卖出"
+        interpretation = complete_preset_interpretation()
+        candidates = [{
+            "code": "600000",
+            "name": "测试股",
+            "best_strategy": "preset_text",
+            "best_score": 7.0,
+            "entry_threshold": 0.0,
+            "actionable": True,
+            "hard_blockers": [],
+            "return_20d_pct": 8.5,
+            "above_ema20": True,
+            "risk_flags": [],
+        }]
+        snapshot = trader.build_preset_strategy_snapshot(
+            text,
+            captured_at="2026-06-23 10:00:00",
+        )
+        entry_audit = trader.build_preset_decision_audit(
+            snapshot=snapshot,
+            candidates=candidates,
+            interpretation=interpretation,
+            prompt="entry prompt",
+            generated_at="2026-06-23 10:00:01",
+        )
+        add_audit = trader.build_preset_decision_audit(
+            snapshot=snapshot,
+            candidates=candidates,
+            interpretation=interpretation,
+            prompt="later add prompt",
+            generated_at="2026-06-24 10:00:01",
+        )
+        state = {
+            "cash": 90000.0,
+            "positions": {
+                "600000": {
+                    "code": "600000",
+                    "name": "测试股",
+                    "qty": 1000,
+                    "avg_cost": 10.0,
+                    "last_price": 10.0,
+                    "buy_date_lots": {"2026-06-23": 1000},
+                    "buy_strategy": "preset_text",
+                    "strategy_mark": {
+                        "strategy_id": "preset_text",
+                        "label": "预设文字策略",
+                    },
+                    "preset_strategy_snapshot": snapshot,
+                    "preset_strategy_interpretation": interpretation,
+                    "preset_strategy_interpretation_sha256": entry_audit[
+                        "interpretation_sha256"
+                    ],
+                    "preset_strategy_prompt_protocol": entry_audit[
+                        "prompt_protocol"
+                    ],
+                    "preset_strategy_prompt_sha256": entry_audit[
+                        "prompt_sha256"
+                    ],
+                }
+            },
+            "trade_log": [],
+        }
+        decision = {
+            "preset_strategy_audit": add_audit,
+            "actions": [{
+                "action": "BUY",
+                "code": "600000",
+                "name": "测试股",
+                "shares": 100,
+                "reason": "同一冻结策略回踩确认，加仓后约11%仓位",
+            }],
+        }
+        try:
+            os.environ[trader.ACTIVE_STRATEGY_ENV] = "preset_text"
+            os.environ[trader.PRESET_STRATEGY_TEXT_ENV] = text
+            trader.is_a_share_execution_time = lambda dt=None: (
+                True,
+                "连续竞价交易时段",
+            )
+            trader.execution_quote = lambda code: {
+                "price": 10.0,
+                "name": "测试股",
+                "source": "test",
+            }
+
+            executed = trader.execute_actions(
+                state,
+                decision,
+                candidates,
+                True,
+                "连续竞价交易时段",
+                permissive_market_context(),
+            )
+        finally:
+            trader.is_a_share_execution_time = original_execution_time
+            trader.execution_quote = original_quote
+            if saved_active is None:
+                os.environ.pop(trader.ACTIVE_STRATEGY_ENV, None)
+            else:
+                os.environ[trader.ACTIVE_STRATEGY_ENV] = saved_active
+            if saved_text is None:
+                os.environ.pop(trader.PRESET_STRATEGY_TEXT_ENV, None)
+            else:
+                os.environ[trader.PRESET_STRATEGY_TEXT_ENV] = saved_text
+
+        self.assertEqual(len(executed), 1)
+        self.assertEqual(
+            executed[0]["preset_strategy_prompt_sha256"],
+            add_audit["prompt_sha256"],
+        )
+        self.assertNotEqual(
+            executed[0]["preset_strategy_prompt_sha256"],
+            entry_audit["prompt_sha256"],
+        )
+        self.assertEqual(
+            state["positions"]["600000"]["preset_strategy_prompt_sha256"],
+            entry_audit["prompt_sha256"],
+        )
+
+    def test_preset_text_sell_uses_frozen_entry_policy_after_current_text_changes(self):
+        original_execution_time = trader.is_a_share_execution_time
+        original_quote = trader.execution_quote
+        original_today_key = trader.today_key
+        snapshot = trader.build_preset_strategy_snapshot(
+            "收盘跌破20日线卖出",
+            captured_at="2026-06-23 10:00:00",
+        )
+        interpretation = complete_preset_interpretation()
+        entry_audit = trader.build_preset_decision_audit(
+            snapshot=snapshot,
+            candidates=[],
+            interpretation=interpretation,
+            prompt="entry prompt",
+            generated_at="2026-06-23 10:00:00",
+        )
+        state = {
+            "cash": 90000.0,
+            "positions": {
+                "600000": {
+                    "code": "600000",
+                    "name": "测试股",
+                    "qty": 1000,
+                    "avg_cost": 10.0,
+                    "last_price": 9.8,
+                    "buy_date_lots": {"2026-06-23": 1000},
+                    "buy_strategy": "preset_text",
+                    "strategy_mark": {"strategy_id": "preset_text", "label": "预设文字策略"},
+                    "preset_strategy_snapshot": snapshot,
+                    "preset_strategy_interpretation": interpretation,
+                    "preset_strategy_interpretation_sha256": entry_audit[
+                        "interpretation_sha256"
+                    ],
+                }
+            },
+            "trade_log": [],
+        }
+        contexts = trader.preset_position_policy_context(state)
+        decision = {
+            "preset_exit_audit": trader.build_preset_exit_audit(
+                contexts,
+                prompt="prompt containing frozen policy",
+                generated_at="2026-06-24 10:00:00",
+            ),
+            "actions": [{
+                "action": "SELL",
+                "code": "600000",
+                "name": "测试股",
+                "shares": 1000,
+                "reason": f"策略指纹{snapshot['text_sha256'][:12]}：收盘跌破20日线",
+            }],
+        }
+        try:
+            trader.today_key = lambda: "2026-06-24"
+            trader.is_a_share_execution_time = lambda dt=None: (True, "连续竞价交易时段")
+            trader.execution_quote = lambda code: {"price": 9.8, "name": "测试股", "source": "test"}
+            executed = trader.execute_actions(
+                state,
+                decision,
+                [],
+                True,
+                "连续竞价交易时段",
+                permissive_market_context(),
+            )
+        finally:
+            trader.today_key = original_today_key
+            trader.is_a_share_execution_time = original_execution_time
+            trader.execution_quote = original_quote
+
+        self.assertEqual(len(executed), 1)
+        self.assertNotIn("600000", state["positions"])
+        self.assertEqual(executed[0]["buy_strategy"], "preset_text")
+        self.assertEqual(executed[0]["preset_strategy_text_sha256"], snapshot["text_sha256"])
+        self.assertEqual(
+            executed[0]["preset_strategy_exit_prompt_sha256"],
+            decision["preset_exit_audit"]["prompt_sha256"],
+        )
+
+    def test_preset_text_position_skips_unfrozen_generic_auto_exits(self):
+        snapshot = trader.build_preset_strategy_snapshot(
+            "只在跌破20日线时卖出",
+            captured_at="2026-05-01 10:00:00",
+        )
+        pos = {
+            "qty": 1000,
+            "avg_cost": 10.0,
+            "last_price": 15.0,
+            "buy_date_lots": {"2026-05-01": 1000},
+            "buy_strategy": "preset_text",
+            "strategy_mark": {"strategy_id": "preset_text", "label": "预设文字策略"},
+            "preset_strategy_snapshot": snapshot,
+        }
+
+        signal = trader.evaluate_sell_signal("600000", pos, "2026-06-24")
+
+        self.assertIsNone(signal)
 
     def test_execute_actions_daily_loss_budget_blocks_buy_but_not_sell(self):
         state = {
@@ -930,6 +1556,7 @@ class SellStrategyRuleTests(unittest.TestCase):
                         "avg_cost": 9.0,
                         "last_price": 10.0,
                         "buy_strategy": "niu_leader",
+                        "mainline_state": "inactive",
                         "buy_date_lots": {
                             "2026-06-23": 800,
                             trader.today_key(): 200,
@@ -972,8 +1599,92 @@ class SellStrategyRuleTests(unittest.TestCase):
         self.assertEqual(fill["available_sell_shares"], 800)
         self.assertTrue(fill["sell_quantity_auto_reduced"])
         self.assertEqual(fill["sell_execution_source"], "model_action")
-        self.assertEqual(fill["sell_execution_evidence_schema_version"], 1)
+        self.assertEqual(fill["sell_execution_evidence_schema_version"], 2)
         self.assertFalse(fill["position_fully_closed"])
+
+    def test_execute_actions_stages_niuone_model_soft_sell_across_sessions(self):
+        original_execution_time = trader.is_a_share_execution_time
+        original_quote = trader.execution_quote
+        try:
+            trader.is_a_share_execution_time = lambda dt=None: (
+                True,
+                "连续竞价交易时段",
+            )
+            trader.execution_quote = lambda code: {
+                "price": 10.0,
+                "name": "牛牛测试股",
+                "source": "test",
+            }
+            state = {
+                "cash": 0.0,
+                "positions": {
+                    "600000": {
+                        "code": "600000",
+                        "name": "牛牛测试股",
+                        "qty": 1000,
+                        "avg_cost": 9.0,
+                        "last_price": 10.0,
+                        "sell_score": 3,
+                        "buy_strategy": "niu_leader",
+                        "entry_theme": "算力",
+                        "day_high": 10.3,
+                        "bbi": 9.8,
+                        "buy_date_lots": {"2026-06-19": 1000},
+                    }
+                },
+                "trade_log": [],
+            }
+            first_decision = {
+                "actions": [{
+                    "action": "SELL",
+                    "code": "600000",
+                    "shares": 1000,
+                    "reason": "卖出评分转弱，建议降低仓位",
+                }],
+            }
+
+            first = trader.execute_actions(
+                state,
+                first_decision,
+                [],
+                True,
+                "连续竞价交易时段",
+                permissive_market_context(),
+                evaluated_at=datetime(2026, 6, 24, 10, 0),
+            )
+            second_decision = {
+                "actions": [{
+                    "action": "SELL",
+                    "code": "600000",
+                    "shares": 500,
+                    "reason": "卖出评分转弱，建议降低仓位",
+                }],
+            }
+            second = trader.execute_actions(
+                state,
+                second_decision,
+                [],
+                True,
+                "连续竞价交易时段",
+                permissive_market_context(),
+                evaluated_at=datetime(2026, 6, 25, 10, 0),
+            )
+        finally:
+            trader.is_a_share_execution_time = original_execution_time
+            trader.execution_quote = original_quote
+
+        self.assertEqual(first[0]["shares"], 500)
+        self.assertEqual(first[0]["soft_exit_stage"], "reduce")
+        self.assertEqual(first[0]["model_requested_sell_shares"], 1000)
+        self.assertEqual(second[0]["shares"], 500)
+        self.assertEqual(second[0]["soft_exit_stage"], "exit")
+        self.assertTrue(second[0]["position_fully_closed"])
+        self.assertTrue(second[0]["post_exit_reentry_watch_created"])
+        self.assertNotIn("600000", state["positions"])
+        self.assertEqual(
+            state["post_exit_reentry_watch"]["600000"]["exit_high"],
+            10.3,
+        )
 
     def test_execute_actions_keeps_niuone_sell_fail_closed_when_nothing_is_available(self):
         original_execution_time = trader.is_a_share_execution_time
@@ -1052,6 +1763,35 @@ class SellStrategyRuleTests(unittest.TestCase):
         self.assertEqual(ctx["max_open_positions"], min(3, trader.MAX_OPEN_POSITIONS))
         self.assertEqual(ctx["max_new_buys_per_decision"], 1)
         self.assertIn("午盘前", ctx["session_note"])
+
+    def test_morning_market_prompt_scopes_position_cap_to_non_niuone(self):
+        ctx = trader.derive_market_strategy_context([], datetime(2026, 8, 21, 10, 0, 0))
+
+        shared_prompt = trader.format_market_strategy_context_for_prompt(ctx)
+        niuone_prompt = trader.format_market_strategy_context_for_prompt(ctx, niuone_only=True)
+
+        self.assertEqual(ctx["max_open_positions"], 3)
+        self.assertEqual(ctx["niuone_max_open_positions"], trader.NIUONE_MAX_OPEN_POSITIONS)
+        self.assertIn("非牛牛策略专属午盘节奏（不得用于牛牛开仓数量判断）", shared_prompt)
+        self.assertIn("禁止把当前持仓数与上述非牛牛上限比较", shared_prompt)
+        self.assertIn(
+            f"只有牛牛持仓达到{trader.NIUONE_MAX_OPEN_POSITIONS}只才按满仓处理",
+            shared_prompt,
+        )
+        self.assertNotIn("\n午盘前最多持有3只", shared_prompt)
+        self.assertNotIn("暂无此刻盘面总结，按午盘前保留仓位", shared_prompt)
+        self.assertIn(f"牛牛节奏：最多{trader.NIUONE_MAX_OPEN_POSITIONS}只", niuone_prompt)
+        self.assertNotIn("3只", niuone_prompt)
+        self.assertNotIn("午盘前最多持有", niuone_prompt)
+        self.assertNotIn("非牛牛节奏", niuone_prompt)
+
+        ctx["guidance_lines"] = [
+            "开仓节奏：上午最多2-3只；先试错1笔",
+            "选股方向：只看有资金承接的主线候选",
+        ]
+        niuone_prompt = trader.format_market_strategy_context_for_prompt(ctx, niuone_only=True)
+        self.assertNotIn("上午最多2-3只", niuone_prompt)
+        self.assertIn("只看有资金承接的主线候选", niuone_prompt)
 
     def test_defensive_market_guidance_allows_reduced_buy_budget(self):
         reports = [{
@@ -1399,6 +2139,8 @@ class SellStrategyRuleTests(unittest.TestCase):
 
         self.assertEqual(ctx["tone"], "offensive")
         self.assertIn("仓位倾向：可提高集中度", prompt)
+        self.assertIn("牛牛开仓数量不受本次盘面评价影响", prompt)
+        self.assertIn("非牛牛节奏", prompt)
         self.assertNotIn("单票≤", prompt)
         self.assertNotIn("总仓≤", prompt)
         self.assertNotIn("现金≥", prompt)
@@ -1420,6 +2162,63 @@ class SellStrategyRuleTests(unittest.TestCase):
         self.assertFalse(ctx["allow_new_buys"])
         self.assertEqual(ctx["max_new_buys_per_decision"], 0)
         self.assertEqual(ctx["buy_budget_multiplier"], 0.0)
+
+    def test_market_guidance_pause_still_blocks_non_niuone_execution(self):
+        original_execution_time = trader.is_a_share_execution_time
+        original_quote = trader.execution_quote
+        try:
+            trader.is_a_share_execution_time = lambda dt=None: (
+                True,
+                "上午连续竞价交易时段",
+            )
+            trader.execution_quote = lambda code: {
+                "price": 10.0,
+                "name": "普通候选",
+                "source": "test",
+            }
+            state = {"cash": 100000.0, "positions": {}, "trade_log": []}
+            decision = {
+                "actions": [{
+                    "action": "BUY",
+                    "code": "601999",
+                    "name": "普通候选",
+                    "shares": 100,
+                }]
+            }
+            candidates = [{
+                "code": "601999",
+                "name": "普通候选",
+                "best_strategy": "b3_accelerate",
+                "best_score": 10.0,
+                "entry_threshold": 8.5,
+                "distance_pct": 1.0,
+                "actionable": True,
+                "hard_blockers": [],
+            }]
+            market = {
+                **permissive_market_context(),
+                "tone_label": "防守",
+                "allow_new_buys": False,
+                "max_new_buys_per_decision": 0,
+            }
+
+            executed = trader.execute_actions(
+                state,
+                decision,
+                candidates,
+                True,
+                "上午连续竞价交易时段",
+                market,
+            )
+        finally:
+            trader.is_a_share_execution_time = original_execution_time
+            trader.execution_quote = original_quote
+
+        self.assertEqual(executed, [])
+        self.assertTrue(any(
+            block["category"] == "market_guidance"
+            for block in decision["execution_blocks"]
+        ))
 
     def test_after_1430_does_not_automatically_block_new_buys(self):
         reports = [{
@@ -1672,9 +2471,9 @@ class SellStrategyRuleTests(unittest.TestCase):
             def fake_request(base_url, api_key, payload, model_name, max_retries=3, timeout=60):
                 self.assertIn("最多允许新开仓：1笔", payload["messages"][0]["content"])
                 return json.dumps({
-                    "summary": "优选股确定性更高，放弃先给股",
+                    "summary": "emerging题材中的leader确定性更高，放弃follower",
                     "keep_buy_codes": ["600002"],
-                    "drop_buys": [{"code": "600001", "reason": "确定性不如优选股"}],
+                    "drop_buys": [{"code": "600001", "reason": "follower确定性不如leader"}],
                 }, ensure_ascii=False)
 
             trader.request_chat_content = fake_request
@@ -1709,6 +2508,16 @@ class SellStrategyRuleTests(unittest.TestCase):
         self.assertEqual(refinement["status"], "model_refined")
         self.assertEqual(refinement["kept_codes"], ["600002"])
         self.assertEqual(decision["actions"][0]["action"], "HOLD")
+        self.assertIn("启动阶段题材中的领涨股", decision["summary"])
+        self.assertEqual(
+            decision["buy_refinement"]["summary"],
+            "启动阶段题材中的领涨股确定性更高，放弃跟随股",
+        )
+        self.assertEqual(
+            decision["buy_refinement"]["dropped"][0]["reason"],
+            "跟随股确定性不如领涨股",
+        )
+        self.assertIn("跟随股确定性不如领涨股", decision["actions"][0]["reason"])
         self.assertEqual(len(executed), 1)
         self.assertEqual(executed[0]["code"], "600002")
         self.assertIn("600002", state["positions"])
@@ -1852,7 +2661,7 @@ class SellStrategyRuleTests(unittest.TestCase):
                             "summary": "午休前策略",
                             "actions": [{"action": "BUY", "code": "600000", "name": "测试股", "shares": 1000}],
                         },
-                        "candidate_evidence_schema_version": 1,
+                        "candidate_evidence_schema_version": 2,
                         "candidate_evidence": [{
                             "code": "600000",
                             "strategy_id": "niu_leader",
@@ -1924,7 +2733,10 @@ class SellStrategyRuleTests(unittest.TestCase):
                     "decision_log": [],
                     "equity_history": [],
                 }
-                trader.STATE_FILE.write_text(json.dumps(current, ensure_ascii=False))
+                trader.STATE_FILE.write_text(
+                    json.dumps(current, ensure_ascii=False),
+                    encoding="utf-8",
+                )
 
                 stale = {
                     "initial_cash": 100000.0,
@@ -1968,7 +2780,10 @@ class SellStrategyRuleTests(unittest.TestCase):
                     "decision_log": [],
                     "equity_history": [],
                 }
-                trader.STATE_FILE.write_text(json.dumps(current, ensure_ascii=False))
+                trader.STATE_FILE.write_text(
+                    json.dumps(current, ensure_ascii=False),
+                    encoding="utf-8",
+                )
 
                 later_add = {
                     "time": "2026-08-04 09:59:37", "action": "BUY", "code": "001257",
@@ -2040,7 +2855,10 @@ class SellStrategyRuleTests(unittest.TestCase):
                     "decision_log": [],
                     "equity_history": [],
                 }
-                trader.STATE_FILE.write_text(json.dumps(current, ensure_ascii=False))
+                trader.STATE_FILE.write_text(
+                    json.dumps(current, ensure_ascii=False),
+                    encoding="utf-8",
+                )
 
                 sell = {
                     "time": "2026-07-13 09:30:09", "action": "SELL", "code": "002654",
@@ -2083,16 +2901,19 @@ class SellStrategyRuleTests(unittest.TestCase):
                     },
                     "executed": [],
                 }
-                trader.STATE_FILE.write_text(json.dumps({
-                    "initial_cash": 100000.0,
-                    "cash": 100000.0,
-                    "positions": {},
-                    "trade_log": [],
-                    "decision_log": [failure],
-                    "equity_history": [],
-                    "last_decision_at": failure["time"],
-                    "last_error": failure_error,
-                }, ensure_ascii=False))
+                trader.STATE_FILE.write_text(
+                    json.dumps({
+                        "initial_cash": 100000.0,
+                        "cash": 100000.0,
+                        "positions": {},
+                        "trade_log": [],
+                        "decision_log": [failure],
+                        "equity_history": [],
+                        "last_decision_at": failure["time"],
+                        "last_error": failure_error,
+                    }, ensure_ascii=False),
+                    encoding="utf-8",
+                )
 
                 stale_refresh = {
                     "initial_cash": 100000.0,
@@ -2185,6 +3006,111 @@ class SellStrategyRuleTests(unittest.TestCase):
         self.assertEqual(result["summary"], "重试成功")
         self.assertEqual([payload["max_tokens"] for payload in payloads], [4096, 8192])
 
+    def test_request_chat_content_retries_empty_length_response_to_65536(self):
+        original_request = trader.request_model_complete
+        requested_limits = []
+        try:
+            def fake_request(model_request, api_key, **kwargs):
+                requested_limits.append(model_request.payload["max_tokens"])
+                if model_request.payload["max_tokens"] < trader.DECISION_RETRY_MAX_TOKENS:
+                    return types.SimpleNamespace(
+                        content="",
+                        detail="finish_reason=length",
+                    )
+                return types.SimpleNamespace(
+                    content='{"summary":"重试成功","actions":[]}',
+                    detail="finish_reason=stop",
+                )
+
+            trader.request_model_complete = fake_request
+            result = trader.request_chat_content(
+                "https://decision.example/v1",
+                "key",
+                {"model": "deepseek-v4-flash", "messages": [], "max_tokens": 4096},
+                "deepseek-v4-flash",
+                max_retries=1,
+            )
+        finally:
+            trader.request_model_complete = original_request
+
+        self.assertIn('"summary":"重试成功"', result)
+        self.assertEqual(requested_limits, [4096, 8192, 16384, 32768, 65536])
+
+    def test_request_chat_json_object_increases_truncated_budget_to_65536(self):
+        original_request = trader.request_chat_content
+        payloads = []
+        responses = iter([
+            '{"summary":"截断 4096"',
+            '{"summary":"截断 8192"',
+            '{"summary":"截断 16384"',
+            '{"summary":"截断 32768"',
+            '{"summary":"重试成功","actions":[]}',
+        ])
+        try:
+            def fake_request(base_url, api_key, payload, model_name, max_retries=3, timeout=60):
+                payloads.append(dict(payload))
+                return next(responses)
+
+            trader.request_chat_content = fake_request
+            result = trader.request_chat_json_object(
+                "https://decision.example/v1",
+                "key",
+                {"model": "deepseek-v4-pro", "messages": [], "max_tokens": 4096},
+                "deepseek-v4-pro",
+                max_parse_attempts=5,
+                timeout=180,
+            )
+        finally:
+            trader.request_chat_content = original_request
+
+        self.assertEqual(result["summary"], "重试成功")
+        self.assertEqual(
+            [payload["max_tokens"] for payload in payloads],
+            [4096, 8192, 16384, 32768, 65536],
+        )
+        self.assertEqual(trader.increased_model_output_limit(70_000), 70_000)
+
+    def test_request_chat_json_object_retries_same_limit_only_once_at_ceiling(self):
+        original_request = trader.request_chat_content
+        payloads = []
+        try:
+            def fake_request(base_url, api_key, payload, model_name, max_retries=3, timeout=60):
+                payloads.append(dict(payload))
+                return '{"summary":"仍然截断"'
+
+            trader.request_chat_content = fake_request
+            with self.assertRaises(ValueError):
+                trader.request_chat_json_object(
+                    "https://decision.example/v1",
+                    "key",
+                    {
+                        "model": "deepseek-v4-pro",
+                        "messages": [],
+                        "max_tokens": trader.DECISION_RETRY_MAX_TOKENS,
+                    },
+                    "deepseek-v4-pro",
+                    max_parse_attempts=6,
+                    timeout=180,
+                )
+        finally:
+            trader.request_chat_content = original_request
+
+        self.assertEqual(
+            [payload["max_tokens"] for payload in payloads],
+            [trader.DECISION_RETRY_MAX_TOKENS] * 2,
+        )
+
+    def test_deepseek_decision_uses_native_json_response_format(self):
+        self.assertEqual(
+            trader.decision_json_response_format("deepseek-v4-flash"),
+            {"type": "json_object"},
+        )
+        self.assertEqual(
+            trader.decision_json_response_format("deepseek-v4-pro"),
+            {"type": "json_object"},
+        )
+        self.assertIsNone(trader.decision_json_response_format("custom-model"))
+
     def test_strategy_performance_splits_entry_and_exit_dimensions(self):
         state = {
             "trade_log": [
@@ -2236,6 +3162,15 @@ class SellStrategyRuleTests(unittest.TestCase):
             },
         }
 
+        # Each entry/exit pair supplies a verified, fee-net complete lifecycle.
+        for index, trade in enumerate(state["trade_log"]):
+            is_buy = trade["action"] == "BUY"
+            trade.update({
+                "position_before_qty": 0 if is_buy else 1000,
+                "position_after_qty": 1000 if is_buy else 0,
+                "amount": 9578.13 if index == 1 else 10000.0,
+                "fee": 0.0,
+            })
         perf = trader.track_strategy_performance(state)
 
         self.assertEqual(perf["buy_strategy"]["b3_accelerate"]["losses"], 1)
@@ -2329,7 +3264,9 @@ class SellStrategyRuleTests(unittest.TestCase):
             trader.check_market_environment = lambda: {"bullish": True, "detail": "test"}
             trader.check_market_sentiment = lambda: {"sentiment": "neutral", "detail": "test", "hot_sectors": []}
             trader.current_market_strategy_context = lambda now=None: {"enabled": False}
-            trader.check_candidate_news_precheck = lambda candidates: ""
+            trader.check_candidate_news_precheck = lambda candidates: (_ for _ in ()).throw(
+                TimeoutError("预检超时不得进入决策")
+            )
 
             def fake_request(base_url, api_key, payload, model_name, max_retries=3, timeout=60):
                 captured["payload"] = payload
@@ -2369,7 +3306,19 @@ class SellStrategyRuleTests(unittest.TestCase):
 
         prompt = captured["payload"]["messages"][0]["content"]
         self.assertEqual(result["summary"], "ok")
+        self.assertEqual(
+            result["decision_intelligence"]["news_precheck"],
+            {
+                "available": False,
+                "text": "",
+                "error": "precheck_TimeoutError",
+                "decision_weight": 0,
+            },
+        )
+        self.assertNotIn("预检超时不得进入决策", prompt)
+        self.assertNotIn("precheck_TimeoutError", prompt)
         self.assertNotIn("temperature", captured["payload"])
+        self.assertEqual(captured["payload"]["response_format"], {"type": "json_object"})
         self.assertIn("当前激活策略：预设文字策略", prompt)
         self.assertIn("系统底线风控", prompt)
         self.assertNotIn("-4%硬止损", prompt)
@@ -2379,7 +3328,8 @@ class SellStrategyRuleTests(unittest.TestCase):
         self.assertIn("用户原文：\n只做主线强趋势回踩\n跌破5日线离场", prompt)
         self.assertIn("先将用户原文分析并优化成清晰的选股条件", prompt)
         self.assertIn("其他策略不得影响本轮新增仓判断", prompt)
-        self.assertIn("基础扫描结果只作为原始候选池", prompt)
+        self.assertIn("筛选中性行情事实候选", prompt)
+        self.assertIn("中性候选排序不构成买点", prompt)
         self.assertIn("不得引用、混合或补充其他未启用策略", prompt)
         self.assertIn("每条 BUY/SELL 的仓位大小由你决定", prompt)
         self.assertIn("参考价或成交价 × shares ÷ 当前总权益 × 100%", prompt)
@@ -2590,8 +3540,83 @@ class SellStrategyRuleTests(unittest.TestCase):
         prompt = captured["payload"]["messages"][0]["content"]
         self.assertEqual(result["summary"], "ok")
         self.assertIn("自定义纪律：只在高确定性时开仓\n重仓必须说明集中理由", prompt)
+        self.assertIn("预检失败、超时、未检查、待判断或不可用统一按中性且决策权重为0", prompt)
+        self.assertIn("不得作为不开仓、HOLD或SELL的理由", prompt)
         self.assertNotIn("单次决策最多给2条新买入", prompt)
         self.assertNotIn("当前持仓达到", prompt)
+
+    def test_niuone_decision_prompt_omits_non_niuone_morning_position_cap(self):
+        saved_env = {
+            trader.ACTIVE_STRATEGY_ENV: os.environ.get(trader.ACTIVE_STRATEGY_ENV),
+            trader.STRATEGY_SOURCE_ENV: os.environ.get(trader.STRATEGY_SOURCE_ENV),
+            trader.PERSONA_STRATEGY_ENV: os.environ.get(trader.PERSONA_STRATEGY_ENV),
+            trader.TRADE_DISCIPLINE_TEXT_ENV: os.environ.get(trader.TRADE_DISCIPLINE_TEXT_ENV),
+        }
+        originals = {
+            "load_crossdesk_config": trader.load_crossdesk_config,
+            "check_market_environment": trader.check_market_environment,
+            "check_market_sentiment": trader.check_market_sentiment,
+            "check_candidate_news_precheck": trader.check_candidate_news_precheck,
+            "request_chat_content": trader.request_chat_content,
+        }
+        captured: dict[str, dict] = {}
+        market_ctx = {
+            **permissive_market_context(),
+            "enabled": True,
+            "phase": "morning",
+            "max_open_positions": 3,
+            "niuone_max_open_positions": trader.NIUONE_MAX_OPEN_POSITIONS,
+            "session_note": "午盘前最多持有3只，保留2个仓位给午后确认",
+            "guidance_lines": ["开仓节奏：上午最多2-3只；先试错1笔"],
+        }
+        try:
+            os.environ[trader.ACTIVE_STRATEGY_ENV] = "niuone"
+            os.environ[trader.STRATEGY_SOURCE_ENV] = "builtin"
+            os.environ[trader.PERSONA_STRATEGY_ENV] = "niuone"
+            os.environ.pop(trader.TRADE_DISCIPLINE_TEXT_ENV, None)
+            trader.load_crossdesk_config = lambda *args, **kwargs: ("https://decision.example/v1", "key")
+            trader.check_market_environment = lambda: {"bullish": True, "detail": "test"}
+            trader.check_market_sentiment = lambda: {
+                "sentiment": "neutral",
+                "detail": "test",
+                "hot_sectors": [],
+            }
+            trader.check_candidate_news_precheck = lambda candidates: ""
+
+            def fake_request(base_url, api_key, payload, model_name, max_retries=3, timeout=60):
+                captured["payload"] = payload
+                return '{"summary":"ok","actions":[]}'
+
+            trader.request_chat_content = fake_request
+            trader.call_model_decision(
+                [],
+                {
+                    "positions": [
+                        {"code": f"60000{index}", "name": f"持仓{index}", "qty": 100}
+                        for index in range(3)
+                    ],
+                    "trade_log": [],
+                    "cash": 900000,
+                    "total_equity": 1000000,
+                },
+                True,
+                "测试交易时段",
+                market_ctx,
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(trader, name, value)
+            for name, value in saved_env.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+        prompt = captured["payload"]["messages"][0]["content"]
+        self.assertIn(f"牛牛节奏：最多{trader.NIUONE_MAX_OPEN_POSITIONS}只", prompt)
+        self.assertNotIn("午盘前最多持有3只", prompt)
+        self.assertNotIn("上午最多2-3只", prompt)
+        self.assertNotIn("非牛牛节奏：最多3只", prompt)
 
     def test_b3_next_day_no_progress_exits(self):
         pos = {
@@ -2712,6 +3737,7 @@ class SellStrategyRuleTests(unittest.TestCase):
                         "qty": 1000,
                         "avg_cost": 10.0,
                         "last_price": 9.98,
+                        "prev_close": 10.0,
                         "buy_strategy": "b3_accelerate",
                         "buy_date_lots": {"2026-06-23": 1000},
                     }
@@ -2728,6 +3754,11 @@ class SellStrategyRuleTests(unittest.TestCase):
         at_open = trader.check_auto_exits(state, datetime(2026, 6, 24, 9, 37))
         self.assertEqual(len(at_open), 1)
         self.assertEqual(at_open[0]["exit_signal"], "b3_next_day_no_progress")
+        self.assertEqual(at_open[0]["day_reference_price"], 10.0)
+        self.assertEqual(
+            at_open[0]["day_pnl"],
+            round(at_open[0]["net_proceeds"] - at_open[0]["shares"] * 10.0, 2),
+        )
         self.assertIn("09:37", at_open[0]["reason"])
 
         state = make_b3_state()
@@ -2783,17 +3814,25 @@ class SellStrategyRuleTests(unittest.TestCase):
             "decision_log": [],
         }
         originals = {
+            "load_state": trader.load_state,
+            "save_state": trader.save_state,
+            "record_equity": trader.record_equity,
             "_sync_trades_to_db": trader._sync_trades_to_db,
             "_sync_decision_to_db": trader._sync_decision_to_db,
         }
         try:
+            trader.load_state = lambda: json.loads(json.dumps(state))
+            trader.save_state = lambda _state: None
+            trader.record_equity = lambda _state: False
             trader._sync_trades_to_db = lambda _rows: False
             trader._sync_decision_to_db = lambda _row: True
-            executed = trader.check_auto_exits(
-                state,
-                datetime(2026, 6, 24, 9, 37),
+            _saved_state, executed, persistence = (
+                trader._commit_refreshed_auto_exits(
+                    state,
+                    trader._auto_exit_refresh_baseline(state),
+                    datetime(2026, 6, 24, 9, 37),
+                )
             )
-            persistence = trader._pop_auto_exit_persistence_status(state)
         finally:
             for name, value in originals.items():
                 setattr(trader, name, value)
@@ -2925,12 +3964,25 @@ class SellStrategyRuleTests(unittest.TestCase):
             "refresh_realtime_prices": trader.refresh_realtime_prices,
             "refresh_position_intraday": trader.refresh_position_intraday,
             "_refresh_position_bbi": trader._refresh_position_bbi,
+            "load_state": trader.load_state,
+            "save_state": trader.save_state,
+            "record_equity": trader.record_equity,
+            "_sync_trades_to_db": trader._sync_trades_to_db,
+            "_sync_positions_to_db": trader._sync_positions_to_db,
+            "_sync_decision_to_db": trader._sync_decision_to_db,
         }
         try:
             os.environ[trader.ACTIVE_STRATEGY_ENV] = "sector_tide"
             trader.refresh_realtime_prices = lambda _state: {}
             trader.refresh_position_intraday = lambda _state: {}
             trader._refresh_position_bbi = lambda _state, _dt=None: None
+            canonical_snapshot = json.loads(json.dumps(state))
+            trader.load_state = lambda: json.loads(json.dumps(canonical_snapshot))
+            trader.save_state = lambda _state: None
+            trader.record_equity = lambda _state: False
+            trader._sync_trades_to_db = lambda _trades: True
+            trader._sync_positions_to_db = lambda _state: True
+            trader._sync_decision_to_db = lambda _decision: True
 
             executed = trader.run_position_exit_checks_before_decision(
                 state,
@@ -3214,6 +4266,143 @@ class SellStrategyRuleTests(unittest.TestCase):
             [point["time"] for point in state["equity_history"]],
             ["2026-07-17 14:59:00", "2026-07-17 15:00:00"],
         )
+
+    def test_session_equity_heartbeat_refreshes_today_sold_quotes(self):
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 7, 17, 10, 1, 1)
+
+        state = {
+            "initial_cash": 100000.0,
+            "cash": 110000.0,
+            "positions": {},
+            "trade_log": [{
+                "time": "2026-07-17 10:00:30",
+                "action": "SELL",
+                "code": "600000",
+                "name": "测试股",
+                "shares": 1000,
+                "price": 10.0,
+                "amount": 10000.0,
+                "net_proceeds": 9990.0,
+                "fee": 10.0,
+                "pnl": 990.0,
+            }],
+            "decision_log": [],
+            "equity_history": [{
+                "time": "2026-07-17 10:00:00",
+                "equity": 110000.0,
+                "cash": 110000.0,
+                "market_value": 0.0,
+                "pnl_pct": 10.0,
+            }],
+            "daily_equity_history": [],
+        }
+        quote_calls = []
+        fake_db = types.ModuleType("niuniu_db")
+        fake_db.record_daily_equity = lambda _point: None
+        original_db = sys.modules.get("niuniu_db")
+        originals = {
+            "datetime": trader.datetime,
+            "is_a_share_trading_day": trader.is_a_share_trading_day,
+            "load_state": trader.load_state,
+            "save_state": trader.save_state,
+            "refresh_realtime_prices": trader.refresh_realtime_prices,
+            "fetch_realtime_quotes": trader.fetch_realtime_quotes,
+        }
+        try:
+            sys.modules["niuniu_db"] = fake_db
+            trader.datetime = FixedDateTime
+            trader.is_a_share_trading_day = lambda dt=None: True
+            trader.load_state = lambda: state
+            trader.save_state = lambda _state: None
+            trader.refresh_realtime_prices = lambda _state: {}
+
+            def fetch_quotes(codes):
+                quote_calls.append(list(codes))
+                return ({
+                    "600000": {
+                        "code": "600000",
+                        "name": "测试股",
+                        "price": 10.5,
+                        "change_pct": 2.0,
+                        "quote_time": "2026-07-17 10:01:00",
+                        "source": "test",
+                    }
+                }, {})
+
+            trader.fetch_realtime_quotes = fetch_quotes
+            self.assertTrue(trader.maybe_record_session_equity_heartbeat())
+        finally:
+            for name, value in originals.items():
+                setattr(trader, name, value)
+            if original_db is None:
+                sys.modules.pop("niuniu_db", None)
+            else:
+                sys.modules["niuniu_db"] = original_db
+
+        self.assertEqual(quote_calls, [["600000"]])
+        self.assertEqual(state["today_sold_stocks"][0]["current_price"], 10.5)
+        self.assertEqual(state["today_sold_stocks"][0]["after_sell_pnl"], 500.0)
+        self.assertEqual(state["today_sold_quote_refresh"]["updated"], 1)
+
+    def test_sold_quote_snapshot_preserves_concurrent_sell(self):
+        fetched_state = {
+            "today_sold_stocks": [{
+                "code": "600000",
+                "name": "先卖出的股票",
+                "last_sell_time": "2026-07-17 10:00:00",
+                "current_price": 10.5,
+                "current_change_pct": 2.0,
+                "quote_time": "2026-07-17 10:01:00",
+                "quote_source": "test",
+            }],
+            "today_sold_quote_refresh": {
+                "quote_time": "2026-07-17 10:01:00",
+                "updated": 1,
+            },
+        }
+        state = {
+            "trade_log": [
+                {
+                    "time": "2026-07-17 10:00:00",
+                    "action": "SELL",
+                    "code": "600000",
+                    "name": "先卖出的股票",
+                    "shares": 1000,
+                    "price": 10.0,
+                    "amount": 10000.0,
+                    "net_proceeds": 9990.0,
+                    "fee": 10.0,
+                    "pnl": 990.0,
+                },
+                {
+                    "time": "2026-07-17 10:01:01",
+                    "action": "SELL",
+                    "code": "600001",
+                    "name": "并发卖出的股票",
+                    "shares": 1000,
+                    "price": 20.0,
+                    "amount": 20000.0,
+                    "net_proceeds": 19990.0,
+                    "fee": 10.0,
+                    "pnl": 1990.0,
+                },
+            ]
+        }
+
+        trader.apply_today_sold_quote_snapshot(
+            state,
+            fetched_state,
+            today="2026-07-17",
+        )
+
+        rows_by_code = {row["code"]: row for row in state["today_sold_stocks"]}
+        self.assertEqual(set(rows_by_code), {"600000", "600001"})
+        self.assertEqual(rows_by_code["600000"]["current_price"], 10.5)
+        self.assertIsNone(rows_by_code["600001"]["current_price"])
+        self.assertEqual(len(state["trade_log"]), 2)
 
     def test_post_close_snapshot_persists_account_mark_without_trading(self):
         class ClosingSnapshotDateTime(datetime):
@@ -4204,6 +5393,321 @@ class SellStrategyRuleTests(unittest.TestCase):
         self.assertIsNotNone(signal)
         self.assertEqual(signal["signal"], "sell_score_reduce")
         self.assertEqual(signal["sell_ratio"], trader.TAKE_PROFIT_PARTIAL_RATIO)
+
+    def test_soft_exit_score_veto_then_reduce_and_confirm_runner_exit(self):
+        pos = {
+            "qty": 1000,
+            "avg_cost": 10.0,
+            "last_price": 9.9,
+            "max_pnl_pct": 0.2,
+            "sell_score": 5,
+            "sell_score_reason": "趋势仍完整",
+            "buy_date_lots": {"2026-06-19": 1000},
+        }
+
+        vetoed = trader.evaluate_sell_signal("600000", pos, "2026-06-24")
+        reduced = trader.evaluate_sell_signal("600000", pos, "2026-06-25")
+        pos["soft_exit_reduced"] = True
+        confirmed = trader.evaluate_sell_signal("600000", pos, "2026-06-26")
+
+        self.assertIsNone(vetoed)
+        self.assertEqual(reduced["soft_exit_stage"], "reduce")
+        self.assertEqual(reduced["sell_ratio"], 0.5)
+        self.assertEqual(confirmed["soft_exit_stage"], "exit")
+        self.assertEqual(confirmed["sell_ratio"], 1.0)
+
+    def test_active_feedback_policy_changes_only_staged_soft_exit_parameters(self):
+        pos = {
+            "qty": 1000,
+            "avg_cost": 10.0,
+            "last_price": 9.9,
+            "max_pnl_pct": 0.2,
+            "sell_score": 2,
+            "buy_date_lots": {"2026-06-19": 1000},
+        }
+        policy = {
+            "enabled": True,
+            "version": 4,
+            "parameters": {
+                "soft_exit_confirmations": 3,
+                "soft_exit_reduce_ratio": 0.25,
+                "replacement_priority_margin": 4.0,
+                "reentry_volume_ratio": 0.9,
+                "reentry_amount_percentile": 55.0,
+            },
+        }
+
+        signal = trader.evaluate_sell_signal(
+            "600000",
+            pos,
+            "2026-06-24",
+            exit_feedback_policy=policy,
+        )
+
+        self.assertEqual(signal["soft_exit_stage"], "reduce")
+        self.assertEqual(signal["sell_ratio"], 0.25)
+        self.assertEqual(signal["soft_exit_confirmations_required"], 3)
+        self.assertEqual(signal["exit_feedback_policy_version"], 4)
+
+    def test_soft_exit_reduction_does_not_masquerade_as_profit_taking(self):
+        state = {
+            "cash": 0.0,
+            "positions": {
+                "600000": {
+                    "code": "600000",
+                    "name": "测试股",
+                    "qty": 1000,
+                    "avg_cost": 10.0,
+                    "last_price": 9.9,
+                    "max_pnl_pct": 0.2,
+                    "sell_score": 2,
+                    "buy_date_lots": {"2026-06-19": 1000},
+                }
+            },
+            "trade_log": [],
+            "decision_log": [],
+        }
+
+        executed = trader.check_auto_exits(
+            state,
+            datetime(2026, 6, 24, 14, 45),
+        )
+
+        self.assertEqual(len(executed), 1)
+        self.assertEqual(executed[0]["soft_exit_stage"], "reduce")
+        self.assertEqual(executed[0]["position_before_qty"], 1000)
+        self.assertEqual(executed[0]["position_after_qty"], 500)
+        self.assertTrue(state["positions"]["600000"]["soft_exit_reduced"])
+        self.assertNotIn("partial_tp_done", state["positions"]["600000"])
+
+    def test_one_lot_soft_exit_waits_for_confirmation_instead_of_selling_all(self):
+        state = {
+            "cash": 0.0,
+            "positions": {
+                "600000": {
+                    "code": "600000",
+                    "name": "测试股",
+                    "qty": 100,
+                    "avg_cost": 10.0,
+                    "last_price": 9.9,
+                    "max_pnl_pct": 0.2,
+                    "sell_score": 2,
+                    "buy_date_lots": {"2026-06-19": 100},
+                }
+            },
+            "trade_log": [],
+            "decision_log": [],
+        }
+
+        first = trader.check_auto_exits(
+            state,
+            datetime(2026, 6, 24, 14, 45),
+        )
+        second = trader.check_auto_exits(
+            state,
+            datetime(2026, 6, 25, 14, 45),
+        )
+
+        self.assertEqual(first, [])
+        self.assertEqual(len(second), 1)
+        self.assertEqual(second[0]["soft_exit_stage"], "exit")
+        self.assertNotIn("600000", state["positions"])
+        self.assertTrue(second[0]["post_exit_reentry_watch_created"])
+
+    def test_hard_structure_stop_is_not_vetoed_by_high_sell_score(self):
+        signal = trader.evaluate_sell_signal(
+            "600000",
+            {
+                "qty": 1000,
+                "avg_cost": 10.0,
+                "last_price": 9.4,
+                "sell_score": 5,
+                "entry_stop_price": 9.5,
+                "entry_stop_source": "n_structure_low",
+                "buy_date_lots": {"2026-06-19": 1000},
+            },
+            "2026-06-24",
+        )
+
+        self.assertEqual(signal["signal"], "shaofu_entry_stop")
+        self.assertEqual(signal["sell_ratio"], 1.0)
+
+    def test_recent_soft_exit_reentry_requires_reclaim_volume_and_thesis(self):
+        state = {
+            "post_exit_reentry_watch": {
+                "600000": {
+                    "exit_date": "2026-06-23",
+                    "exit_price": 10.0,
+                    "exit_high": 10.4,
+                    "exit_bbi": 10.2,
+                    "active_theme": "机器人",
+                    "expires_after_sessions": 5,
+                }
+            }
+        }
+        candidate = {
+            "signal_theme": "机器人",
+            "mainline_state": "mainline",
+            "volume_ratio": 1.2,
+        }
+
+        blocker, blocked_audit = trader.post_exit_reentry_audit(
+            state,
+            "600000",
+            candidate,
+            price=10.3,
+            today="2026-06-24",
+        )
+        allowed, allowed_audit = trader.post_exit_reentry_audit(
+            state,
+            "600000",
+            candidate,
+            price=10.5,
+            today="2026-06-24",
+        )
+
+        self.assertIn("尚未站回", blocker)
+        self.assertFalse(blocked_audit["eligible"])
+        self.assertEqual(allowed, "")
+        self.assertTrue(allowed_audit["eligible"])
+
+    def test_feedback_policy_can_lower_reentry_volume_gate_one_bounded_step(self):
+        original = trader.os.environ.get("DASHBOARD_EXIT_FEEDBACK_AUTO_TUNE_ENABLED")
+        trader.os.environ["DASHBOARD_EXIT_FEEDBACK_AUTO_TUNE_ENABLED"] = "1"
+        try:
+            state = {
+                "exit_feedback_policy": {
+                    "enabled": True,
+                    "version": 5,
+                    "parameters": {
+                        "soft_exit_confirmations": 3,
+                        "soft_exit_reduce_ratio": 0.25,
+                        "replacement_priority_margin": 4.0,
+                        "reentry_volume_ratio": 0.9,
+                        "reentry_amount_percentile": 55.0,
+                    },
+                },
+                "post_exit_reentry_watch": {
+                    "600000": {
+                        "exit_date": "2026-06-23",
+                        "exit_price": 10.0,
+                        "exit_high": 10.4,
+                        "exit_bbi": 10.2,
+                        "active_theme": "机器人",
+                        "expires_after_sessions": 5,
+                    }
+                },
+            }
+            blocker, audit = trader.post_exit_reentry_audit(
+                state,
+                "600000",
+                {
+                    "signal_theme": "机器人",
+                    "mainline_state": "mainline",
+                    "volume_ratio": 0.95,
+                },
+                price=10.5,
+                today="2026-06-24",
+            )
+        finally:
+            if original is None:
+                trader.os.environ.pop("DASHBOARD_EXIT_FEEDBACK_AUTO_TUNE_ENABLED", None)
+            else:
+                trader.os.environ["DASHBOARD_EXIT_FEEDBACK_AUTO_TUNE_ENABLED"] = original
+
+        self.assertEqual(blocker, "")
+        self.assertTrue(audit["eligible"])
+        self.assertEqual(audit["required_volume_ratio"], 0.9)
+        self.assertEqual(audit["exit_feedback_policy_version"], 5)
+
+    def test_exit_feedback_auto_tune_defaults_on_and_accepts_override(self):
+        name = "DASHBOARD_EXIT_FEEDBACK_AUTO_TUNE_ENABLED"
+        original = trader.os.environ.pop(name, None)
+        try:
+            self.assertTrue(trader.exit_feedback_auto_tune_config()["enabled"])
+            trader.os.environ[name] = "0"
+            self.assertFalse(trader.exit_feedback_auto_tune_config()["enabled"])
+            trader.os.environ[name] = "1"
+            self.assertTrue(trader.exit_feedback_auto_tune_config()["enabled"])
+        finally:
+            if original is None:
+                trader.os.environ.pop(name, None)
+            else:
+                trader.os.environ[name] = original
+
+    def test_feedback_policy_is_observable_before_first_post_close_review(self):
+        name = "DASHBOARD_EXIT_FEEDBACK_AUTO_TUNE_ENABLED"
+        original = trader.os.environ.pop(name, None)
+        try:
+            policy = trader.current_exit_feedback_policy({
+                "exit_feedback_policy": {"enabled": False},
+            })
+
+            self.assertTrue(policy["enabled"])
+            self.assertEqual(policy["version"], 0)
+            self.assertEqual(policy["status"], "learning")
+            self.assertEqual(policy["action"], "awaiting_first_review")
+            self.assertIn("首次盘后复盘", policy["reason"])
+
+            trader.os.environ[name] = "0"
+            disabled = trader.current_exit_feedback_policy({
+                "exit_feedback_policy": {
+                    "enabled": True,
+                    "status": "active",
+                    "parameters": {"soft_exit_confirmations": 3},
+                },
+            })
+            self.assertFalse(disabled["enabled"])
+            self.assertEqual(disabled["status"], "disabled")
+            self.assertEqual(
+                disabled["parameters"],
+                trader.effective_exit_feedback_parameters({"enabled": False}),
+            )
+        finally:
+            if original is None:
+                trader.os.environ.pop(name, None)
+            else:
+                trader.os.environ[name] = original
+
+    def test_stale_json_policy_reconciles_from_active_sqlite_version(self):
+        original_env = trader.os.environ.get(
+            "DASHBOARD_EXIT_FEEDBACK_AUTO_TUNE_ENABLED"
+        )
+        original_module = sys.modules.get("niuniu_db")
+        trader.os.environ["DASHBOARD_EXIT_FEEDBACK_AUTO_TUNE_ENABLED"] = "1"
+        sys.modules["niuniu_db"] = types.SimpleNamespace(
+            query_active_exit_feedback_policy=lambda: {
+                "active": True,
+                "enabled": True,
+                "version": 7,
+                "parameters": {
+                    "soft_exit_confirmations": 3,
+                    "soft_exit_reduce_ratio": 0.25,
+                    "replacement_priority_margin": 4.0,
+                    "reentry_volume_ratio": 1.0,
+                    "reentry_amount_percentile": 60.0,
+                },
+            }
+        )
+        state = {"exit_feedback_policy": {"enabled": True, "version": 6}}
+        try:
+            trader._reconcile_exit_feedback_policy_from_db(state)
+        finally:
+            if original_env is None:
+                trader.os.environ.pop(
+                    "DASHBOARD_EXIT_FEEDBACK_AUTO_TUNE_ENABLED",
+                    None,
+                )
+            else:
+                trader.os.environ[
+                    "DASHBOARD_EXIT_FEEDBACK_AUTO_TUNE_ENABLED"
+                ] = original_env
+            if original_module is None:
+                sys.modules.pop("niuniu_db", None)
+            else:
+                sys.modules["niuniu_db"] = original_module
+
+        self.assertEqual(state["exit_feedback_policy"]["version"], 7)
 
     def test_luzhu_signal_reduces_half(self):
         pos = {

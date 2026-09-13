@@ -1,0 +1,3408 @@
+/* Classic Tongdaxin terminal theme: dense black canvas, grey headers and red chart grids. */
+html[data-theme="tongdaxin"]:root {
+  color-scheme:dark;
+  scrollbar-gutter:stable;
+  --bg:#000;
+  --panel:#000;
+  --panel2:#050505;
+  --surface:#000;
+  --surface2:#050505;
+  --field:#000;
+  --text:#c8c8c8;
+  --muted:#898989;
+  --soft:#b5b5b5;
+  --line:#730000;
+  --line2:#a00000;
+  --accent:#d40000;
+  --accent-soft:#270000;
+  --accent-border:#ac1616;
+  --accent-text:#f0df00;
+  --primary:#a80000;
+  --primary-text:#fff;
+  --green:#00dfe8;
+  --green-soft:#001f22;
+  --green-border:#007b82;
+  --green-text:#21eff6;
+  --red:#ff4141;
+  --red-soft:#2b0000;
+  --red-border:#9e0000;
+  --red-text:#ff5555;
+  --yellow:#e8df00;
+  --yellow-soft:#252300;
+  --yellow-border:#7e7900;
+  --yellow-text:#fff200;
+  --danger-button-bg:#940000;
+  --danger-button-hover:#bd0000;
+  --danger-button-border:#e03535;
+  --danger-button-text:#fff;
+  --terminal-header:#292929;
+  --terminal-header-deep:#181818;
+  --terminal-row:#050505;
+  --terminal-row-alt:#0d0d0d;
+  --terminal-selection:#07155c;
+  --terminal-selection-border:#2949ff;
+  --terminal-grid:#b40000;
+  --terminal-orange:#ff9000;
+  --terminal-magenta:#ff00ff;
+  --terminal-button-bg:#202020;
+  --terminal-button-bg-hover:#292929;
+  --terminal-button-bg-pressed:#111;
+  --terminal-button-border-light:#5b5b5b;
+  --terminal-button-border-dark:#080808;
+  --terminal-button-text:#d8d8d8;
+  --terminal-button-accent:#fff200;
+  --chart-grid:rgba(205,0,0,.68);
+  --chart-grid-soft:rgba(180,0,0,.40);
+  --chart-zero:rgba(255,48,48,.76);
+  --chart-marker:#fff;
+  --terminal-page-title-height:38px;
+  --terminal-page-title-padding:6px 8px;
+  --terminal-page-title-size:16px;
+  --terminal-header-row-height:30px;
+  --terminal-header-control-height:24px;
+  --terminal-header-control-padding:4px 7px;
+  --terminal-header-meta-font-size:10px;
+  --terminal-header-action-gap:2px;
+  --page-shadow:none;
+}
+
+html[data-theme="tongdaxin"]:root body {
+  background:#000;
+  color:var(--text);
+  font-family:SimSun,"宋体","Songti SC",Tahoma,Arial,sans-serif;
+  font-size:12px;
+  font-variant-numeric:tabular-nums;
+  line-height:1.25;
+}
+
+html[data-theme="tongdaxin"]:root body * {
+  background-image:none !important;
+  border-radius:0 !important;
+  letter-spacing:0;
+  text-shadow:none;
+  transition:none !important;
+}
+html[data-theme="tongdaxin"]:root :where(
+  .practice-current-marker,
+  .practice-hover-marker,
+  .practice-trade-marker,
+  .benchmark-dot
+) { border-radius:50% !important; }
+html[data-theme="tongdaxin"]:root .theme-state::before { border-radius:50% !important; }
+html[data-theme="tongdaxin"]:root :where(button,input,select,textarea) { font-family:inherit; }
+html[data-theme="tongdaxin"]:root :where(
+  .inline-value,
+  .position-value,
+  .position-brief-item b,
+  .practice-kpi-value,
+  .index-price,
+  .sector-pct,
+  .market-metric-value,
+  .market-num,
+  .rating-table,
+  .backtest-table-wrap table
+) { font-family:Tahoma,Arial,sans-serif; }
+html[data-theme="tongdaxin"]:root a { color:var(--accent-text); }
+html[data-theme="tongdaxin"]:root ::selection { background:#890000; color:#fff; }
+html[data-theme="tongdaxin"]:root { scrollbar-color:#8e0000 #000; }
+html[data-theme="tongdaxin"]:root ::-webkit-scrollbar { width:12px; height:12px; }
+html[data-theme="tongdaxin"]:root ::-webkit-scrollbar-track {
+  border:1px solid #3f0000;
+  background:#080808;
+}
+html[data-theme="tongdaxin"]:root ::-webkit-scrollbar-thumb {
+  border:1px solid #8e0000;
+  background:#333;
+  box-shadow:inset 1px 1px 0 #4d4d4d,inset -1px -1px 0 #111;
+}
+html[data-theme="tongdaxin"]:root ::-webkit-scrollbar-corner { background:#000; }
+
+html[data-theme="tongdaxin"]:root .theme-icon-sun { display:none; }
+html[data-theme="tongdaxin"]:root .theme-icon-moon { display:inline-flex; }
+
+/* Dashboard chrome */
+html[data-theme="tongdaxin"]:root header,
+html[data-theme="tongdaxin"]:root .admin-header {
+  border-color:var(--line2);
+  background:#0b0b0b;
+  box-shadow:inset 0 -1px 0 var(--line2);
+  backdrop-filter:none;
+}
+
+html[data-theme="tongdaxin"]:root header {
+  padding:3px max(clamp(6px,1vw,12px),calc((100vw - 1600px) / 2));
+}
+
+html[data-theme="tongdaxin"]:root .header-row {
+  min-height:var(--terminal-header-row-height);
+  gap:5px;
+}
+html[data-theme="tongdaxin"]:root h1 { font-size:17px; font-weight:700; letter-spacing:0; }
+html[data-theme="tongdaxin"]:root .dashboard-brand { gap:5px; color:#d8d8d8; }
+html[data-theme="tongdaxin"]:root .dashboard-brand-logo { width:23px; height:23px; }
+html[data-theme="tongdaxin"]:root .header-actions {
+  --header-control-height:var(--terminal-header-control-height) !important;
+  gap:var(--terminal-header-action-gap) !important;
+}
+
+html[data-theme="tongdaxin"]:root :where(
+  .settings-link,
+  .header-link,
+  .version-status,
+  .refresh-pill,
+  .theme-toggle,
+  .toplink,
+  .admin-theme-toggle
+) {
+  border-color:#555 #090909 #090909 #555;
+  background:#202020;
+  color:#c4c4c4;
+  box-shadow:none !important;
+}
+
+html[data-theme="tongdaxin"]:root :where(.settings-link,.header-link,.toplink) { color:#c4c4c4; }
+html[data-theme="tongdaxin"]:root :where(.settings-link,.header-link,.version-status,.refresh-pill,.toplink) {
+  gap:3px;
+  padding:var(--terminal-header-control-padding) !important;
+  font-size:11px;
+}
+html[data-theme="tongdaxin"]:root :where(.version-status,.refresh-pill) :where(span,b) {
+  font-size:var(--terminal-header-meta-font-size) !important;
+  line-height:1 !important;
+}
+html[data-theme="tongdaxin"]:root :where(.version-status,.refresh-pill) span { color:#888; }
+html[data-theme="tongdaxin"]:root :where(.version-status,.refresh-pill) b { color:#e3e3e3; }
+html[data-theme="tongdaxin"]:root :where(
+  .settings-link,
+  .header-link,
+  .version-status,
+  .theme-toggle,
+  .toplink,
+  .admin-theme-toggle
+):hover {
+  border-color:#e00000;
+  background:#2b0000;
+  color:#fff200;
+}
+
+html[data-theme="tongdaxin"]:root .category-tabs {
+  width:100%;
+  margin-top:2px;
+  gap:2px;
+  padding:1px;
+  border-color:var(--line2);
+  background:#000;
+  box-shadow:none;
+}
+
+html[data-theme="tongdaxin"]:root .tab {
+  justify-content:center;
+  min-height:22px;
+  border-color:transparent;
+  border-right:1px solid var(--line);
+  padding:2px 9px;
+  background:transparent;
+  color:#aaa;
+  font-size:12px;
+}
+
+html[data-theme="tongdaxin"]:root .tab + .tab::before { display:none; }
+html[data-theme="tongdaxin"]:root .tab:hover { background:#210000; color:#fff200; }
+html[data-theme="tongdaxin"]:root .tab.active {
+  border-color:#ef2020;
+  background:#a80000;
+  color:#fff;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.12);
+}
+
+@media(min-width:721px) {
+  html[data-theme="tongdaxin"]:root .category-tabs { margin-top:4px; padding:2px; }
+  html[data-theme="tongdaxin"]:root .tab { min-height:30px; padding:5px 11px; font-size:13px; }
+}
+
+html[data-theme="tongdaxin"]:root main {
+  padding:3px max(clamp(3px,.8vw,8px),calc((100vw - 1600px) / 2)) 10px;
+}
+
+html[data-theme="tongdaxin"]:root .feed,
+html[data-theme="tongdaxin"]:root .indices-page,
+html[data-theme="tongdaxin"]:root .overview-page,
+html[data-theme="tongdaxin"]:root .mainline-page { gap:4px; }
+
+html[data-theme="tongdaxin"]:root :where(
+  .card,
+  .sector-cloud,
+  .market-breadth-card,
+  .market-monitor-card,
+  .us-market-summary-card,
+  .market-detail-overview,
+  .market-section,
+  .practice-log-panel,
+  .practice-chart-card,
+  .rating-card,
+  .rating-table-wrap,
+  .practice-log-detail-card,
+  .practice-rule-card,
+  .practice-calendar-card,
+  .practice-calendar-day-curve,
+  .dragon-tiger-unavailable,
+  .mainline-hero,
+  .theme-ranking-panel
+) {
+  border-color:var(--line);
+  background:var(--panel);
+  box-shadow:none;
+}
+
+html[data-theme="tongdaxin"]:root .card,
+html[data-theme="tongdaxin"]:root .sector-cloud { padding:5px; }
+
+html[data-theme="tongdaxin"]:root :where(
+  .sector-item,
+  .hot-item,
+  .index-card,
+  .market-metric-item,
+  .inline-field,
+  .position-card,
+  .position-brief-card,
+  .practice-log-row,
+  .practice-kpi,
+  .rating-inline-grid .inline-field,
+  .dragon-tiger-detail-meta,
+  .dragon-tiger-seat-side,
+  .dragon-tiger-detail-record,
+  .mainline-summary-card,
+  .theme-stock-detail-row
+) {
+  border-color:var(--line);
+  background:var(--panel2);
+  box-shadow:none;
+}
+
+html[data-theme="tongdaxin"]:root :where(
+  .market-card-head,
+  .market-section-head,
+  .practice-log-head,
+  .practice-log-detail-head,
+  .practice-rule-head,
+  .practice-calendar-head,
+  .rating-table th,
+  .rating-table-title,
+  .dragon-tiger-head,
+  .dragon-tiger-list-head,
+  .theme-ranking-head
+) {
+  border-color:var(--line);
+  background:var(--terminal-header);
+  color:#e3e3e3;
+}
+
+html[data-theme="tongdaxin"]:root :where(
+  .market-card-head,
+  .practice-log-head,
+  .practice-log-detail-head,
+  .practice-rule-head,
+  .practice-calendar-head,
+  .rating-table-title,
+  .dragon-tiger-head,
+  .theme-ranking-head
+) { padding:7px 9px; }
+
+html[data-theme="tongdaxin"]:root .market-section-head { padding:5px 8px; }
+
+/* Route title bars share the overview command bar geometry. */
+html[data-theme="tongdaxin"]:root .dragon-tiger-panel {
+  padding:0;
+}
+
+html[data-theme="tongdaxin"]:root :where(
+  .overview-command-head,
+  .practice-account-head,
+  .mainline-heading,
+  .indices-part-head,
+  .dragon-tiger-head,
+  .rating-table-title
+) {
+  box-sizing:border-box;
+  width:100%;
+  flex:0 0 var(--terminal-page-title-height) !important;
+  height:var(--terminal-page-title-height) !important;
+  min-height:var(--terminal-page-title-height) !important;
+  padding:var(--terminal-page-title-padding) !important;
+  align-items:center;
+  overflow:hidden;
+}
+
+html[data-theme="tongdaxin"]:root :where(
+  .overview-command-head h2,
+  .practice-account-head h3,
+  .mainline-heading h2,
+  .indices-part-title,
+  .dragon-tiger-head h2,
+  .rating-table-title
+) {
+  margin:0;
+  font-size:var(--terminal-page-title-size) !important;
+  line-height:1.2;
+  font-weight:700;
+  white-space:nowrap;
+}
+
+html[data-theme="tongdaxin"]:root :where(
+  .mainline-heading > div:first-child,
+  .dragon-tiger-head > div:first-child
+) {
+  display:flex;
+  min-width:0;
+  align-items:baseline;
+  gap:10px;
+}
+
+html[data-theme="tongdaxin"]:root :where(
+  .mainline-heading p,
+  .dragon-tiger-sub
+) {
+  min-width:0;
+  margin:0;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+
+html[data-theme="tongdaxin"]:root :where(
+  .practice-account-head,
+  .mainline-heading,
+  .indices-part-head,
+  .dragon-tiger-head,
+  .rating-table-title
+) { padding:var(--terminal-page-title-padding); }
+
+html[data-theme="tongdaxin"]:root :where(.sector-item,.hot-item) { padding:6px; }
+html[data-theme="tongdaxin"]:root .index-card { min-width:124px; padding:7px 9px; }
+html[data-theme="tongdaxin"]:root .market-metric-item { padding:5px 6px; }
+
+/* Flat, compact Windows-era terminal chrome. */
+html[data-theme="tongdaxin"]:root :where(
+  .practice-manual-cycle-btn,
+  .practice-market-summary-btn,
+  .practice-market-summary-view-btn,
+  .practice-calendar-open-btn,
+  .practice-rule-btn,
+  .mainline-actions button,
+  .dragon-tiger-unavailable a,
+  .dragon-tiger-date-controls button
+) {
+  min-height:22px;
+  border-color:#5b5b5b #080808 #080808 #5b5b5b;
+  padding:2px 7px;
+  background:#202020;
+  color:#d8d8d8;
+  box-shadow:inset 1px 1px 0 #383838,inset -1px -1px 0 #000;
+  font-size:12px;
+  font-weight:400;
+  transform:none;
+}
+
+html[data-theme="tongdaxin"]:root :where(
+  .practice-manual-cycle-btn,
+  .practice-market-summary-btn,
+  .practice-market-summary-view-btn,
+  .practice-calendar-open-btn,
+  .practice-rule-btn,
+  .mainline-actions button,
+  .dragon-tiger-unavailable a,
+  .dragon-tiger-date-controls button
+):hover:not(:disabled) {
+  border-color:#777 #111 #111 #777;
+  background:#292929;
+  color:#fff200;
+  transform:none;
+}
+
+html[data-theme="tongdaxin"]:root .sector-cloud { margin-bottom:4px !important; }
+html[data-theme="tongdaxin"]:root .practice-account-head {
+  margin:-5px -5px 4px;
+  border-bottom:1px solid var(--line2);
+  background:var(--terminal-header);
+}
+html[data-theme="tongdaxin"]:root .practice-account-head h3 {
+  color:#e0e0e0;
+}
+html[data-theme="tongdaxin"]:root .practice-account-actions { gap:3px; }
+html[data-theme="tongdaxin"]:root .practice-data-readiness {
+  margin:3px 0;
+  padding:5px 7px;
+  border-color:#777000;
+  background:#171700;
+  font-size:11px;
+}
+html[data-theme="tongdaxin"]:root .practice-data-readiness p { margin-top:3px; }
+html[data-theme="tongdaxin"]:root .practice-data-progress { height:3px; margin-top:4px; background:#3a3a00; }
+html[data-theme="tongdaxin"]:root .practice-stats {
+  gap:1px !important;
+  margin:3px 0 !important;
+  border:1px solid var(--line);
+  background:var(--line);
+}
+html[data-theme="tongdaxin"]:root .practice-stats .inline-field {
+  min-height:42px;
+  border:0;
+  padding:4px 6px;
+  background:#050505;
+}
+html[data-theme="tongdaxin"]:root .inline-label { margin-bottom:1px; font-size:11px; font-weight:400; }
+html[data-theme="tongdaxin"]:root .inline-value { font-size:14px; line-height:1.25; font-weight:700; }
+
+html[data-theme="tongdaxin"]:root .practice-chart-card {
+  margin:4px 0;
+  padding:0;
+  border-color:var(--line2);
+}
+html[data-theme="tongdaxin"]:root .practice-chart-head {
+  min-height:29px;
+  margin:0;
+  padding:3px 5px;
+  border-bottom:1px solid var(--line);
+  background:var(--terminal-header-deep);
+}
+html[data-theme="tongdaxin"]:root .practice-chart-title-row { gap:5px; }
+html[data-theme="tongdaxin"]:root .practice-chart-title { color:#e3e3e3; font-size:12px; font-weight:700; }
+html[data-theme="tongdaxin"]:root .practice-chart-sub { margin-top:1px; font-size:10px; }
+html[data-theme="tongdaxin"]:root .practice-chart-kpis { gap:1px; }
+html[data-theme="tongdaxin"]:root .practice-kpi {
+  min-width:88px;
+  padding:3px 5px;
+  border-color:var(--line);
+  background:#000;
+}
+html[data-theme="tongdaxin"]:root .practice-kpi-label { color:#9a9a9a; font-size:10px; font-weight:400; }
+html[data-theme="tongdaxin"]:root .practice-kpi-value { margin-top:1px; font-size:13px; }
+html[data-theme="tongdaxin"]:root .practice-mode-control { gap:0; padding:0; }
+html[data-theme="tongdaxin"]:root .practice-mode-btn { min-height:20px; padding:2px 6px; font-weight:400; }
+html[data-theme="tongdaxin"]:root .practice-mode-btn.active {
+  border:1px solid #d00000;
+  background:#850000;
+  color:#fff;
+}
+html[data-theme="tongdaxin"]:root .benchmark-toggle { padding:2px 5px; color:#d0d0d0; }
+html[data-theme="tongdaxin"]:root .practice-chart-wrap { height:200px; margin:0 4px; }
+
+html[data-theme="tongdaxin"]:root .practice-positions-section { margin-top:4px; }
+html[data-theme="tongdaxin"]:root .practice-position-bar {
+  min-height:24px;
+  margin-bottom:2px;
+  padding:2px 4px;
+  border:1px solid var(--line);
+  background:var(--terminal-header);
+}
+html[data-theme="tongdaxin"]:root .practice-position-heading-copy h4 { font-size:12px; font-weight:700; }
+html[data-theme="tongdaxin"]:root .practice-position-context,
+html[data-theme="tongdaxin"]:root .practice-position-toolbar { gap:3px; }
+html[data-theme="tongdaxin"]:root .position-card-list { gap:1px; margin-bottom:4px; }
+html[data-theme="tongdaxin"]:root .position-card {
+  padding:4px 5px;
+  border-color:var(--line);
+  background:#000;
+}
+html[data-theme="tongdaxin"]:root .position-card > div:first-child {
+  min-height:20px;
+  margin-bottom:2px !important;
+  padding:1px 3px 3px;
+  border-bottom:1px solid var(--line);
+  background:#151515;
+}
+html[data-theme="tongdaxin"]:root .position-card > div:first-child > span:first-child {
+  color:#e0e0e0 !important;
+  font-size:13px !important;
+  font-weight:700 !important;
+}
+html[data-theme="tongdaxin"]:root .position-card > div:first-child > span:last-child { font-size:11px !important; }
+html[data-theme="tongdaxin"]:root .position-metrics {
+  grid-template-columns:repeat(8,minmax(78px,1fr));
+  gap:0;
+  border:1px solid #3f0000;
+}
+html[data-theme="tongdaxin"]:root .position-metric { min-height:36px; padding:3px 5px; }
+html[data-theme="tongdaxin"]:root .position-metric + .position-metric { border-left:1px solid #3f0000; }
+html[data-theme="tongdaxin"]:root .position-label { color:#929292; font-size:10px; }
+html[data-theme="tongdaxin"]:root .position-value { margin-top:1px; color:#d0d0d0; font-size:12px; }
+html[data-theme="tongdaxin"]:root .position-reason-block {
+  margin-top:2px;
+  gap:2px;
+  padding:3px 5px;
+  border-top:1px solid #3f0000;
+  background:#050505;
+  font-size:11px;
+  line-height:1.35;
+}
+html[data-theme="tongdaxin"]:root .position-reason-text { color:#b8b8b8; }
+html[data-theme="tongdaxin"]:root .empty { padding:14px 8px !important; border-color:#520000; background:#000; }
+html[data-theme="tongdaxin"]:root .practice-log-panel { margin-top:4px; }
+html[data-theme="tongdaxin"]:root .practice-log-head { padding:4px 6px; }
+html[data-theme="tongdaxin"]:root .practice-log-scroll { padding:3px; gap:1px; }
+html[data-theme="tongdaxin"]:root .practice-log-row { padding:4px 6px; }
+
+html[data-theme="tongdaxin"]:root :where(
+  .sector-name,
+  .index-name,
+  .index-head,
+  .indices-part-title,
+  .market-card-title,
+  .market-metric-value,
+  .market-section-title,
+  .market-detail-line,
+  .market-flow-value,
+  .market-symbol,
+  .us-market-title,
+  .market-day-title,
+  .inline-value,
+  .position-value,
+  .position-brief-name,
+  .practice-log-title,
+  .practice-log-summary,
+  .practice-rule-title,
+  .practice-rule-body,
+  .practice-chart-title,
+  .practice-kpi-value,
+  .practice-calendar-title,
+  .rating-table-title,
+  .rating-table .ticker,
+  .dragon-tiger-head h2,
+  .dragon-tiger-item > summary,
+  .dragon-tiger-list-name
+) { color:var(--text); }
+
+html[data-theme="tongdaxin"]:root :where(
+  .indices-part-meta,
+  .index-time,
+  .market-card-time,
+  .market-day-sub,
+  .us-market-sub,
+  .practice-log-count,
+  .practice-log-detail,
+  .practice-rule-meta,
+  .position-label,
+  .inline-label,
+  .rating-table-title small,
+  .rating-table .muted,
+  .dragon-tiger-sub,
+  .dragon-tiger-foot
+) { color:var(--muted); }
+
+html[data-theme="tongdaxin"]:root :where(input,select,textarea,button) {
+  border-color:var(--line2);
+  background:var(--field);
+  color:var(--text);
+}
+
+html[data-theme="tongdaxin"]:root :where(.version-status,.theme-toggle) {
+  border-color:#555 #090909 #090909 #555;
+  background:#202020;
+}
+
+html[data-theme="tongdaxin"]:root :where(.version-status,.theme-toggle):hover {
+  border-color:#e00000;
+  background:#2b0000;
+  color:#fff200;
+}
+
+html[data-theme="tongdaxin"]:root :where(input,select,textarea):focus {
+  border-color:var(--accent);
+  outline-color:var(--accent);
+}
+
+html[data-theme="tongdaxin"]:root :where(
+  .indices-switch,
+  .market-region-switch,
+  .practice-mode-control,
+  .market-breadth-controls
+) {
+  border-color:var(--line);
+  background:#000;
+  box-shadow:none;
+}
+
+html[data-theme="tongdaxin"]:root :where(
+  .indices-switch-btn.active,
+  .market-region-btn.active,
+  .practice-mode-btn.active,
+  .market-breadth-toggle.active
+) {
+  border-color:var(--accent-border);
+  background:var(--accent-soft);
+  color:var(--accent-text);
+  box-shadow:none;
+}
+
+html[data-theme="tongdaxin"]:root :where(
+  .market-chip,
+  .market-section-count,
+  .benchmark-toggle,
+  .practice-log-badge,
+  .position-reason-badge
+) {
+  border-color:var(--line);
+  background:#050505;
+  color:#aaa;
+}
+
+html[data-theme="tongdaxin"]:root .market-section-count {
+  border:0;
+  border-left:1px solid var(--line);
+  padding:1px 0 1px 7px;
+  background:transparent;
+}
+html[data-theme="tongdaxin"]:root .market-detail-overview { padding:0; }
+html[data-theme="tongdaxin"]:root .market-mood-panel {
+  border-right:1px solid var(--line);
+  background:#050505;
+}
+html[data-theme="tongdaxin"]:root .market-metric-grid {
+  gap:1px;
+  background:var(--line);
+}
+html[data-theme="tongdaxin"]:root .market-metric-item { border:0; }
+
+/* Market monitor entries use the same compact grid as a quote terminal. */
+html[data-theme="tongdaxin"]:root .market-monitor-grid {
+  gap:1px;
+  border:1px solid var(--line2);
+  background:var(--line);
+}
+html[data-theme="tongdaxin"]:root .market-monitor-table-head {
+  display:grid;
+  grid-template-columns:minmax(145px,.8fr) 126px minmax(180px,1.3fr) minmax(260px,1.65fr) 48px 20px;
+  min-height:24px;
+  background:var(--terminal-header);
+  color:#c8c8c8;
+  font-size:11px;
+}
+html[data-theme="tongdaxin"]:root .market-monitor-table-head > span {
+  display:flex;
+  min-width:0;
+  align-items:center;
+  border-left:1px solid var(--line);
+  padding:3px 6px;
+}
+html[data-theme="tongdaxin"]:root .market-monitor-table-head > span:first-child { border-left:0; }
+html[data-theme="tongdaxin"]:root .market-monitor-card {
+  border:0;
+  background:var(--terminal-row);
+}
+html[data-theme="tongdaxin"]:root .market-monitor-card:nth-of-type(even) { background:var(--terminal-row-alt); }
+html[data-theme="tongdaxin"]:root .market-monitor-card:hover { border-color:transparent; background:#181818; }
+html[data-theme="tongdaxin"]:root .market-monitor-card.open { border-color:transparent; background:#000; }
+html[data-theme="tongdaxin"]:root .market-monitor-card .market-card-head {
+  display:grid;
+  grid-template-columns:minmax(145px,.8fr) 126px minmax(180px,1.3fr) minmax(260px,1.65fr) 48px 20px;
+  gap:0;
+  padding:0;
+  background:inherit;
+}
+html[data-theme="tongdaxin"]:root .market-monitor-card.open .market-card-head {
+  border-bottom:1px solid #2949ff;
+  background:var(--terminal-selection);
+}
+html[data-theme="tongdaxin"]:root .market-monitor-card :where(.market-card-main,.market-card-title-row,.market-card-side) { display:contents; }
+html[data-theme="tongdaxin"]:root .market-monitor-card :where(
+  .market-card-title,
+  .market-card-time,
+  .market-card-preview,
+  .market-chip-row,
+  .market-type,
+  .market-chevron
+) {
+  box-sizing:border-box;
+  min-width:0;
+  min-height:24px;
+  margin:0;
+  border:0;
+  border-left:1px solid var(--line);
+  padding:3px 6px;
+  overflow:hidden;
+  background:transparent;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+html[data-theme="tongdaxin"]:root .market-monitor-card .market-card-title {
+  display:flex;
+  align-items:center;
+  border-left:0;
+  color:#e0e0e0;
+  font-size:12px;
+  font-weight:700;
+}
+html[data-theme="tongdaxin"]:root .market-monitor-card .market-card-time {
+  display:flex;
+  align-items:center;
+  color:#929292;
+  font-family:Tahoma,Arial,sans-serif;
+  font-size:11px;
+}
+html[data-theme="tongdaxin"]:root .market-monitor-card .market-card-preview {
+  display:block;
+  color:#c0c0c0;
+  font-size:11px;
+  line-height:18px;
+}
+html[data-theme="tongdaxin"]:root .market-monitor-card .market-chip-row {
+  display:flex;
+  flex-wrap:nowrap;
+  gap:0;
+}
+html[data-theme="tongdaxin"]:root .market-monitor-card .market-chip {
+  flex:0 1 auto;
+  min-width:0;
+  border:0;
+  border-left:1px solid #4a0000;
+  padding:0 5px;
+  overflow:hidden;
+  background:transparent;
+  color:#aaa;
+  font-size:10px;
+  line-height:18px;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+html[data-theme="tongdaxin"]:root .market-monitor-card .market-chip:first-child { border-left:0; padding-left:0; }
+html[data-theme="tongdaxin"]:root .market-monitor-card .market-chip.up { color:#ff5555; }
+html[data-theme="tongdaxin"]:root .market-monitor-card .market-chip.down { color:#21eff6; }
+html[data-theme="tongdaxin"]:root .market-monitor-card .market-type {
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  color:#fff200;
+  font-size:11px;
+  font-weight:400;
+}
+html[data-theme="tongdaxin"]:root .market-monitor-card .market-chevron {
+  display:grid;
+  width:auto;
+  place-items:center;
+  padding:2px;
+  color:#d8d8d8;
+  font-family:Tahoma,Arial,sans-serif;
+  font-size:0;
+  line-height:1;
+  transform:none;
+}
+html[data-theme="tongdaxin"]:root .market-monitor-card .market-chevron::before {
+  content:'+';
+  display:grid;
+  width:14px;
+  height:14px;
+  place-items:center;
+  border:1px solid #666;
+  background:#1b1b1b;
+  font-size:11px;
+}
+html[data-theme="tongdaxin"]:root .market-monitor-card.open .market-chevron { color:#fff200; transform:none; }
+html[data-theme="tongdaxin"]:root .market-monitor-card.open .market-chevron::before { content:'\2212'; border-color:#fff200; }
+
+html[data-theme="tongdaxin"]:root .us-market-summary-card {
+  margin-top:3px;
+  border-color:var(--line2);
+  background:var(--terminal-row);
+}
+html[data-theme="tongdaxin"]:root .us-market-summary-card::before { display:none; }
+html[data-theme="tongdaxin"]:root .us-market-head {
+  display:grid;
+  grid-template-columns:170px minmax(0,1fr) 54px 20px;
+  gap:0;
+  padding:0;
+  background:var(--terminal-row);
+}
+html[data-theme="tongdaxin"]:root .us-market-summary-card.open .us-market-head {
+  border-bottom:1px solid #2949ff;
+  background:var(--terminal-selection);
+}
+html[data-theme="tongdaxin"]:root .us-market-head > span:first-child,
+html[data-theme="tongdaxin"]:root .us-market-head-actions { display:contents; }
+html[data-theme="tongdaxin"]:root .us-market-sub { display:none; }
+html[data-theme="tongdaxin"]:root .us-market-title,
+html[data-theme="tongdaxin"]:root .us-market-preview,
+html[data-theme="tongdaxin"]:root .us-market-tone,
+html[data-theme="tongdaxin"]:root .us-market-chevron {
+  box-sizing:border-box;
+  min-width:0;
+  min-height:24px;
+  margin:0;
+  border:0;
+  border-left:1px solid var(--line);
+  padding:3px 6px;
+  overflow:hidden;
+  background:transparent;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+html[data-theme="tongdaxin"]:root .us-market-title { display:flex; align-items:center; border-left:0; color:#e0e0e0; font-size:12px; }
+html[data-theme="tongdaxin"]:root .us-market-preview { display:block; color:#c0c0c0; font-size:11px; line-height:18px; }
+html[data-theme="tongdaxin"]:root .us-market-tone { display:flex; align-items:center; justify-content:center; color:#fff200; font-size:11px; font-weight:400; }
+html[data-theme="tongdaxin"]:root .us-market-chevron {
+  display:grid;
+  width:auto;
+  place-items:center;
+  padding:2px;
+  color:#d8d8d8;
+  font-size:0;
+  transform:none;
+}
+html[data-theme="tongdaxin"]:root .us-market-chevron::before {
+  content:'+';
+  display:grid;
+  width:14px;
+  height:14px;
+  place-items:center;
+  border:1px solid #666;
+  background:#1b1b1b;
+  font-family:Tahoma,Arial,sans-serif;
+  font-size:11px;
+}
+html[data-theme="tongdaxin"]:root .us-market-summary-card.open .us-market-chevron { color:#fff200; transform:none; }
+html[data-theme="tongdaxin"]:root .us-market-summary-card.open .us-market-chevron::before { content:'\2212'; border-color:#fff200; }
+
+html[data-theme="tongdaxin"]:root .market-day-pager {
+  gap:8px;
+  margin-top:3px;
+  border-color:var(--line2);
+  padding:4px 6px;
+  background:var(--terminal-header);
+}
+html[data-theme="tongdaxin"]:root .market-day-pager > div:first-child { display:flex; align-items:center; gap:9px; }
+html[data-theme="tongdaxin"]:root .market-day-title { color:#e0e0e0; font-size:12px; font-weight:700; }
+html[data-theme="tongdaxin"]:root .market-day-sub { margin:0; color:#929292; font-size:10px; }
+html[data-theme="tongdaxin"]:root .market-day-actions { gap:2px; }
+html[data-theme="tongdaxin"]:root .market-day-btn { min-height:22px; padding:2px 7px; font-size:11px; }
+
+/* Market reports follow the dense quote-table typography of the terminal. */
+html[data-theme="tongdaxin"]:root .market-card-detail {
+  padding:0 4px 4px;
+}
+html[data-theme="tongdaxin"]:root .market-card-detail .market-detail-box {
+  gap:3px;
+  padding-top:3px;
+}
+html[data-theme="tongdaxin"]:root .market-card-detail .market-mood-panel {
+  padding:5px 6px;
+}
+html[data-theme="tongdaxin"]:root .market-card-detail .market-mood-label {
+  margin-bottom:2px;
+  font-size:9px;
+  line-height:1.2;
+}
+html[data-theme="tongdaxin"]:root .market-card-detail .market-mood-text {
+  font-size:12px;
+  line-height:1.3;
+  font-weight:700;
+}
+html[data-theme="tongdaxin"]:root .market-card-detail .market-metric-item {
+  padding:4px 5px;
+}
+html[data-theme="tongdaxin"]:root .market-card-detail .market-metric-label {
+  font-size:9px;
+  line-height:1.15;
+}
+html[data-theme="tongdaxin"]:root .market-card-detail .market-metric-value {
+  margin-top:1px;
+  font-size:12px;
+  line-height:1.15;
+}
+html[data-theme="tongdaxin"]:root .market-card-detail .market-section-list { gap:3px; }
+html[data-theme="tongdaxin"]:root .market-card-detail .market-section-head {
+  min-height:22px;
+  padding:3px 5px;
+}
+html[data-theme="tongdaxin"]:root .market-card-detail .market-section-title {
+  font-size:11px;
+  line-height:1.2;
+}
+html[data-theme="tongdaxin"]:root .market-card-detail .market-section-count {
+  padding-left:5px;
+  font-size:9px;
+  line-height:1.2;
+}
+html[data-theme="tongdaxin"]:root .market-card-detail .market-section-body {
+  padding:2px 5px 3px;
+}
+html[data-theme="tongdaxin"]:root .market-card-detail .market-detail-line {
+  font-size:11px;
+  line-height:1.35;
+}
+html[data-theme="tongdaxin"]:root .market-card-detail .market-detail-line.item {
+  grid-template-columns:18px minmax(0,1fr);
+  gap:3px;
+  padding:2px 0;
+}
+html[data-theme="tongdaxin"]:root .market-card-detail .market-detail-line.item::before {
+  margin-top:.1em;
+  font-size:8px;
+  line-height:1.25;
+}
+html[data-theme="tongdaxin"]:root .market-card-detail .market-detail-line.flow {
+  grid-template-columns:34px minmax(0,1fr);
+  gap:5px;
+  padding:3px 0;
+}
+html[data-theme="tongdaxin"]:root .market-card-detail .market-flow-label { font-size:10px; }
+html[data-theme="tongdaxin"]:root .market-card-detail :where(.market-num,.market-symbol) {
+  padding:0 1px;
+  font-size:inherit;
+}
+html[data-theme="tongdaxin"]:root .market-card-detail .market-detail-overview {
+  border-color:var(--line);
+  background:#000;
+}
+html[data-theme="tongdaxin"]:root .market-card-detail .market-mood-panel {
+  display:grid;
+  grid-template-columns:58px minmax(0,1fr);
+  align-items:center;
+  gap:6px;
+  border-color:var(--line);
+  background:#050505;
+}
+html[data-theme="tongdaxin"]:root .market-card-detail .market-mood-label {
+  margin:0;
+  border-right:1px solid #4a0000;
+  color:#999;
+}
+html[data-theme="tongdaxin"]:root .market-card-detail .market-mood-text { color:#e0e0e0; font-weight:400; }
+html[data-theme="tongdaxin"]:root .market-card-detail .market-metric-item {
+  display:grid;
+  grid-template-columns:auto minmax(0,1fr);
+  align-items:center;
+  gap:6px;
+  background:#000;
+}
+html[data-theme="tongdaxin"]:root .market-card-detail .market-metric-label { color:#888; }
+html[data-theme="tongdaxin"]:root .market-card-detail .market-metric-value {
+  margin:0;
+  color:#d8d8d8;
+  font-family:Tahoma,Arial,sans-serif;
+  font-weight:700;
+  text-align:right;
+}
+html[data-theme="tongdaxin"]:root .market-card-detail .market-section-list { grid-template-columns:repeat(2,minmax(0,1fr)); gap:2px; }
+html[data-theme="tongdaxin"]:root .market-card-detail .market-section {
+  border-color:var(--line);
+  background:#000;
+}
+html[data-theme="tongdaxin"]:root .market-card-detail .market-section-head {
+  border-color:var(--line);
+  background:var(--terminal-header);
+}
+html[data-theme="tongdaxin"]:root .market-card-detail .market-section-title { color:#d8d8d8; font-weight:700; }
+html[data-theme="tongdaxin"]:root .market-card-detail .market-section.hot .market-section-title { color:#ff5555; }
+html[data-theme="tongdaxin"]:root .market-card-detail .market-section.flow .market-section-title { color:#21eff6; }
+html[data-theme="tongdaxin"]:root .market-card-detail .market-section.risk .market-section-title { color:#ff5555; }
+html[data-theme="tongdaxin"]:root .market-card-detail .market-section.tip .market-section-title { color:#fff200; }
+html[data-theme="tongdaxin"]:root .market-card-detail .market-section-count { color:#929292; }
+html[data-theme="tongdaxin"]:root .market-card-detail .market-section-body { background:#000; }
+html[data-theme="tongdaxin"]:root .market-card-detail .market-detail-line.item,
+html[data-theme="tongdaxin"]:root .market-card-detail .market-detail-line.flow { border-color:#4a0000; }
+html[data-theme="tongdaxin"]:root .market-card-detail .market-detail-line.item::before {
+  border-right:1px solid #4a0000;
+  color:#777;
+}
+html[data-theme="tongdaxin"]:root .market-card-detail .market-detail-line.risk,
+html[data-theme="tongdaxin"]:root .market-card-detail .market-detail-line.risk::before { color:#ff5555; }
+html[data-theme="tongdaxin"]:root .market-card-detail .market-detail-line.tip::before,
+html[data-theme="tongdaxin"]:root .market-card-detail .market-flow-label { color:#e8df00; }
+html[data-theme="tongdaxin"]:root .market-card-detail .market-num.up,
+html[data-theme="tongdaxin"]:root .market-card-detail .market-metric-value.up { color:#ff4141; }
+html[data-theme="tongdaxin"]:root .market-card-detail .market-num.down,
+html[data-theme="tongdaxin"]:root .market-card-detail .market-metric-value.down { color:#21eff6; }
+
+@media (max-width:720px) {
+  html[data-theme="tongdaxin"]:root .market-monitor-grid { gap:2px; border:0; background:transparent; }
+  html[data-theme="tongdaxin"]:root .market-monitor-table-head { display:none; }
+  html[data-theme="tongdaxin"]:root .market-monitor-card { border:1px solid var(--line); }
+  html[data-theme="tongdaxin"]:root .market-monitor-card .market-card-head {
+    grid-template-columns:minmax(0,1fr) auto;
+    gap:5px;
+    padding:4px 5px;
+  }
+  html[data-theme="tongdaxin"]:root .market-monitor-card :where(.market-card-main,.market-card-title-row,.market-card-side) { display:flex; }
+  html[data-theme="tongdaxin"]:root .market-monitor-card .market-card-main { display:block; min-width:0; }
+  html[data-theme="tongdaxin"]:root .market-monitor-card .market-card-title-row { align-items:center; gap:6px; }
+  html[data-theme="tongdaxin"]:root .market-monitor-card .market-card-side { align-items:center; gap:3px; }
+  html[data-theme="tongdaxin"]:root .market-monitor-card :where(
+    .market-card-title,
+    .market-card-time,
+    .market-card-preview,
+    .market-chip-row,
+    .market-type,
+    .market-chevron
+  ) { min-height:0; border-left:0; padding:0; }
+  html[data-theme="tongdaxin"]:root .market-monitor-card .market-card-title { font-size:12px; }
+  html[data-theme="tongdaxin"]:root .market-monitor-card .market-card-time { font-size:10px; }
+  html[data-theme="tongdaxin"]:root .market-monitor-card .market-card-preview { margin-top:3px; line-height:1.35; }
+  html[data-theme="tongdaxin"]:root .market-monitor-card .market-chip-row { margin-top:3px; }
+  html[data-theme="tongdaxin"]:root .market-card-detail .market-detail-overview,
+  html[data-theme="tongdaxin"]:root .market-card-detail .market-section-list { grid-template-columns:minmax(0,1fr); }
+  html[data-theme="tongdaxin"]:root .market-card-detail .market-mood-panel { border-right:0; border-bottom:1px solid var(--line); }
+  html[data-theme="tongdaxin"]:root .us-market-head {
+    grid-template-columns:minmax(0,1fr) auto;
+    gap:5px;
+    padding:4px 5px;
+  }
+  html[data-theme="tongdaxin"]:root .us-market-head > span:first-child { display:block; min-width:0; }
+  html[data-theme="tongdaxin"]:root .us-market-head-actions { display:flex; align-items:center; gap:3px; }
+  html[data-theme="tongdaxin"]:root .us-market-sub { display:block; margin-top:2px; }
+  html[data-theme="tongdaxin"]:root :where(.us-market-title,.us-market-preview,.us-market-tone,.us-market-chevron) {
+    min-height:0;
+    border-left:0;
+    padding:0;
+  }
+  html[data-theme="tongdaxin"]:root .us-market-preview { margin-top:3px; line-height:1.35; }
+  html[data-theme="tongdaxin"]:root .market-day-pager { display:grid; }
+  html[data-theme="tongdaxin"]:root .market-day-pager > div:first-child { justify-content:space-between; }
+}
+
+html[data-theme="tongdaxin"]:root .sector-item.up,
+html[data-theme="tongdaxin"]:root .hot-item.up,
+html[data-theme="tongdaxin"]:root .index-card.index-up,
+html[data-theme="tongdaxin"]:root .practice-calendar-day.has-result.up {
+  border-color:var(--red-border);
+  background:#000 !important;
+}
+
+html[data-theme="tongdaxin"]:root .sector-item.down,
+html[data-theme="tongdaxin"]:root .hot-item.down,
+html[data-theme="tongdaxin"]:root .index-card.index-down,
+html[data-theme="tongdaxin"]:root .practice-calendar-day.has-result.down {
+  border-color:var(--green-border);
+  background:#000 !important;
+}
+
+html[data-theme="tongdaxin"]:root :where(
+  .sector-item.up .sector-pct,
+  .hot-item.up .sector-pct,
+  .flow-in,
+  .index-up,
+  .market-chip.up,
+  .market-metric-value.up,
+  .market-num.up,
+  .dragon-tiger-list .up,
+  .rating-table .upside.pos,
+  .practice-kpi-value.up,
+  .practice-chart-value.up,
+  .practice-calendar-rate.up,
+  .practice-calendar-amount.up,
+  .practice-calendar-stat-value.up
+) { color:var(--red); }
+
+html[data-theme="tongdaxin"]:root :where(
+  .sector-item.down .sector-pct,
+  .hot-item.down .sector-pct,
+  .flow-out,
+  .index-down,
+  .market-chip.down,
+  .market-metric-value.down,
+  .market-num.down,
+  .dragon-tiger-list .down,
+  .rating-table .upside.neg,
+  .practice-kpi-value.down,
+  .practice-chart-value.down,
+  .practice-calendar-rate.down,
+  .practice-calendar-amount.down,
+  .practice-calendar-stat-value.down
+) { color:var(--green); }
+
+html[data-theme="tongdaxin"]:root .rating-table,
+html[data-theme="tongdaxin"]:root .backtest-table-wrap table { font-size:12px; }
+html[data-theme="tongdaxin"]:root :where(.rating-table th,.rating-table td,.backtest-table-wrap th,.backtest-table-wrap td) {
+  border-color:var(--line);
+  padding:5px 7px;
+}
+html[data-theme="tongdaxin"]:root :where(.rating-table th,.backtest-table-wrap th) {
+  background:var(--terminal-header);
+  color:#e3e3e3;
+  font-size:11px;
+  letter-spacing:0;
+}
+html[data-theme="tongdaxin"]:root :where(.rating-table tbody tr,.backtest-table-wrap tbody tr) { background:var(--terminal-row); }
+html[data-theme="tongdaxin"]:root :where(.rating-table tbody tr:nth-child(even),.backtest-table-wrap tbody tr:nth-child(even)) {
+  background:var(--terminal-row-alt);
+}
+html[data-theme="tongdaxin"]:root .rating-table tbody tr:hover {
+  background:#252000;
+  box-shadow:inset 2px 0 0 var(--terminal-orange);
+}
+html[data-theme="tongdaxin"]:root .rating-table tbody tr.expanded {
+  background:var(--terminal-selection);
+  box-shadow:inset 2px 0 0 var(--terminal-selection-border);
+}
+
+/* Tongdaxin reserves bright red for chart grids and hard market boundaries. */
+html[data-theme="tongdaxin"]:root .market-breadth-grid { stroke:var(--chart-grid); }
+html[data-theme="tongdaxin"]:root .market-breadth-grid-vertical { opacity:.82; stroke-dasharray:2 4; }
+html[data-theme="tongdaxin"]:root .market-breadth-volume-grid { stroke:var(--chart-grid-soft); }
+html[data-theme="tongdaxin"]:root .market-breadth-volume-grid-zero { stroke:var(--chart-zero); }
+html[data-theme="tongdaxin"]:root .market-breadth-axis-line { stroke:var(--chart-grid-soft); }
+html[data-theme="tongdaxin"]:root .market-breadth-axis-label { fill:#9a9a9a; }
+html[data-theme="tongdaxin"]:root .market-breadth-axis-title { fill:#d0d0d0; color:#d0d0d0; }
+html[data-theme="tongdaxin"]:root .market-breadth-card {
+  --market-breadth-limit-down:#00dfe8;
+  --market-breadth-limit-up:#ff3030;
+  --market-breadth-broken-limit:#ff9000;
+  --market-breadth-red:#ff00ff;
+  --market-breadth-green:#00ff00;
+  --market-breadth-estimated-turnover:#fff200;
+  --market-breadth-actual-turnover:#ff3030;
+  --market-breadth-previous-turnover:#b8b8b8;
+  --market-breadth-turnover-increment:#00dfe8;
+  --market-breadth-same-time-delta:#ff00ff;
+}
+html[data-theme="tongdaxin"]:root .practice-axis-label { color:#a8a8a8; }
+html[data-theme="tongdaxin"]:root .practice-axis-label.zero { color:#fff200; }
+
+html[data-theme="tongdaxin"]:root .practice-hover-tooltip,
+html[data-theme="tongdaxin"]:root .practice-trade-marker-tooltip,
+html[data-theme="tongdaxin"]:root .theme-stock-details,
+html[data-theme="tongdaxin"]:root [class$="-popover"] {
+  border-color:#b50000;
+  background:#000;
+  color:var(--text);
+  box-shadow:0 10px 28px rgba(0,0,0,.48);
+  backdrop-filter:none;
+}
+
+/* Teleported overview popovers must carry their own terminal palette. */
+html[data-theme="tongdaxin"]:root .overview-theme-stock-popover {
+  --overview-surface:#000;
+  --overview-surface-raised:#090909;
+  --overview-border:#641010;
+  --overview-border-strong:#b50000;
+  --overview-text:#d0d0d0;
+  --overview-muted:#8c8c8c;
+  --overview-faint:#727272;
+  --overview-accent:#fff200;
+  --overview-up:#ff4141;
+  --overview-down:#00dfe8;
+  border-color:var(--overview-border-strong);
+  background:var(--overview-surface);
+  color:var(--overview-text);
+}
+html[data-theme="tongdaxin"]:root .overview-theme-stock-popover-head {
+  border-bottom:1px solid var(--overview-border);
+  padding:2px 2px 5px;
+}
+html[data-theme="tongdaxin"]:root .overview-theme-stock-popover-head button {
+  display:inline-flex;
+  min-width:42px;
+  min-height:22px;
+  align-items:center;
+  justify-content:center;
+  padding:2px 7px;
+  line-height:1;
+}
+html[data-theme="tongdaxin"]:root .overview-theme-stock-list-head {
+  border-bottom:1px solid var(--overview-border);
+  background:var(--terminal-header-deep);
+}
+html[data-theme="tongdaxin"]:root .overview-theme-stock-list {
+  gap:1px;
+  border:1px solid var(--overview-border);
+  background:var(--overview-border);
+}
+html[data-theme="tongdaxin"]:root .overview-theme-stock {
+  border:0;
+  background:var(--terminal-row);
+}
+html[data-theme="tongdaxin"]:root .overview-theme-stock:nth-child(even) {
+  background:var(--terminal-row-alt);
+}
+html[data-theme="tongdaxin"]:root .overview-theme-stock + .overview-theme-stock { margin-top:0; }
+
+html[data-theme="tongdaxin"]:root .overview-page {
+  --overview-surface:#000;
+  --overview-surface-raised:#090909;
+  --overview-surface-strong:#101010;
+  --overview-border:#641010;
+  --overview-border-strong:#8c1616;
+  --overview-text:#d0d0d0;
+  --overview-muted:#8c8c8c;
+  --overview-faint:#727272;
+  --overview-accent:#fff200;
+  --overview-accent-soft:rgba(154,0,0,.22);
+  --overview-up:#ff4141;
+  --overview-up-soft:rgba(255,65,65,.10);
+  --overview-down:#00dfe8;
+  --overview-down-soft:rgba(0,223,232,.09);
+  --overview-warning:#e8df00;
+  --overview-warning-soft:rgba(255,216,77,.10);
+  --overview-mainline-accent:#fff200;
+  --overview-mainline-secondary:#b8b8b8;
+}
+
+html[data-theme="tongdaxin"]:root .overview-command-head {
+  align-items:center;
+  padding:6px 8px;
+  background:var(--terminal-header-deep);
+}
+html[data-theme="tongdaxin"]:root .overview-command-head h2 { font-size:16px; letter-spacing:0; }
+html[data-theme="tongdaxin"]:root .overview-panel { padding:7px; background:var(--overview-surface); }
+html[data-theme="tongdaxin"]:root :where(.overview-terminal-grid,.overview-primary-grid,.overview-secondary-grid) { gap:4px; }
+html[data-theme="tongdaxin"]:root :where(.overview-panel-head,.overview-panel-head.compact) { margin-bottom:4px; min-height:22px; }
+html[data-theme="tongdaxin"]:root .overview-panel-head h3 { font-size:12px; }
+html[data-theme="tongdaxin"]:root .overview-news-mode {
+  background:var(--terminal-header);
+  border-color:var(--overview-border-strong);
+  color:#fff200;
+}
+html[data-theme="tongdaxin"]:root .overview-right-bottom > .overview-news-panel { padding:4px 7px; }
+html[data-theme="tongdaxin"]:root .overview-news-panel :where(.overview-panel-head,.overview-panel-head.compact) {
+  margin-bottom:1px;
+  min-height:18px;
+}
+html[data-theme="tongdaxin"]:root .overview-news-item { border-color:var(--overview-border); }
+html[data-theme="tongdaxin"]:root .overview-news-source { color:#ffc000; }
+html[data-theme="tongdaxin"]:root .overview-news-item.important .overview-news-title { color:#ff5555; }
+html[data-theme="tongdaxin"]:root .overview-kpi-strip { gap:1px; }
+html[data-theme="tongdaxin"]:root .overview-kpi { padding:5px 7px; }
+html[data-theme="tongdaxin"]:root .overview-index-grid { gap:2px; }
+html[data-theme="tongdaxin"]:root .overview-index-tile { padding:4px 6px; }
+html[data-theme="tongdaxin"]:root :where(.overview-theme-table-head,.overview-candidate-table-head) {
+  background:var(--terminal-header);
+  color:#e0e0e0;
+  padding-block:2px;
+}
+html[data-theme="tongdaxin"]:root :where(.overview-theme-row,.overview-candidate-row,.overview-flow-row) {
+  border-color:var(--overview-border);
+}
+html[data-theme="tongdaxin"]:root :where(.overview-theme-row:nth-child(odd),.overview-candidate-row:nth-child(odd)) {
+  background:var(--terminal-row-alt);
+}
+html[data-theme="tongdaxin"]:root .overview-candidate-row { min-height:34px; padding-block:4px; }
+html[data-theme="tongdaxin"]:root .overview-page[data-layout="wide"] .overview-candidate-row {
+  height:100%;
+  min-height:0;
+  padding-block:2px;
+}
+html[data-theme="tongdaxin"]:root .overview-flow-row { min-height:22px; }
+
+/* Full-width market windows replace modern floating cards. */
+html[data-theme="tongdaxin"]:root .indices-switch {
+  width:100%;
+  max-width:none;
+  gap:0;
+  padding:0;
+  background:var(--terminal-header-deep);
+}
+html[data-theme="tongdaxin"]:root .indices-switch-btn {
+  min-height:27px;
+  border-right:1px solid var(--line);
+  padding:3px 10px;
+  color:#c0c0c0;
+  font-size:12px;
+  font-weight:400;
+}
+html[data-theme="tongdaxin"]:root .indices-switch-btn.active {
+  border:1px solid #d00000;
+  background:#8c0000;
+  color:#fff200;
+}
+html[data-theme="tongdaxin"]:root .indices-part { gap:3px; }
+html[data-theme="tongdaxin"]:root .indices-part-head {
+  border:1px solid var(--line);
+  background:var(--terminal-header);
+}
+html[data-theme="tongdaxin"]:root .market-region-switch {
+  width:184px;
+  gap:0;
+  padding:0;
+}
+html[data-theme="tongdaxin"]:root .market-region-btn {
+  min-height:21px;
+  border-left:1px solid var(--line);
+  padding:2px 7px;
+  font-size:11px;
+  font-weight:400;
+}
+html[data-theme="tongdaxin"]:root .indices-index-stack > div {
+  margin-bottom:4px !important;
+  border:1px solid var(--line);
+  background:#000;
+}
+html[data-theme="tongdaxin"]:root .indices-index-stack > div > h3 {
+  min-height:22px;
+  margin:0 !important;
+  border-bottom:1px solid var(--line);
+  padding:3px 6px;
+  background:var(--terminal-header-deep);
+  color:#d0d0d0 !important;
+  font-size:12px !important;
+  font-weight:700;
+}
+html[data-theme="tongdaxin"]:root .market-strip {
+  display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(240px,1fr));
+  gap:0;
+  overflow:visible;
+  margin:0 !important;
+  padding:0;
+}
+html[data-theme="tongdaxin"]:root .index-card {
+  position:relative;
+  min-width:0;
+  min-height:104px;
+  padding:5px 7px;
+  overflow:hidden;
+  border:0;
+  border-right:1px solid var(--line);
+  background:#000 !important;
+}
+html[data-theme="tongdaxin"]:root .index-card::before,
+html[data-theme="tongdaxin"]:root .index-card::after {
+  content:"";
+  position:absolute;
+  z-index:0;
+  pointer-events:none;
+}
+html[data-theme="tongdaxin"]:root .index-card::before {
+  right:0;
+  left:0;
+  top:62%;
+  border-top:1px dotted #5f0000;
+}
+html[data-theme="tongdaxin"]:root .index-card::after {
+  top:22px;
+  bottom:18px;
+  left:50%;
+  border-left:1px dotted #470000;
+}
+html[data-theme="tongdaxin"]:root .index-card > * { position:relative; z-index:1; }
+html[data-theme="tongdaxin"]:root .index-name { color:#c7c7c7; font-size:11px; font-weight:400; }
+html[data-theme="tongdaxin"]:root .index-price { margin-top:2px; font-size:18px; }
+html[data-theme="tongdaxin"]:root .index-change { margin-top:0; font-size:11px; }
+html[data-theme="tongdaxin"]:root .sparkline { height:31px; margin-top:3px; }
+html[data-theme="tongdaxin"]:root .sparkline-area { fill:none; }
+html[data-theme="tongdaxin"]:root .sparkline-line { stroke-width:1; }
+html[data-theme="tongdaxin"]:root .sparkline-zero { stroke:#700000; stroke-dasharray:2 3; }
+html[data-theme="tongdaxin"]:root .index-time { margin-top:1px; color:#858585; }
+
+html[data-theme="tongdaxin"]:root .mainline-page { --mainline-line:var(--line); }
+html[data-theme="tongdaxin"]:root .mainline-hero { padding:0; }
+html[data-theme="tongdaxin"]:root .mainline-heading {
+  border-bottom:1px solid var(--line);
+  background:var(--terminal-header);
+}
+html[data-theme="tongdaxin"]:root .mainline-heading h2 {
+  margin:0;
+  font-size:var(--terminal-page-title-size);
+  line-height:1.2;
+  font-weight:700;
+}
+html[data-theme="tongdaxin"]:root .mainline-heading p { font-size:11px; line-height:1.35; }
+html[data-theme="tongdaxin"]:root .mainline-actions { gap:4px; }
+html[data-theme="tongdaxin"]:root .mainline-actions button { min-height:22px; padding:2px 7px; font-size:11px; }
+html[data-theme="tongdaxin"]:root .mainline-loading,
+html[data-theme="tongdaxin"]:root .mainline-empty { min-height:86px; }
+html[data-theme="tongdaxin"]:root .mainline-empty strong { font-size:13px; }
+html[data-theme="tongdaxin"]:root .mainline-summary-grid { margin:4px; gap:1px; }
+html[data-theme="tongdaxin"]:root .mainline-summary-card { padding:6px; }
+html[data-theme="tongdaxin"]:root .mainline-section { margin-top:4px; }
+html[data-theme="tongdaxin"]:root .theme-rankings { gap:4px; }
+html[data-theme="tongdaxin"]:root .theme-row { height:58px; gap:3px 8px; padding:4px 7px; }
+html[data-theme="tongdaxin"]:root .theme-row { border-color:var(--line); }
+
+html[data-theme="tongdaxin"]:root .theme-stock-details {
+  padding:0;
+  border-color:var(--line2);
+  background:#000;
+  box-shadow:0 10px 28px rgba(0,0,0,.48);
+}
+html[data-theme="tongdaxin"]:root :where(.theme-stock-details-head,.theme-stock-detail-row) { gap:0; }
+html[data-theme="tongdaxin"]:root .theme-stock-details-head {
+  min-height:25px;
+  border-bottom:1px solid var(--line2);
+  padding:0;
+  background:var(--terminal-header);
+  color:#b8b8b8;
+}
+html[data-theme="tongdaxin"]:root .theme-stock-detail-row {
+  min-height:30px;
+  border:0;
+  border-bottom:1px solid var(--line);
+  padding:0;
+  background:var(--terminal-row);
+}
+html[data-theme="tongdaxin"]:root .theme-stock-detail-row:nth-child(odd) { background:var(--terminal-row-alt); }
+html[data-theme="tongdaxin"]:root .theme-stock-detail-row:last-child { border-bottom:0; }
+html[data-theme="tongdaxin"]:root .theme-stock-detail-row + .theme-stock-detail-row { margin-top:0; }
+html[data-theme="tongdaxin"]:root :where(.theme-stock-details-head,.theme-stock-detail-row) > * {
+  display:flex;
+  min-height:inherit;
+  align-items:center;
+  padding:4px 6px;
+}
+html[data-theme="tongdaxin"]:root :where(.theme-stock-details-head,.theme-stock-detail-row) > * + * {
+  border-left:1px solid var(--line);
+}
+html[data-theme="tongdaxin"]:root .theme-stock-detail-row > .theme-stock-change {
+  justify-self:stretch;
+  justify-content:flex-end;
+}
+
+html[data-theme="tongdaxin"]:root .dragon-tiger-panel {
+  max-width:none;
+  margin:0;
+  border-color:var(--line2);
+  background:#000;
+}
+html[data-theme="tongdaxin"]:root .dragon-tiger-head {
+  gap:6px;
+  border-color:var(--line2);
+  background:var(--terminal-header);
+}
+html[data-theme="tongdaxin"]:root .dragon-tiger-head h2 { color:#f0f0f0; font-size:16px; font-weight:700; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-sub { margin:0; color:#999; font-size:10px; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-head-actions {
+  display:flex;
+  align-items:center;
+  gap:3px;
+}
+html[data-theme="tongdaxin"]:root .dragon-tiger-date-controls { gap:2px; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-date-controls input {
+  min-height:22px;
+  border-color:#5b5b5b #080808 #080808 #5b5b5b;
+  padding:2px 5px;
+  background:#000;
+  color:#ddd;
+  font-size:10px;
+}
+html[data-theme="tongdaxin"]:root .dragon-tiger-status {
+  border-color:#666;
+  padding:2px 5px;
+  background:#111;
+  color:#c8c8c8;
+  font-size:10px;
+  font-weight:400;
+}
+html[data-theme="tongdaxin"]:root .dragon-tiger-status.stale { border-color:#777000; background:#171700; color:#fff200; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-status.querying { border-color:#244bb1; background:#07154c; color:#65c7ff; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-unavailable {
+  margin:4px;
+  gap:4px;
+  border-style:solid;
+  padding:10px;
+  background:#000;
+}
+html[data-theme="tongdaxin"]:root .dragon-tiger-unavailable a { margin-top:2px; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-list {
+  border:1px solid var(--line2);
+  background:#000;
+}
+html[data-theme="tongdaxin"]:root .dragon-tiger-list-head,
+html[data-theme="tongdaxin"]:root .dragon-tiger-item > summary {
+  gap:0;
+  min-height:24px;
+  padding:2px 26px 2px 5px;
+}
+html[data-theme="tongdaxin"]:root .dragon-tiger-list-head {
+  border-bottom:1px solid var(--line2);
+  background:var(--terminal-header);
+  color:#c8c8c8;
+  font-size:12px;
+  font-weight:400;
+}
+html[data-theme="tongdaxin"]:root .dragon-tiger-sort-btn {
+  color:#c8c8c8;
+  font-weight:400;
+}
+html[data-theme="tongdaxin"]:root .dragon-tiger-sort-btn:first-child > span:first-child { font-size:0; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-sort-btn:first-child > span:first-child::after {
+  content:'代码 / 名称';
+  font-size:12px;
+}
+html[data-theme="tongdaxin"]:root .dragon-tiger-sort-btn:hover,
+html[data-theme="tongdaxin"]:root .dragon-tiger-sort-btn.active { background:#181818; color:#fff200; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-sort-indicator,
+html[data-theme="tongdaxin"]:root .dragon-tiger-sort-btn.active .dragon-tiger-sort-indicator { color:#fff200; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-list-head > *,
+html[data-theme="tongdaxin"]:root .dragon-tiger-item > summary > span {
+  min-height:18px;
+  border-left:1px solid var(--line);
+  padding:1px 5px;
+}
+html[data-theme="tongdaxin"]:root .dragon-tiger-list-head > :first-child,
+html[data-theme="tongdaxin"]:root .dragon-tiger-item > summary > span:first-child { border-left:0; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-item { border-color:var(--line); background:var(--terminal-row); }
+html[data-theme="tongdaxin"]:root .dragon-tiger-item:nth-of-type(even) { background:var(--terminal-row-alt); }
+html[data-theme="tongdaxin"]:root .dragon-tiger-item > summary {
+  color:#c8c8c8;
+  font-weight:400;
+}
+html[data-theme="tongdaxin"]:root .dragon-tiger-item > summary:hover { background:#181818; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-item[open] > summary {
+  border-bottom:1px solid #2949ff;
+  background:var(--terminal-selection);
+  color:#fff;
+}
+html[data-theme="tongdaxin"]:root .dragon-tiger-item.has-positive-news > summary,
+html[data-theme="tongdaxin"]:root .dragon-tiger-item.has-negative-news > summary { box-shadow:none; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-item > summary::after {
+  content:'+';
+  right:6px;
+  display:grid;
+  width:15px;
+  height:15px;
+  place-items:center;
+  border:1px solid #666;
+  background:#1b1b1b;
+  color:#ddd;
+  font-family:Tahoma,Arial,sans-serif;
+  font-size:12px;
+  line-height:1;
+  transform:none;
+}
+html[data-theme="tongdaxin"]:root .dragon-tiger-item[open] > summary::after {
+  content:'\2212';
+  border-color:#fff200;
+  color:#fff200;
+  transform:none;
+}
+html[data-theme="tongdaxin"]:root .dragon-tiger-list-name { gap:6px; color:#e0e0e0; font-size:12px; font-weight:400; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-list-code {
+  display:inline-block;
+  flex:0 0 58px;
+  color:#9b9b9b;
+  font-family:Tahoma,Arial,sans-serif;
+  font-size:11px;
+  font-weight:400;
+}
+html[data-theme="tongdaxin"]:root .dragon-tiger-list-name > span { color:#e0e0e0; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-name-has-limit-up-reason { color:#ff4b4b; text-decoration:none; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-list-sector { color:#b3b3b3; font-size:12px; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-list-number { font-family:Tahoma,Arial,sans-serif; font-size:12px; font-weight:700; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-list .up { color:#ff3b3b; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-list .down { color:#00dfe8; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-streak,
+html[data-theme="tongdaxin"]:root .dragon-tiger-news-tone { border:0; padding:1px 3px; font-size:10px; font-weight:400; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-streak.limit-up,
+html[data-theme="tongdaxin"]:root .dragon-tiger-news-tone.positive { background:#3b0000; color:#ff5555; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-streak.limit-down,
+html[data-theme="tongdaxin"]:root .dragon-tiger-news-tone.negative { background:#002426; color:#21eff6; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-list-name > .dragon-tiger-streak.continuous-list { border:0; background:#292700; color:#fff200; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-detail { padding:5px 7px; background:#000; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-detail-meta {
+  margin-bottom:3px;
+  border-color:var(--line);
+  background:#000;
+}
+html[data-theme="tongdaxin"]:root .dragon-tiger-detail-meta > span {
+  display:grid;
+  grid-template-columns:auto minmax(0,1fr);
+  align-items:center;
+  gap:7px;
+  border-color:var(--line);
+  padding:4px 6px;
+}
+html[data-theme="tongdaxin"]:root .dragon-tiger-detail-meta small,
+html[data-theme="tongdaxin"]:root .dragon-tiger-detail-values small,
+html[data-theme="tongdaxin"]:root .dragon-tiger-seat-values small { color:#7f7f7f; font-size:10px; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-detail-meta b,
+html[data-theme="tongdaxin"]:root .dragon-tiger-detail-values b,
+html[data-theme="tongdaxin"]:root .dragon-tiger-seat-values b { margin-top:0; color:#d0d0d0; font-size:11px; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-analysis-grid {
+  gap:3px;
+  margin-bottom:3px;
+}
+html[data-theme="tongdaxin"]:root :where(.dragon-tiger-reasons,.dragon-tiger-funds,.dragon-tiger-seats) {
+  border-color:var(--line);
+  background:#000;
+}
+html[data-theme="tongdaxin"]:root :where(.dragon-tiger-reasons-head,.dragon-tiger-funds-head,.dragon-tiger-seats-head) {
+  border-color:var(--line);
+  padding:4px 6px;
+  background:var(--terminal-header);
+}
+html[data-theme="tongdaxin"]:root :where(.dragon-tiger-reasons-head,.dragon-tiger-funds-head,.dragon-tiger-seats-head) b {
+  color:#e0e0e0;
+  font-size:11px;
+  font-weight:700;
+}
+html[data-theme="tongdaxin"]:root .dragon-tiger-limit-up-reason .dragon-tiger-reasons-head b { color:#ff5555; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-continuous-news .dragon-tiger-reasons-head b { color:#fff200; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-reasons-head span,
+html[data-theme="tongdaxin"]:root .dragon-tiger-funds-head span,
+html[data-theme="tongdaxin"]:root .dragon-tiger-seats-head span { color:#9b9b9b; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-reason-list { padding:2px 6px 3px; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-reason-list li {
+  border-color:#4a0000;
+  padding:4px 0;
+  color:#c8c8c8;
+  font-size:11px;
+  line-height:1.35;
+}
+html[data-theme="tongdaxin"]:root .dragon-tiger-reason-list li > b { border-color:#5f0000; color:#777; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-limit-up-reason,
+html[data-theme="tongdaxin"]:root .dragon-tiger-continuous-news { border-color:var(--line); background:#000; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-limit-up-reason p,
+html[data-theme="tongdaxin"]:root .dragon-tiger-continuous-news p { color:#c8c8c8; font-size:11px; font-weight:400; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-funds { margin-bottom:3px; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-detail-record { padding:4px 6px; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-detail-record-head b { color:#fff200; font-weight:400; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-detail-record-head span { color:#999; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-detail-record + .dragon-tiger-detail-record,
+html[data-theme="tongdaxin"]:root .dragon-tiger-detail-values { border-color:#5f0000; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-detail-values { margin-top:4px; padding-top:4px; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-detail-values > span {
+  display:flex;
+  align-items:baseline;
+  justify-content:space-between;
+  gap:6px;
+  border-color:#5f0000;
+  padding:0 7px;
+}
+html[data-theme="tongdaxin"]:root .dragon-tiger-detail-values > span:first-child { padding-left:0; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-detail-values b,
+html[data-theme="tongdaxin"]:root .dragon-tiger-seat-values b { text-align:right; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-seat-groups { gap:3px; padding:3px; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-seat-sides { gap:3px; margin-top:3px; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-seat-side,
+html[data-theme="tongdaxin"]:root .dragon-tiger-seat-side.buy,
+html[data-theme="tongdaxin"]:root .dragon-tiger-seat-side.sell { border-color:var(--line); background:#000; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-seat-side-head {
+  border-color:var(--line);
+  padding:4px 6px;
+  background:var(--terminal-header);
+}
+html[data-theme="tongdaxin"]:root .dragon-tiger-seat-side.buy .dragon-tiger-seat-side-head b { color:#ff5555; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-seat-side.sell .dragon-tiger-seat-side-head b { color:#21eff6; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-seat-record + .dragon-tiger-seat-record,
+html[data-theme="tongdaxin"]:root .dragon-tiger-seat-values > span { border-color:#5f0000; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-seat-record:nth-child(even) { background:#090909; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-seat-record-head { padding:4px 5px; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-seat-record-head b { color:#d8d8d8; font-weight:400; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-seat-values > span {
+  grid-template-columns:auto minmax(0,1fr);
+  align-items:center;
+  gap:4px;
+  padding:2px 5px;
+}
+html[data-theme="tongdaxin"]:root .dragon-tiger-seat-rank { height:16px; border:0; background:#000; font-weight:400; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-seat-rank.buy { color:#ff5555; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-seat-rank.sell { color:#21eff6; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-seat-category { border:0; background:#000; color:#e8df00; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-seat-category.institution { color:#ff00ff; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-seat-category.quant { color:#65c7ff; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-seat-category.hot-money { color:#ff9000; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-seat-empty,
+html[data-theme="tongdaxin"]:root .dragon-tiger-seat-side-empty,
+html[data-theme="tongdaxin"]:root .dragon-tiger-reason-empty { color:#777; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-foot {
+  border-top:1px solid var(--line);
+  padding:4px 7px;
+  background:#080808;
+  color:#777;
+  font-size:10px;
+  text-align:left;
+}
+html[data-theme="tongdaxin"]:root .dragon-tiger-limit-up-tooltip,
+html[data-theme="tongdaxin"]:root .dragon-tiger-continuous-tooltip {
+  border-color:var(--line2);
+  padding:6px 8px;
+  background:#000;
+  box-shadow:none;
+  color:#c8c8c8;
+  font-size:11px;
+}
+html[data-theme="tongdaxin"]:root .dragon-tiger-continuous-tooltip-head { border-color:var(--line); padding-bottom:5px; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-continuous-tooltip-head b { color:#fff200; font-size:12px; }
+html[data-theme="tongdaxin"]:root .dragon-tiger-continuous-tooltip-head em { border-color:#666; padding:1px 4px; background:#111; }
+
+html[data-theme="tongdaxin"]:root .practice-candidates-backdrop {
+  --candidate-overlay:rgba(0,0,0,.76);
+  --candidate-dialog-surface:#000;
+  --candidate-dialog-head:#090909;
+  --candidate-dialog-border:#b50000;
+  --candidate-dialog-shadow:0 24px 64px rgba(0,0,0,.52);
+  --candidate-card-surface:#050505;
+  --candidate-card-border:#8e0000;
+  --candidate-card-expanded-border:#e00000;
+  --candidate-card-divider:#760000;
+  --candidate-card-subtle:#000;
+  --candidate-card-shadow:none;
+  --candidate-card-expanded-shadow:0 8px 22px rgba(0,0,0,.32);
+  --candidate-niuone-bg:#270000;
+  --candidate-niuone-border:#b50000;
+  --candidate-niuone-text:#fff200;
+}
+
+/* Admin and backtest pages */
+html[data-theme="tongdaxin"]:root .admin-header {
+  min-height:30px;
+  padding:3px max(clamp(6px,1vw,12px),calc((100vw - 1600px) / 2));
+}
+html[data-theme="tongdaxin"]:root .admin-main {
+  width:100%;
+  margin:0;
+  padding:4px max(clamp(3px,.8vw,8px),calc((100vw - 1600px) / 2)) 10px;
+  gap:4px;
+}
+html[data-theme="tongdaxin"]:root :where(.settings-index,.settings-detail,.settings-form) { gap:4px; }
+
+html[data-theme="tongdaxin"]:root :where(
+  .settings-card,
+  .settings-sidebar,
+  .settings-group,
+  .notification-channel-card,
+  .admin-login-box,
+  .backtest-hero,
+  .backtest-form,
+  .backtest-progress-card,
+  .backtest-job-summary,
+  .backtest-result-card
+) {
+  border-color:var(--line);
+  background:var(--surface);
+  box-shadow:none;
+}
+
+html[data-theme="tongdaxin"]:root :where(
+  .settings-group-head,
+  .notification-channel-card-head,
+  .notification-channel-actions,
+  .backtest-result-head
+) {
+  border-color:var(--line);
+  background:var(--terminal-header);
+}
+
+html[data-theme="tongdaxin"]:root :where(
+  .setting-state-item,
+  .strategy-option,
+  .notification-block,
+  .notification-compact-field,
+  .notification-channel-control,
+  .notification-channel-empty,
+  .backtest-overview > div,
+  .backtest-diagnostic-groups article,
+  .backtest-month-diagnostic
+) {
+  border-color:var(--line);
+  background:var(--surface2);
+}
+
+html[data-theme="tongdaxin"]:root .settings-breadcrumbs { min-height:24px; }
+html[data-theme="tongdaxin"]:root .settings-back-link {
+  min-height:22px;
+  gap:4px;
+  border-color:#555 #090909 #090909 #555;
+  padding:2px 7px;
+  background:#202020;
+  color:#fff200;
+  font-size:11px;
+  transform:none;
+}
+html[data-theme="tongdaxin"]:root .settings-back-link:hover,
+html[data-theme="tongdaxin"]:root .settings-back-link:focus-visible {
+  border-color:#777 #111 #111 #777;
+  background:#2b2b2b;
+  color:#fff200;
+  transform:none;
+  outline:none;
+}
+html[data-theme="tongdaxin"]:root .settings-group-head {
+  min-height:32px;
+  align-items:center;
+  padding:4px 7px;
+}
+html[data-theme="tongdaxin"]:root .settings-group-head h2 { font-size:13px; line-height:1.15; }
+html[data-theme="tongdaxin"]:root .settings-group-note {
+  max-width:min(1100px,75vw);
+  margin-top:2px;
+  overflow:hidden;
+  font-size:10px;
+  line-height:1.2;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+html[data-theme="tongdaxin"]:root .settings-count {
+  border-color:#555 #090909 #090909 #555;
+  padding:2px 6px;
+  background:#202020;
+  color:#fff200;
+  font-size:10px;
+}
+html[data-theme="tongdaxin"]:root .setting-row {
+  grid-template-columns:minmax(150px,.55fr) minmax(250px,1fr) minmax(220px,.65fr);
+  align-items:center;
+  gap:7px;
+  border-color:var(--line);
+  padding:4px 7px;
+}
+html[data-theme="tongdaxin"]:root .setting-row:hover { background:#160000; }
+html[data-theme="tongdaxin"]:root .config-label { color:#d0d0d0; font-size:12px; font-weight:400; }
+html[data-theme="tongdaxin"]:root .setting-state { grid-template-columns:repeat(2,minmax(0,1fr)); gap:2px; }
+html[data-theme="tongdaxin"]:root .setting-state-item { gap:1px; padding:3px 5px; }
+html[data-theme="tongdaxin"]:root .setting-state-label { color:#888; font-size:9px; font-weight:400; }
+html[data-theme="tongdaxin"]:root .config-meta { color:#b8b8b8; font-size:10px; line-height:1.2; }
+html[data-theme="tongdaxin"]:root :where(
+  .setting-editor input:not([type="radio"]):not([type="checkbox"]):not([type="range"]),
+  .setting-editor select,
+  .time-list-add,
+  .time-list-remove
+) {
+  min-height:24px;
+  padding:3px 6px;
+  font-size:11px;
+}
+html[data-theme="tongdaxin"]:root .setting-editor textarea {
+  min-height:140px;
+  padding:5px 6px;
+  font-size:11px;
+  line-height:1.35;
+}
+html[data-theme="tongdaxin"]:root .strategy-option { gap:5px; padding:5px 6px; }
+html[data-theme="tongdaxin"]:root .news-source-picker { gap:3px; }
+html[data-theme="tongdaxin"]:root .news-source-toolbar { gap:2px; }
+html[data-theme="tongdaxin"]:root .news-source-toolbar input[type="search"] {
+  border-color:#555 #111 #111 #555;
+  background:#000;
+  color:#e0e0e0;
+}
+html[data-theme="tongdaxin"]:root .news-source-toolbar input[type="search"]::placeholder { color:#777; }
+html[data-theme="tongdaxin"]:root .news-source-count {
+  min-height:24px;
+  border:1px solid var(--line2);
+  padding:3px 6px;
+  background:#080808;
+  color:#aaa;
+  font-size:10px;
+  font-weight:400;
+}
+html[data-theme="tongdaxin"]:root .news-source-count b { color:#fff200; font-weight:400; }
+html[data-theme="tongdaxin"]:root .news-source-groups {
+  gap:0;
+  max-height:360px;
+  padding:0;
+  border-color:var(--line2);
+  border-radius:0;
+  background:#000;
+}
+html[data-theme="tongdaxin"]:root .news-source-group { gap:0; background:#000; }
+html[data-theme="tongdaxin"]:root .news-source-group + .news-source-group {
+  border-top-color:var(--line2);
+}
+html[data-theme="tongdaxin"]:root .news-source-group header {
+  min-height:20px;
+  padding:2px 4px;
+  border-bottom:1px solid var(--line);
+  background:var(--terminal-header);
+  color:#fff200;
+  font-size:11px;
+}
+html[data-theme="tongdaxin"]:root .news-source-group header strong { font-weight:400; }
+html[data-theme="tongdaxin"]:root .news-source-group header span { color:#aaa; font-size:9px; }
+html[data-theme="tongdaxin"]:root .news-source-options {
+  grid-template-columns:repeat(auto-fit,minmax(160px,1fr));
+  gap:1px;
+}
+html[data-theme="tongdaxin"]:root .news-source-option {
+  gap:5px;
+  min-height:32px;
+  border-color:#3d3d3d;
+  border-radius:0;
+  padding:3px 5px;
+  background:#080808;
+}
+html[data-theme="tongdaxin"]:root .news-source-option:hover {
+  border-color:var(--accent-border);
+  background:#210000;
+}
+html[data-theme="tongdaxin"]:root .news-source-option:focus-within {
+  outline:1px solid #fff200;
+  outline-offset:-1px;
+}
+html[data-theme="tongdaxin"]:root .news-source-option.selected {
+  border-color:var(--terminal-selection-border);
+  background:var(--terminal-selection);
+}
+html[data-theme="tongdaxin"]:root .news-source-option input {
+  width:13px;
+  min-width:13px;
+  height:13px;
+  accent-color:#d40000;
+}
+html[data-theme="tongdaxin"]:root .news-source-option-copy { gap:1px; }
+html[data-theme="tongdaxin"]:root .news-source-option-copy strong { color:#d8d8d8; font-size:11px; font-weight:400; }
+html[data-theme="tongdaxin"]:root .news-source-option.selected .news-source-option-copy strong { color:#fff; }
+html[data-theme="tongdaxin"]:root .news-source-option-copy small { color:#929292; font-size:9px; }
+html[data-theme="tongdaxin"]:root .news-source-empty {
+  border-color:var(--line);
+  color:#999;
+}
+html[data-theme="tongdaxin"]:root .news-source-reset {
+  min-height:24px;
+  border-color:#555 #090909 #090909 #555;
+  border-radius:0;
+  padding:3px 6px;
+  background:#202020;
+  color:#fff200;
+}
+html[data-theme="tongdaxin"]:root .news-source-reset:hover {
+  border-color:#777 #111 #111 #777;
+  background:#292929;
+  color:#fff200;
+}
+html[data-theme="tongdaxin"]:root .settings-grid { display:flex; flex-wrap:wrap; align-items:flex-start; gap:2px; }
+html[data-theme="tongdaxin"]:root .settings-card:hover,
+html[data-theme="tongdaxin"]:root .settings-card:focus-visible {
+  border-color:#777 #111 #111 #777;
+  background:#2b2b2b;
+  color:#fff200;
+  transform:none;
+  outline:none;
+}
+html[data-theme="tongdaxin"]:root .settings-card {
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  width:auto;
+  min-width:64px;
+  min-height:24px;
+  padding:2px 7px;
+  border:1px solid;
+  border-color:#555 #090909 #090909 #555;
+  background:#202020;
+  color:#fff200;
+  font-weight:700;
+}
+html[data-theme="tongdaxin"]:root :where(
+  .settings-card-icon,
+  .settings-card-summary,
+  .settings-card-meta,
+  .settings-card-arrow
+) { display:none; }
+html[data-theme="tongdaxin"]:root .settings-card-copy { display:block; }
+html[data-theme="tongdaxin"]:root .settings-card-title { overflow:visible; font-size:12px; color:inherit; text-overflow:clip; }
+html[data-theme="tongdaxin"]:root .settings-actions { border-color:var(--accent-border); background:#050505; box-shadow:none; backdrop-filter:none; }
+
+html[data-theme="tongdaxin"]:root :where(.notification-settings,.notification-block,.notification-channel-fields) {
+  gap:6px;
+  padding:7px;
+}
+html[data-theme="tongdaxin"]:root .notification-channel-card-head { padding:5px 7px; }
+html[data-theme="tongdaxin"]:root .notification-channel-actions { min-height:34px; padding:4px 7px; }
+html[data-theme="tongdaxin"]:root .appearance-settings-body { padding:7px; }
+html[data-theme="tongdaxin"]:root .appearance-mode-layout { gap:5px; }
+html[data-theme="tongdaxin"]:root .appearance-mode-section { gap:6px; padding:6px; }
+html[data-theme="tongdaxin"]:root .appearance-settings-grid { gap:5px; }
+html[data-theme="tongdaxin"]:root .appearance-option-group { gap:4px; }
+html[data-theme="tongdaxin"]:root .appearance-option-card { min-height:46px; gap:6px; padding:5px; }
+@media(min-width:941px) {
+  html[data-theme="tongdaxin"]:root .appearance-tongdaxin-option { margin-top:18px; }
+}
+
+html[data-theme="tongdaxin"]:root .appearance-option-card {
+  border-color:var(--line);
+  background:var(--surface2);
+}
+html[data-theme="tongdaxin"]:root .appearance-option-card:hover { border-color:var(--accent-border); }
+html[data-theme="tongdaxin"]:root .appearance-option-card.selected { border-color:var(--accent); background:var(--accent-soft); }
+html[data-theme="tongdaxin"]:root .appearance-mode-section {
+  border-color:var(--line);
+  background:var(--surface);
+}
+html[data-theme="tongdaxin"]:root .appearance-mode-section.selected {
+  border-color:var(--accent-border);
+  background:#080000;
+}
+
+html[data-theme="tongdaxin"]:root :where(.theme-row,.backtest-month-diagnostic:nth-child(even)) {
+  background:var(--terminal-row-alt);
+}
+
+html[data-theme="tongdaxin"]:root :where(.primary-btn,.danger-btn,.save-btn) {
+  box-shadow:none;
+  text-transform:none;
+}
+
+/* Shared Windows-era push-button chrome for every terminal action control. */
+html[data-theme="tongdaxin"]:root body :where(
+  button:not(.practice-trade-marker):not(.practice-log-row):not(.us-market-head),
+  [role="button"]:not(.practice-log-row):not(.us-market-head):not(.market-monitor-card),
+  a.header-link,
+  a.settings-link,
+  a.toplink,
+  a.settings-back-link,
+  a.settings-card,
+  a.tab,
+  .dragon-tiger-unavailable a,
+  .version-update-actions a
+) {
+  border:1px solid !important;
+  border-color:var(--terminal-button-border-light) var(--terminal-button-border-dark) var(--terminal-button-border-dark) var(--terminal-button-border-light) !important;
+  background:var(--terminal-button-bg) !important;
+  color:var(--terminal-button-text) !important;
+  box-shadow:inset 1px 1px 0 #383838,inset -1px -1px 0 #000 !important;
+  filter:none !important;
+  text-decoration:none;
+  text-shadow:none !important;
+  transform:none !important;
+}
+
+html[data-theme="tongdaxin"]:root body :where(
+  button:not(.practice-trade-marker):not(.practice-log-row):not(.us-market-head),
+  [role="button"]:not(.practice-log-row):not(.us-market-head):not(.market-monitor-card),
+  a.header-link,
+  a.settings-link,
+  a.toplink,
+  a.settings-back-link,
+  a.settings-card,
+  a.tab,
+  .dragon-tiger-unavailable a,
+  .version-update-actions a
+):hover:not(:disabled) {
+  border-color:#777 #111 #111 #777 !important;
+  background:var(--terminal-button-bg-hover) !important;
+  color:var(--terminal-button-accent) !important;
+  box-shadow:inset 1px 1px 0 #444,inset -1px -1px 0 #050505 !important;
+}
+
+html[data-theme="tongdaxin"]:root body :where(
+  button:not(.practice-trade-marker):not(.practice-log-row):not(.us-market-head),
+  [role="button"]:not(.practice-log-row):not(.us-market-head):not(.market-monitor-card),
+  a.header-link,
+  a.settings-link,
+  a.toplink,
+  a.settings-back-link,
+  a.settings-card,
+  a.tab,
+  .dragon-tiger-unavailable a,
+  .version-update-actions a
+):active:not(:disabled) {
+  border-color:var(--terminal-button-border-dark) var(--terminal-button-border-light) var(--terminal-button-border-light) var(--terminal-button-border-dark) !important;
+  background:var(--terminal-button-bg-pressed) !important;
+  box-shadow:inset 1px 1px 0 #000,inset -1px -1px 0 #333 !important;
+}
+
+html[data-theme="tongdaxin"]:root body :where(
+  button:not(.practice-trade-marker):not(.practice-log-row):not(.us-market-head),
+  [role="button"]:not(.practice-log-row):not(.us-market-head):not(.market-monitor-card),
+  a.header-link,
+  a.settings-link,
+  a.toplink,
+  a.settings-back-link,
+  a.settings-card,
+  a.tab,
+  .dragon-tiger-unavailable a,
+  .version-update-actions a
+):focus-visible {
+  outline:1px dotted var(--terminal-button-accent) !important;
+  outline-offset:1px;
+}
+
+html[data-theme="tongdaxin"]:root body :where(
+  button.active,
+  button[aria-pressed="true"],
+  .settings-link.active,
+  .tab.active,
+  .notification-channel-activation.is-active
+):not(.practice-trade-marker):not(.theme-toggle):not(.admin-theme-toggle) {
+  border-color:#ef2020 #570000 #570000 #ef2020 !important;
+  background:#8c0000 !important;
+  color:#fff200 !important;
+  box-shadow:inset 1px 1px 0 #bd2222,inset -1px -1px 0 #310000 !important;
+}
+html[data-theme="tongdaxin"]:root body .category-tabs .tab.active { color:#fff !important; }
+
+html[data-theme="tongdaxin"]:root body :where(
+  .settings-link,
+  .settings-back-link,
+  .settings-card,
+  .header-link[href*="github.com"]
+) {
+  color:var(--terminal-button-accent) !important;
+  font-weight:700;
+}
+
+html[data-theme="tongdaxin"]:root body :where(
+  button:disabled,
+  [role="button"][aria-disabled="true"]
+) {
+  cursor:not-allowed;
+  border-color:#303030 #090909 #090909 #303030 !important;
+  background:#141414 !important;
+  color:#666 !important;
+  box-shadow:inset 1px 1px 0 #202020 !important;
+  opacity:1;
+}
+
+html[data-theme="tongdaxin"]:root body :where(
+  .danger-btn,
+  .backtest-cancel,
+  .notification-channel-remove,
+  .save-button.error,
+  .model-test-button.is-error
+):not(:disabled) { color:var(--red-text) !important; }
+
+html[data-theme="tongdaxin"]:root body :where(
+  .save-button.saved,
+  .model-test-button.is-ok
+):not(:disabled) { color:var(--green-text) !important; }
+
+html[data-theme="tongdaxin"]:root body .theme-leader-button {
+  min-height:24px;
+  padding:3px 6px;
+}
+
+/* Strategy backtest: TongdaXin terminal presentation. */
+html[data-theme="tongdaxin"]:root .backtest-page {
+  gap:3px;
+  padding-top:4px;
+  color:#d0d0d0;
+  font-family:Tahoma,"Microsoft YaHei",Arial,sans-serif;
+}
+html[data-theme="tongdaxin"]:root :where(
+  .backtest-hero,
+  .backtest-form,
+  .backtest-progress-card,
+  .backtest-job-summary,
+  .backtest-result-card,
+  .backtest-quality,
+  .backtest-overview,
+  .backtest-month-diagnostic,
+  .backtest-month-diagnostic-body>.backtest-table-wrap
+) {
+  border-color:var(--line);
+  border-radius:0;
+  background:#000;
+  box-shadow:none;
+}
+html[data-theme="tongdaxin"]:root .backtest-hero {
+  min-height:44px;
+  padding:5px 7px;
+}
+html[data-theme="tongdaxin"]:root :where(
+  .backtest-hero-copy h2,
+  .backtest-form h2,
+  .backtest-progress-card h2,
+  .backtest-result-card h2
+) {
+  color:#e5e5e5;
+  font-size:12px;
+  font-weight:700;
+}
+html[data-theme="tongdaxin"]:root :where(
+  .backtest-hero-copy p,
+  .backtest-form-head p,
+  .backtest-progress-card p,
+  .backtest-result-head p
+) {
+  margin-top:2px;
+  color:#8e8e8e;
+  font-size:10px;
+  line-height:1.35;
+}
+html[data-theme="tongdaxin"]:root .backtest-tags { gap:2px; }
+html[data-theme="tongdaxin"]:root .backtest-tags span {
+  padding:2px 6px;
+  border-color:#555 #090909 #090909 #555;
+  border-radius:0;
+  background:#202020;
+  color:#fff200;
+  font-size:10px;
+  box-shadow:inset 1px 1px 0 #303030,inset -1px -1px 0 #000;
+}
+html[data-theme="tongdaxin"]:root .backtest-notice {
+  padding:5px 7px;
+  border-color:var(--line);
+  border-radius:0;
+  background:#080808;
+  color:#c7c7c7;
+  font-size:10px;
+}
+html[data-theme="tongdaxin"]:root .backtest-notice.is-warning {
+  border-color:#665d00;
+  background:#0b0a00;
+  color:#fff200;
+}
+html[data-theme="tongdaxin"]:root .backtest-quality { color:#fff200; }
+html[data-theme="tongdaxin"]:root .backtest-quality summary { padding:5px 7px; }
+html[data-theme="tongdaxin"]:root .backtest-quality-icon,
+html[data-theme="tongdaxin"]:root .backtest-quality-count {
+  border-color:#665d00;
+  border-radius:0;
+  background:#111000;
+  color:#fff200;
+}
+html[data-theme="tongdaxin"]:root .backtest-quality-details {
+  border-color:#665d00;
+  background:#000;
+}
+html[data-theme="tongdaxin"]:root .backtest-quality-details>div {
+  padding:5px 7px;
+  border-color:#3f3900;
+}
+html[data-theme="tongdaxin"]:root .backtest-quality-details span { color:#aaa; }
+html[data-theme="tongdaxin"]:root :where(
+  .backtest-form-head,
+  .backtest-result-head,
+  .backtest-progress-head,
+  .backtest-actions
+) {
+  padding:5px 7px;
+  border-color:var(--line);
+  background:var(--terminal-header);
+}
+html[data-theme="tongdaxin"]:root .backtest-fields {
+  gap:4px;
+  padding:6px 7px;
+}
+html[data-theme="tongdaxin"]:root .backtest-fields label {
+  gap:3px;
+  color:#aaa;
+  font-size:10px;
+}
+html[data-theme="tongdaxin"]:root .backtest-fields label>small { color:#707070; }
+html[data-theme="tongdaxin"]:root .backtest-fields :where(input,select) {
+  min-height:24px;
+  padding:2px 5px;
+  border-color:#555 #090909 #090909 #555;
+  border-radius:0;
+  background:#0b0b0b;
+  color:#e5e5e5;
+  font-family:Tahoma,"Microsoft YaHei",Arial,sans-serif;
+  font-size:11px;
+  box-shadow:inset 1px 1px 0 #050505;
+}
+html[data-theme="tongdaxin"]:root .backtest-actions { gap:4px; }
+html[data-theme="tongdaxin"]:root body :where(.backtest-start,.backtest-cancel) {
+  min-width:88px;
+  min-height:24px;
+  padding:2px 8px;
+  border-color:#555 #090909 #090909 #555 !important;
+  border-radius:0;
+  background:#202020 !important;
+  box-shadow:inset 1px 1px 0 #383838,inset -1px -1px 0 #000 !important;
+  font-size:11px;
+}
+html[data-theme="tongdaxin"]:root body .backtest-start:not(:disabled) { color:#fff200 !important; }
+html[data-theme="tongdaxin"]:root body .backtest-cancel:not(:disabled) { color:#ff4141 !important; }
+html[data-theme="tongdaxin"]:root .backtest-progress-head strong {
+  color:#fff200;
+  font-size:18px;
+}
+html[data-theme="tongdaxin"]:root .backtest-status {
+  margin-bottom:3px;
+  padding:1px 5px;
+  border-color:#555 #090909 #090909 #555;
+  border-radius:0;
+  background:#202020;
+  color:#fff200;
+  font-size:9px;
+}
+html[data-theme="tongdaxin"]:root .backtest-status.is-succeeded { color:#00d8b4; }
+html[data-theme="tongdaxin"]:root :where(.backtest-status.is-failed,.backtest-status.is-cancelled) { color:#ff4141; }
+html[data-theme="tongdaxin"]:root .backtest-progress-track {
+  height:4px;
+  margin:6px 7px 0;
+  border-color:#500000;
+  border-radius:0;
+  background:#140000;
+}
+html[data-theme="tongdaxin"]:root .backtest-progress-track span {
+  border-radius:0;
+  background:#d40000;
+}
+html[data-theme="tongdaxin"]:root .backtest-timestamps {
+  gap:4px 12px;
+  margin-top:5px;
+  padding:4px 7px 6px;
+  border-color:var(--line);
+  color:#777;
+  font-size:9px;
+}
+html[data-theme="tongdaxin"]:root .backtest-job-summary { padding:4px 6px; }
+html[data-theme="tongdaxin"]:root .backtest-overview { border-color:var(--line); }
+html[data-theme="tongdaxin"]:root .backtest-overview>div {
+  min-height:48px;
+  padding:5px 7px;
+  border-color:var(--line);
+  background:#000;
+}
+html[data-theme="tongdaxin"]:root .backtest-overview span { color:#888; font-size:9px; }
+html[data-theme="tongdaxin"]:root .backtest-overview strong { color:#fff200; font-size:16px; }
+html[data-theme="tongdaxin"]:root .backtest-scope-summary strong { color:#e5e5e5; font-size:11px; }
+html[data-theme="tongdaxin"]:root .backtest-scope-summary small { color:#777; }
+html[data-theme="tongdaxin"]:root .backtest-result-head { min-height:34px; }
+html[data-theme="tongdaxin"]:root .backtest-table-wrap table {
+  border-color:var(--line);
+  background:#000;
+  color:#cfcfcf;
+  font-size:10px;
+}
+html[data-theme="tongdaxin"]:root .backtest-table-wrap :where(th,td) {
+  height:24px;
+  padding:3px 6px;
+  border-color:var(--line);
+}
+html[data-theme="tongdaxin"]:root .backtest-table-wrap th {
+  background:var(--terminal-header);
+  color:#aaa;
+  font-size:9px;
+  font-weight:400;
+}
+html[data-theme="tongdaxin"]:root .backtest-table-wrap tbody tr:nth-child(odd) { background:#000; }
+html[data-theme="tongdaxin"]:root .backtest-table-wrap tbody tr:nth-child(even) { background:#080808; }
+html[data-theme="tongdaxin"]:root .backtest-table-wrap tbody tr:hover {
+  background:#181000;
+  box-shadow:none;
+}
+html[data-theme="tongdaxin"]:root .backtest-table-wrap td { color:#bcbcbc; }
+html[data-theme="tongdaxin"]:root .backtest-table-wrap .is-positive { color:#ff4141; }
+html[data-theme="tongdaxin"]:root .backtest-table-wrap .is-negative { color:#00d8b4; }
+html[data-theme="tongdaxin"]:root .backtest-diagnostic-groups {
+  border-color:var(--line);
+  background:#000;
+}
+html[data-theme="tongdaxin"]:root .backtest-diagnostic-groups article {
+  padding:6px;
+  border-color:var(--line);
+  background:#000;
+}
+html[data-theme="tongdaxin"]:root .backtest-diagnostic-groups h3 { color:#fff200; font-size:10px; }
+html[data-theme="tongdaxin"]:root .backtest-blockers li {
+  border:1px solid #2f0000;
+  border-radius:0;
+  background:#080808;
+}
+html[data-theme="tongdaxin"]:root .backtest-blockers b { color:#fff200; }
+html[data-theme="tongdaxin"]:root .backtest-monthly-diagnostics { gap:3px; padding:4px; }
+html[data-theme="tongdaxin"]:root .backtest-month-diagnostic>summary { padding:4px 6px; }
+html[data-theme="tongdaxin"]:root .backtest-month-diagnostic>summary strong { color:#e5e5e5; font-size:10px; }
+html[data-theme="tongdaxin"]:root .backtest-month-diagnostic>summary span { color:#888; font-size:9px; }
+html[data-theme="tongdaxin"]:root .backtest-month-diagnostic-body { gap:4px; padding:0 4px 4px; }
+html[data-theme="tongdaxin"]:root .backtest-month-diagnostic-body>.backtest-table-wrap { margin-top:4px; }
+html[data-theme="tongdaxin"]:root .backtest-empty { padding:12px; color:#777; font-size:10px; }
+
+@media(max-width:720px) {
+  html[data-theme="tongdaxin"]:root { scrollbar-gutter:auto; }
+  html[data-theme="tongdaxin"]:root header { padding:8px 10px; }
+  html[data-theme="tongdaxin"]:root h1 { font-size:18px; }
+  html[data-theme="tongdaxin"]:root .dashboard-brand-logo { width:28px; height:28px; }
+  html[data-theme="tongdaxin"]:root .category-tabs {
+    width:calc(100% + 18px);
+    max-width:none;
+    margin-top:6px;
+  }
+  html[data-theme="tongdaxin"]:root .tab { min-height:28px; padding:5px 10px; }
+  html[data-theme="tongdaxin"]:root main { padding:8px 8px 22px; }
+  html[data-theme="tongdaxin"]:root .practice-chart-wrap { height:180px; }
+  html[data-theme="tongdaxin"]:root .position-metrics { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  html[data-theme="tongdaxin"]:root .position-metric { border-bottom:1px solid #3f0000; }
+  html[data-theme="tongdaxin"]:root .position-metric:nth-child(odd) { border-left:0; }
+  html[data-theme="tongdaxin"]:root :where(
+    .overview-command-head,
+    .practice-account-head,
+    .mainline-heading,
+    .indices-part-head,
+    .dragon-tiger-head,
+    .rating-table-title
+  ) {
+    flex:0 0 auto !important;
+    height:auto !important;
+    min-height:var(--terminal-page-title-height) !important;
+    overflow:visible;
+  }
+  /* Keep the route title inside the mobile viewport instead of centering its
+     desktop-width title/subtitle row beyond both screen edges. */
+  html[data-theme="tongdaxin"]:root .mainline-heading {
+    width:100%;
+    align-items:stretch;
+    flex-direction:column;
+    gap:3px;
+    overflow:hidden;
+  }
+  html[data-theme="tongdaxin"]:root .mainline-heading > div:first-child {
+    box-sizing:border-box;
+    width:100%;
+    display:grid;
+    grid-template-columns:max-content minmax(0,1fr);
+    align-items:baseline;
+    gap:6px;
+  }
+  html[data-theme="tongdaxin"]:root .mainline-heading p {
+    overflow:hidden;
+    text-overflow:ellipsis;
+    white-space:nowrap;
+  }
+  html[data-theme="tongdaxin"]:root .mainline-actions {
+    width:100%;
+    min-width:0;
+    justify-content:space-between;
+    gap:4px;
+  }
+  html[data-theme="tongdaxin"]:root .mainline-time {
+    min-width:0;
+    overflow:hidden;
+    text-overflow:ellipsis;
+    white-space:nowrap;
+  }
+  /* Mobile mainline rows reflow into multiple grid lines. Let longer theme
+     names and metrics grow the row instead of clipping into the next item. */
+  html[data-theme="tongdaxin"]:root .theme-row {
+    height:auto;
+    min-height:80px;
+  }
+  html[data-theme="tongdaxin"]:root .theme-toggle:hover,
+  html[data-theme="tongdaxin"]:root .theme-toggle:active,
+  html[data-theme="tongdaxin"]:root .theme-toggle:focus,
+  html[data-theme="tongdaxin"]:root .theme-toggle:focus-visible {
+    border-color:var(--terminal-button-border-light) var(--terminal-button-border-dark) var(--terminal-button-border-dark) var(--terminal-button-border-light) !important;
+    background:var(--terminal-button-bg) !important;
+    color:var(--terminal-button-text) !important;
+    outline:none !important;
+    box-shadow:inset 1px 1px 0 #383838,inset -1px -1px 0 #000 !important;
+  }
+}
+
+html[data-theme="tongdaxin"]:root .realtime-news-page {
+  gap:2px;
+  max-width:none;
+}
+html[data-theme="tongdaxin"]:root .realtime-news-header,
+html[data-theme="tongdaxin"]:root .realtime-news-stream { border-color:var(--terminal-grid); background:#000; }
+html[data-theme="tongdaxin"]:root .realtime-news-heading {
+  min-height:42px;
+  padding:5px 7px;
+  border-bottom-color:var(--terminal-grid);
+  background:var(--terminal-header-deep);
+}
+html[data-theme="tongdaxin"]:root .realtime-news-heading h2 { color:#fff200; font-size:15px; font-weight:400; }
+html[data-theme="tongdaxin"]:root .realtime-news-heading p { margin-top:1px; color:#aaa; font-size:10px; }
+html[data-theme="tongdaxin"]:root .realtime-news-eyebrow {
+  border-color:#666;
+  padding:1px 4px;
+  color:#d8d8d8;
+  background:#111;
+  font-size:9px;
+  font-weight:400;
+}
+html[data-theme="tongdaxin"]:root .realtime-news-health {
+  min-height:22px;
+  border-color:#666;
+  padding:2px 5px;
+  color:#d8d8d8;
+  background:#111;
+  font-size:10px;
+  font-weight:400;
+}
+html[data-theme="tongdaxin"]:root .realtime-news-health.success { border-color:#007b82; color:#21eff6; background:#001f22; }
+html[data-theme="tongdaxin"]:root .realtime-news-controls { min-height:30px; gap:2px; padding:3px; background:#000; }
+html[data-theme="tongdaxin"]:root .realtime-news-sources { gap:2px; }
+html[data-theme="tongdaxin"]:root .realtime-news-sources button,
+html[data-theme="tongdaxin"]:root .realtime-news-refresh,
+html[data-theme="tongdaxin"]:root .realtime-news-important-toggle {
+  min-height:22px;
+  border-color:var(--terminal-button-border-light) var(--terminal-button-border-dark) var(--terminal-button-border-dark) var(--terminal-button-border-light);
+  padding:3px 6px;
+  color:var(--terminal-button-text);
+  background:var(--terminal-button-bg);
+  font-size:10px;
+  font-weight:400;
+  box-shadow:inset 1px 1px 0 #383838,inset -1px -1px 0 #000;
+}
+html[data-theme="tongdaxin"]:root .realtime-news-sources button.active {
+  border-color:var(--terminal-selection-border);
+  color:#fff200;
+  background:var(--terminal-selection);
+  font-weight:400;
+  box-shadow:none;
+}
+html[data-theme="tongdaxin"]:root .realtime-news-refresh { color:#fff200; }
+html[data-theme="tongdaxin"]:root .realtime-news-table-head,
+html[data-theme="tongdaxin"]:root .realtime-news-item { grid-template-columns:112px minmax(0,1fr); }
+html[data-theme="tongdaxin"]:root .realtime-news-table-head {
+  min-height:22px;
+  border-bottom-color:var(--terminal-grid);
+  color:#d8d8d8;
+  background:var(--terminal-header);
+  font-size:10px;
+  font-weight:400;
+}
+html[data-theme="tongdaxin"]:root .realtime-news-table-head span { padding:3px 5px; }
+html[data-theme="tongdaxin"]:root .realtime-news-table-head span:not(:last-child),
+html[data-theme="tongdaxin"]:root .realtime-news-meta-cell { border-color:var(--terminal-grid); }
+html[data-theme="tongdaxin"]:root .realtime-news-table-head span:not(:last-child),
+html[data-theme="tongdaxin"]:root .realtime-news-meta-cell { border-right:1px solid var(--terminal-grid); }
+html[data-theme="tongdaxin"]:root .realtime-news-item { background:var(--terminal-row); }
+html[data-theme="tongdaxin"]:root .realtime-news-item:nth-child(even) { background:var(--terminal-row-alt); }
+html[data-theme="tongdaxin"]:root .realtime-news-item + .realtime-news-item { border-top-color:var(--terminal-grid); }
+html[data-theme="tongdaxin"]:root .realtime-news-item:hover { background:var(--terminal-selection); }
+html[data-theme="tongdaxin"]:root .realtime-news-item.important { background:#1d0000; }
+html[data-theme="tongdaxin"]:root .realtime-news-item.important:hover { background:#310000; }
+html[data-theme="tongdaxin"]:root .realtime-news-meta-cell { gap:2px; padding:4px 5px; }
+html[data-theme="tongdaxin"]:root .realtime-news-item time { padding:0; }
+html[data-theme="tongdaxin"]:root .realtime-news-item time strong { color:#fff200; font-size:11px; font-weight:400; }
+html[data-theme="tongdaxin"]:root .realtime-news-item time span { color:#888; font-size:9px; }
+html[data-theme="tongdaxin"]:root .realtime-news-source-cell { justify-content:flex-start; padding:0; color:var(--terminal-orange); font-size:10px; font-weight:400; text-align:left; }
+html[data-theme="tongdaxin"]:root .realtime-news-item article { padding:4px 6px 5px; }
+html[data-theme="tongdaxin"]:root .realtime-news-title-row > a,
+html[data-theme="tongdaxin"]:root .realtime-news-title-row > h3 { color:#d8d8d8; font-size:11px; line-height:1.4; font-weight:400; }
+html[data-theme="tongdaxin"]:root .realtime-news-item.important .realtime-news-title-row > a,
+html[data-theme="tongdaxin"]:root .realtime-news-item.important .realtime-news-title-row > h3 { color:#ff5555; }
+html[data-theme="tongdaxin"]:root .realtime-news-title-row > a:hover { color:#fff200; }
+html[data-theme="tongdaxin"]:root .realtime-news-important {
+  min-height:16px;
+  border-color:#d40000;
+  padding:1px 3px;
+  color:#fff200;
+  background:#520000;
+  font-size:9px;
+  font-weight:400;
+}
+html[data-theme="tongdaxin"]:root .realtime-news-item article > p {
+  max-width:none;
+  margin-top:2px;
+  color:#999;
+  font-size:10px;
+  line-height:1.4;
+}
+
+@media(max-width:760px) {
+  html[data-theme="tongdaxin"]:root .realtime-news-heading { min-height:0; }
+  html[data-theme="tongdaxin"]:root .realtime-news-table-head { display:none; }
+  html[data-theme="tongdaxin"]:root .realtime-news-item { grid-template-columns:minmax(0,1fr); }
+  html[data-theme="tongdaxin"]:root .realtime-news-meta-cell { grid-column:1; grid-row:1; border-right:0; }
+  html[data-theme="tongdaxin"]:root .realtime-news-item article { grid-column:1; grid-row:2; }
+}
+
+@media(max-width:560px) {
+  html[data-theme="tongdaxin"]:root .mainline-summary-card {
+    min-height:72px;
+    padding:5px 6px;
+  }
+  html[data-theme="tongdaxin"]:root .mainline-summary-card.empty {
+    padding:5px 6px !important;
+  }
+  html[data-theme="tongdaxin"]:root .mainline-summary-card strong {
+    margin:4px 0 2px;
+  }
+
+  /* The desktop terminal table exposes all four headers. The mobile component
+     reflows rows into two lines, so reset the inherited desktop cell geometry,
+     keep only the assigned headers, and show exactly five compact stock rows. */
+  html[data-theme="tongdaxin"]:root .theme-stock-details {
+    max-height:222px;
+  }
+  html[data-theme="tongdaxin"]:root .theme-stock-details-head {
+    height:20px;
+    min-height:20px;
+  }
+  html[data-theme="tongdaxin"]:root .theme-stock-detail-row {
+    height:40px;
+    min-height:40px;
+  }
+  html[data-theme="tongdaxin"]:root :where(.theme-stock-details-head,.theme-stock-detail-row) {
+    grid-template-columns:minmax(0,1fr) minmax(58px,30%);
+  }
+  html[data-theme="tongdaxin"]:root .theme-stock-detail-head-code,
+  html[data-theme="tongdaxin"]:root .theme-stock-detail-head-attribution {
+    display:none;
+  }
+  html[data-theme="tongdaxin"]:root :where(.theme-stock-details-head,.theme-stock-detail-row) > * {
+    min-width:0;
+    min-height:0;
+    padding:1px 4px;
+    overflow:hidden;
+  }
+  html[data-theme="tongdaxin"]:root .theme-stock-detail-code {
+    border-left:0;
+  }
+  html[data-theme="tongdaxin"]:root .theme-stock-detail-attribution {
+    justify-self:stretch;
+    justify-content:flex-end;
+  }
+}
+
+/* Tongdaxin light palette: the same dense quote-terminal layout with Windows 95 chrome. */
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root {
+  color-scheme:light;
+  --bg:#c0c0c0;
+  --panel:#fff;
+  --panel2:#f0f0f0;
+  --surface:#c0c0c0;
+  --surface2:#dfdfdf;
+  --field:#fff;
+  --text:#000;
+  --muted:#555;
+  --soft:#222;
+  --line:#808080;
+  --line2:#000;
+  --accent:#000080;
+  --accent-soft:#d6e4ff;
+  --accent-border:#000080;
+  --accent-text:#000080;
+  --primary:#000080;
+  --primary-text:#fff;
+  --green:#007b7b;
+  --green-soft:#d8f0ec;
+  --green-border:#008080;
+  --green-text:#006565;
+  --red:#c00000;
+  --red-soft:#f7dddd;
+  --red-border:#a00000;
+  --red-text:#a00000;
+  --yellow:#666000;
+  --yellow-soft:#fff8c6;
+  --yellow-border:#808000;
+  --yellow-text:#565000;
+  --danger-button-bg:#c0c0c0;
+  --danger-button-hover:#d4d0c8;
+  --danger-button-border:#000;
+  --danger-button-text:#a00000;
+  --terminal-header:#000080;
+  --terminal-header-deep:#000080;
+  --terminal-row:#fff;
+  --terminal-row-alt:#f0f0f0;
+  --terminal-selection:#000080;
+  --terminal-selection-border:#000;
+  --terminal-grid:#808080;
+  --terminal-orange:#9a4d00;
+  --terminal-magenta:#800080;
+  --terminal-button-bg:#c0c0c0;
+  --terminal-button-bg-hover:#d4d0c8;
+  --terminal-button-bg-pressed:#b0b0b0;
+  --terminal-button-border-light:#fff;
+  --terminal-button-border-dark:#000;
+  --terminal-button-text:#000;
+  --terminal-button-accent:#000080;
+  --chart-grid:rgba(0,0,0,.24);
+  --chart-grid-soft:rgba(0,0,0,.13);
+  --chart-zero:rgba(0,0,0,.48);
+  --chart-marker:#000;
+}
+
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root body {
+  background:#c0c0c0;
+  color:#000;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root ::selection { background:#000080; color:#fff; }
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root { scrollbar-color:#c0c0c0 #fff; }
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root ::-webkit-scrollbar-track {
+  border-color:#808080;
+  background:#fff;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root ::-webkit-scrollbar-thumb {
+  border-color:#fff #000 #000 #fff;
+  background:#c0c0c0;
+  box-shadow:inset 1px 1px 0 #dfdfdf,inset -1px -1px 0 #808080;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root ::-webkit-scrollbar-corner { background:#c0c0c0; }
+
+/* Window frames and title bars. */
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root header,
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .admin-header {
+  border-color:#fff #000 #000 #fff;
+  background:#c0c0c0;
+  box-shadow:inset 1px 1px 0 #dfdfdf,inset -1px -1px 0 #808080;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .dashboard-brand { color:#000; }
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .appearance-current {
+  border-color:#fff #000 #000 #fff;
+  background:#c0c0c0;
+  color:#000080 !important;
+  box-shadow:inset 1px 1px 0 #dfdfdf,inset -1px -1px 0 #808080;
+  text-shadow:none;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .overview-command-head .overview-command-meta {
+  color:#fff;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .overview-command-head .overview-stale-badge {
+  border-color:#808000;
+  background:#fff8c6;
+  color:#565000 !important;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .overview-news-source {
+  color:#000080;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .news-source-toolbar input[type="search"] {
+  border-color:#808080 #fff #fff #808080;
+  background:#fff;
+  color:#000;
+  box-shadow:inset 1px 1px 0 #000;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .news-source-toolbar input[type="search"]::placeholder {
+  color:#666;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .news-source-count {
+  border-color:#808080;
+  background:#dfdfdf;
+  color:#333;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .news-source-count b {
+  color:#000080;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .refresh-pill {
+  border-color:#fff #000 #000 #fff !important;
+  background:#c0c0c0 !important;
+  color:#000 !important;
+  box-shadow:inset 1px 1px 0 #dfdfdf,inset -1px -1px 0 #808080 !important;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root :where(
+  .version-status,
+  .refresh-pill
+) :where(span,b) {
+  color:#000 !important;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .version-status:disabled :where(span,b) {
+  color:#808080 !important;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .category-tabs {
+  border:2px solid;
+  border-color:#808080 #fff #fff #808080;
+  background:#c0c0c0;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .tab { border-right-color:#808080; color:#000; }
+
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root :where(
+  .overview-command-head,
+  .practice-account-head,
+  .mainline-heading,
+  .indices-part-head,
+  .market-card-head,
+  .market-monitor-table-head,
+  .market-section-head,
+  .market-day-pager,
+  .us-market-head,
+  .practice-chart-head,
+  .practice-position-bar,
+  .practice-log-head,
+  .practice-log-detail-head,
+  .practice-rule-head,
+  .practice-calendar-head,
+  .rating-table-title,
+  .rating-table th,
+  .theme-ranking-head,
+  .theme-stock-details-head,
+  .dragon-tiger-head,
+  .dragon-tiger-list-head,
+  .dragon-tiger-reasons-head,
+  .dragon-tiger-funds-head,
+  .dragon-tiger-seats-head,
+  .dragon-tiger-seat-side-head,
+  .settings-group-head,
+  .notification-channel-card-head,
+  .notification-channel-actions,
+  .backtest-form-head,
+  .backtest-result-head,
+  .backtest-progress-head,
+  .backtest-actions,
+  .backtest-table-wrap th,
+  .realtime-news-heading,
+  .realtime-news-table-head,
+  .overview-theme-table-head,
+  .overview-candidate-table-head,
+  .overview-theme-stock-list-head
+) {
+  border-color:#000;
+  background:#000080;
+  color:#fff;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .indices-index-stack > div > h3,
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .news-source-group header {
+  border-color:#000;
+  background:#000080;
+  color:#fff !important;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root :where(
+  .overview-command-head,
+  .practice-account-head,
+  .mainline-heading,
+  .indices-part-head,
+  .market-card-head,
+  .market-monitor-table-head,
+  .market-section-head,
+  .market-day-pager,
+  .us-market-head,
+  .practice-chart-head,
+  .practice-position-bar,
+  .practice-log-head,
+  .practice-log-detail-head,
+  .practice-rule-head,
+  .practice-calendar-head,
+  .rating-table-title,
+  .theme-ranking-head,
+  .theme-stock-details-head,
+  .dragon-tiger-head,
+  .dragon-tiger-list-head,
+  .settings-group-head,
+  .backtest-form-head,
+  .backtest-result-head,
+  .backtest-progress-head,
+  .realtime-news-heading,
+  .realtime-news-table-head
+) :where(h1,h2,h3,h4,strong,b,small,span,p,time) { color:inherit !important; }
+
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root :where(
+  .card,
+  .sector-cloud,
+  .market-breadth-card,
+  .market-monitor-grid,
+  .market-detail-overview,
+  .market-section,
+  .practice-log-panel,
+  .practice-chart-card,
+  .rating-card,
+  .rating-table-wrap,
+  .dragon-tiger-panel,
+  .mainline-hero,
+  .theme-ranking-panel,
+  .settings-group,
+  .settings-sidebar,
+  .admin-login-box,
+  .backtest-hero,
+  .backtest-form,
+  .backtest-progress-card,
+  .backtest-job-summary,
+  .backtest-result-card,
+  .backtest-quality,
+  .backtest-overview,
+  .backtest-month-diagnostic
+) {
+  border-color:#fff #000 #000 #fff;
+  background:#c0c0c0;
+  box-shadow:inset 1px 1px 0 #dfdfdf,inset -1px -1px 0 #808080;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .appearance-mode-section {
+  border-color:#fff #000 #000 #fff;
+  background:#c0c0c0;
+  box-shadow:inset 1px 1px 0 #dfdfdf,inset -1px -1px 0 #808080;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .appearance-mode-section.selected {
+  border-color:#000080;
+  background:#dfdfdf;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .settings-actions {
+  border-color:#808080;
+  background:#c0c0c0;
+}
+
+/* Quote canvases and alternating ledger rows. */
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root :where(
+  .overview-panel,
+  .indices-index-stack > div,
+  .index-card,
+  .practice-stats .inline-field,
+  .practice-kpi,
+  .position-card,
+  .position-reason-block,
+  .empty,
+  .indices-switch,
+  .market-region-switch,
+  .practice-mode-control,
+  .market-breadth-controls,
+  .market-mood-panel,
+  .market-card-detail,
+  .market-card-detail .market-section,
+  .market-card-detail .market-section-body,
+  .thread-original,
+  .thread-reply,
+  .theme-stock-details,
+  .dragon-tiger-unavailable,
+  .dragon-tiger-list,
+  .dragon-tiger-detail,
+  .dragon-tiger-detail-meta,
+  .dragon-tiger-reasons,
+  .dragon-tiger-funds,
+  .dragon-tiger-seats,
+  .dragon-tiger-limit-up-reason,
+  .dragon-tiger-continuous-news,
+  .dragon-tiger-seat-side,
+  .dragon-tiger-seat-side.buy,
+  .dragon-tiger-seat-side.sell,
+  .dragon-tiger-seat-rank,
+  .dragon-tiger-seat-category,
+  .dragon-tiger-limit-up-tooltip,
+  .dragon-tiger-continuous-tooltip,
+  .news-source-groups,
+  .news-source-group,
+  .backtest-quality-details,
+  .backtest-table-wrap table,
+  .backtest-diagnostic-groups,
+  .backtest-diagnostic-groups article,
+  .realtime-news-header,
+  .realtime-news-stream,
+  .realtime-news-controls
+) { background:#fff !important; }
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root :where(
+  .backtest-notice,
+  .backtest-tags span,
+  .backtest-quality-icon,
+  .backtest-quality-count,
+  .backtest-status,
+  .backtest-blockers li,
+  .realtime-news-eyebrow,
+  .realtime-news-health,
+  .dragon-tiger-status,
+  .dragon-tiger-item > summary::after,
+  .dragon-tiger-continuous-tooltip-head em
+) { border-color:#808080; background:#c0c0c0; color:#000; }
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .backtest-progress-track {
+  border-color:#808080;
+  background:#fff;
+}
+
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root :where(
+  .sector-item,
+  .hot-item,
+  .market-monitor-card,
+  .us-market-summary-card,
+  .position-brief-card,
+  .practice-log-row,
+  .theme-row,
+  .theme-stock-detail-row,
+  .overview-theme-row,
+  .overview-candidate-row,
+  .overview-flow-row,
+  .overview-theme-stock,
+  .rating-table tbody tr,
+  .dragon-tiger-item,
+  .dragon-tiger-detail-record,
+  .dragon-tiger-seat-record,
+  .news-source-option,
+  .realtime-news-item,
+  .backtest-table-wrap tbody tr,
+  .backtest-overview > div,
+  .backtest-month-diagnostic
+) { background:var(--terminal-row); color:#000; }
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root :where(
+  .market-monitor-card:nth-of-type(even),
+  .theme-row:nth-child(even),
+  .theme-stock-detail-row:nth-child(odd),
+  .overview-theme-row:nth-child(odd),
+  .overview-candidate-row:nth-child(odd),
+  .overview-theme-stock:nth-child(even),
+  .rating-table tbody tr:nth-child(even),
+  .dragon-tiger-item:nth-of-type(even),
+  .dragon-tiger-seat-record:nth-child(even),
+  .realtime-news-item:nth-child(even),
+  .backtest-table-wrap tbody tr:nth-child(even),
+  .backtest-month-diagnostic:nth-child(even)
+) { background:var(--terminal-row-alt); }
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root :where(
+  .market-monitor-card:hover,
+  .rating-table tbody tr:hover,
+  .dragon-tiger-item > summary:hover,
+  .news-source-option:hover,
+  .realtime-news-item:hover,
+  .backtest-table-wrap tbody tr:hover,
+  .setting-row:hover
+) { background:#d6e4ff; color:#000; }
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .setting-row:hover {
+  background:#d6e4ff;
+  color:#000;
+}
+
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root :where(
+  .market-monitor-card.open .market-card-head,
+  .us-market-summary-card.open .us-market-head,
+  .rating-table tbody tr.expanded,
+  .dragon-tiger-item[open] > summary,
+  .news-source-option.selected,
+  .realtime-news-sources button.active,
+  .realtime-news-item:hover
+) {
+  border-color:#000;
+  background:#000080 !important;
+  color:#fff !important;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root :where(
+  .market-monitor-card.open .market-card-head,
+  .us-market-summary-card.open .us-market-head,
+  .rating-table tbody tr.expanded,
+  .dragon-tiger-item[open] > summary,
+  .news-source-option.selected,
+  .realtime-news-sources button.active,
+  .realtime-news-item:hover
+) :where(a,b,strong,small,span,p,time,h3) { color:inherit !important; }
+
+/* Windows 95 form controls and raised/pressed push buttons. */
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root :where(input,select,textarea) {
+  border:2px solid;
+  border-color:#808080 #fff #fff #808080;
+  background:#fff;
+  color:#000;
+  box-shadow:inset 1px 1px 0 #000;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root body :where(
+  button:not(.practice-trade-marker):not(.practice-log-row):not(.us-market-head),
+  [role="button"]:not(.practice-log-row):not(.us-market-head):not(.market-monitor-card),
+  a.header-link,
+  a.settings-link,
+  a.toplink,
+  a.settings-back-link,
+  a.settings-card,
+  a.tab,
+  .dragon-tiger-unavailable a,
+  .version-update-actions a
+) {
+  border-color:#fff #000 #000 #fff !important;
+  background:#c0c0c0 !important;
+  color:#000 !important;
+  box-shadow:inset 1px 1px 0 #dfdfdf,inset -1px -1px 0 #808080 !important;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root body :where(
+  button:not(.practice-trade-marker):not(.practice-log-row):not(.us-market-head),
+  [role="button"]:not(.practice-log-row):not(.us-market-head):not(.market-monitor-card),
+  a.header-link,
+  a.settings-link,
+  a.toplink,
+  a.settings-back-link,
+  a.settings-card,
+  a.tab,
+  .dragon-tiger-unavailable a,
+  .version-update-actions a
+):hover:not(:disabled) {
+  border-color:#fff #000 #000 #fff !important;
+  background:#d4d0c8 !important;
+  color:#000080 !important;
+  box-shadow:inset 1px 1px 0 #fff,inset -1px -1px 0 #808080 !important;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root body :where(
+  button:not(.practice-trade-marker):not(.practice-log-row):not(.us-market-head),
+  [role="button"]:not(.practice-log-row):not(.us-market-head):not(.market-monitor-card),
+  a.header-link,
+  a.settings-link,
+  a.toplink,
+  a.settings-back-link,
+  a.settings-card,
+  a.tab,
+  .dragon-tiger-unavailable a,
+  .version-update-actions a
+):active:not(:disabled) {
+  border-color:#000 #fff #fff #000 !important;
+  background:#b0b0b0 !important;
+  box-shadow:inset 1px 1px 0 #808080 !important;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root body :where(
+  button.active,
+  button[aria-pressed="true"],
+  .settings-link.active,
+  .tab.active,
+  .notification-channel-activation.is-active
+):not(.practice-trade-marker):not(.theme-toggle):not(.admin-theme-toggle) {
+  border-color:#000 #fff #fff #000 !important;
+  background:#000080 !important;
+  color:#fff !important;
+  box-shadow:inset 1px 1px 0 #000 !important;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root body .category-tabs .tab.active { color:#fff !important; }
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root body :where(
+  .settings-link,
+  .settings-back-link,
+  .settings-card,
+  .header-link[href*="github.com"]
+) { color:#000080 !important; }
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root body :where(
+  button:disabled,
+  [role="button"][aria-disabled="true"]
+) {
+  border-color:#dfdfdf #808080 #808080 #dfdfdf !important;
+  background:#c0c0c0 !important;
+  color:#808080 !important;
+  box-shadow:none !important;
+}
+
+/* Light-mode text and market semantics. */
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root :where(
+  .sector-name,
+  .index-name,
+  .index-head,
+  .market-card-title,
+  .market-card-preview,
+  .market-metric-value,
+  .market-section-title,
+  .market-detail-line,
+  .market-flow-value,
+  .market-symbol,
+  .us-market-title,
+  .us-market-preview,
+  .inline-value,
+  .position-value,
+  .position-reason-text,
+  .position-brief-name,
+  .practice-log-title,
+  .practice-log-summary,
+  .practice-rule-title,
+  .practice-rule-body,
+  .practice-kpi-value,
+  .rating-table .ticker,
+  .dragon-tiger-item > summary,
+  .dragon-tiger-list-name,
+  .dragon-tiger-list-name > span,
+  .dragon-tiger-list-sector,
+  .dragon-tiger-detail-meta b,
+  .dragon-tiger-detail-values b,
+  .dragon-tiger-seat-values b,
+  .dragon-tiger-reason-list li,
+  .dragon-tiger-limit-up-reason p,
+  .dragon-tiger-continuous-news p,
+  .dragon-tiger-seat-record-head b,
+  .config-label,
+  .config-meta,
+  .admin-login-box label,
+  .news-source-option-copy strong,
+  .backtest-page,
+  .backtest-hero-copy h2,
+  .backtest-form h2,
+  .backtest-progress-card h2,
+  .backtest-result-card h2,
+  .backtest-table-wrap td,
+  .realtime-news-title-row > a,
+  .realtime-news-title-row > h3
+) { color:#000; }
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root :where(
+  .indices-part-meta,
+  .index-time,
+  .market-card-time,
+  .market-day-sub,
+  .us-market-sub,
+  .practice-log-count,
+  .practice-log-detail,
+  .practice-rule-meta,
+  .position-label,
+  .inline-label,
+  .rating-table-title small,
+  .rating-table .muted,
+  .dragon-tiger-sub,
+  .dragon-tiger-foot,
+  .dragon-tiger-detail-meta small,
+  .dragon-tiger-detail-values small,
+  .dragon-tiger-seat-values small,
+  .setting-state-label,
+  .news-source-option-copy small,
+  .backtest-hero-copy p,
+  .backtest-form-head p,
+  .backtest-progress-card p,
+  .backtest-result-head p,
+  .realtime-news-heading p,
+  .realtime-news-item article > p
+) { color:#555; }
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root :where(
+  .sector-item.up,
+  .hot-item.up,
+  .index-card.index-up,
+  .practice-calendar-day.has-result.up,
+  .sector-item.down,
+  .hot-item.down,
+  .index-card.index-down,
+  .practice-calendar-day.has-result.down
+) { background:#fff !important; }
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .index-card {
+  border-right-color:#808080;
+  background:#fff !important;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .index-quote {
+  display:flex;
+  align-items:baseline;
+  justify-content:space-between;
+  gap:8px;
+  margin-top:2px;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .index-quote .index-price {
+  margin-top:0;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .index-quote .index-change {
+  margin:0 0 0 auto;
+  font-size:16px;
+  text-align:right;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .index-card::before {
+  border-top-color:var(--chart-grid);
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .index-card::after {
+  border-left-color:var(--chart-grid-soft);
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .sparkline-zero {
+  stroke:var(--chart-zero);
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .market-breadth-card {
+  --market-breadth-limit-down:#007b7b;
+  --market-breadth-limit-up:#800000;
+  --market-breadth-broken-limit:#b05000;
+  --market-breadth-red:#d00000;
+  --market-breadth-green:#008000;
+  --market-breadth-estimated-turnover:#565000;
+  --market-breadth-actual-turnover:#c00000;
+  --market-breadth-previous-turnover:#555;
+  --market-breadth-turnover-increment:#007b7b;
+  --market-breadth-same-time-delta:#800080;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .market-breadth-chart-wrap {
+  border:2px solid;
+  border-color:#b0b0b0 #fff #fff #b0b0b0;
+  background:#fff;
+  box-shadow:inset 1px 1px 0 #dfdfdf;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .market-breadth-controls {
+  border:1px solid #a0a0a0;
+  background:#e4e4e4 !important;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .market-breadth-toggle {
+  border-color:transparent;
+  background:transparent;
+  color:#444;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .market-breadth-toggle.active {
+  border-color:#6f8fc8;
+  background:#f4f7fc;
+  color:#222;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .market-breadth-toggle input {
+  accent-color:#6b8fca;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .market-breadth-time {
+  color:#555;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .market-breadth-line-muted {
+  stroke-width:1.5;
+  opacity:.9;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .market-breadth-grid { stroke:#c0c0c0; }
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .market-breadth-grid-vertical { stroke:#dfdfdf; }
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .market-breadth-axis-line { stroke:#808080; }
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .market-breadth-axis-label { fill:#444; }
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .market-breadth-axis-title { fill:#000; color:#000; }
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .market-breadth-endpoint,
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .market-breadth-hover-point { stroke:#fff; }
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .market-breadth-crosshair { stroke:#000080; }
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .market-breadth-info-popover,
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .market-breadth-desktop-tooltip,
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .market-breadth-compact-tooltip {
+  border-color:#000;
+  background:#fff;
+  color:#000;
+  box-shadow:3px 3px 0 rgba(0,0,0,.45);
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .market-breadth-tooltip-panel {
+  fill:#fff;
+  stroke:#000;
+  filter:drop-shadow(3px 3px 0 rgba(0,0,0,.35));
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root :where(
+  .market-breadth-tooltip-time,
+  .market-breadth-tooltip-value
+) { fill:#000; }
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .market-breadth-tooltip-label { fill:#555; }
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .market-breadth-tooltip-divider { stroke:#808080; }
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .market-breadth-desktop-tooltip time {
+  border-bottom-color:#808080;
+  color:#000080;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .market-breadth-desktop-tooltip-item b,
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .market-breadth-compact-tooltip-item b { color:#555; }
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .market-breadth-desktop-tooltip-item strong,
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .market-breadth-compact-tooltip-item strong { color:#000; }
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .practice-axis-label { color:#555; }
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .practice-axis-label.zero { color:#000080; }
+
+/* Popovers, dialogs and special status surfaces. */
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .overview-page,
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .overview-theme-stock-popover {
+  --overview-surface:#fff;
+  --overview-surface-raised:#f0f0f0;
+  --overview-surface-strong:#c0c0c0;
+  --overview-border:#808080;
+  --overview-border-strong:#000;
+  --overview-text:#000;
+  --overview-muted:#555;
+  --overview-faint:#707070;
+  --overview-accent:#000080;
+  --overview-accent-soft:#d6e4ff;
+  --overview-up:#c00000;
+  --overview-up-soft:#f7dddd;
+  --overview-down:#007b7b;
+  --overview-down-soft:#d8f0ec;
+  --overview-warning:#565000;
+  --overview-warning-soft:#fff8c6;
+  --overview-mainline-accent:#000080;
+  --overview-mainline-secondary:#555;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root :where(
+  .practice-hover-tooltip,
+  .practice-trade-marker-tooltip,
+  .theme-stock-details,
+  [class$="-popover"]
+) {
+  border:2px solid;
+  border-color:#fff #000 #000 #fff;
+  background:#fff;
+  color:#000;
+  box-shadow:4px 4px 0 #000;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .practice-candidates-backdrop {
+  --candidate-overlay:rgba(0,0,0,.48);
+  --candidate-dialog-surface:#c0c0c0;
+  --candidate-dialog-head:#000080;
+  --candidate-dialog-border:#000;
+  --candidate-dialog-shadow:6px 6px 0 rgba(0,0,0,.55);
+  --candidate-card-surface:#fff;
+  --candidate-card-border:#808080;
+  --candidate-card-expanded-border:#000080;
+  --candidate-card-divider:#808080;
+  --candidate-card-subtle:#f0f0f0;
+  --candidate-card-shadow:none;
+  --candidate-card-expanded-shadow:3px 3px 0 rgba(0,0,0,.35);
+  --candidate-niuone-bg:#d6e4ff;
+  --candidate-niuone-border:#000080;
+  --candidate-niuone-text:#000080;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root :where(
+  .practice-data-readiness,
+  .dragon-tiger-status.stale,
+  .backtest-notice.is-warning,
+  .backtest-quality,
+  .backtest-quality-icon,
+  .backtest-quality-count
+) { border-color:#808000; background:#fff8c6; color:#565000; }
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root :where(
+  .realtime-news-item.important,
+  .realtime-news-item.important:hover
+) { background:#f7dddd !important; }
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .realtime-news-important {
+  border-color:#a00000;
+  background:#f7dddd;
+  color:#a00000;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .realtime-news-item .realtime-news-source-cell,
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .realtime-news-item .realtime-news-source-cell span {
+  color:#704000 !important;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .realtime-news-item time strong {
+  color:#000080 !important;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .realtime-news-item time span {
+  color:#555 !important;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .realtime-news-item .realtime-news-title-row > a,
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .realtime-news-item .realtime-news-title-row > h3 {
+  color:#111 !important;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .realtime-news-item article > p {
+  color:#444 !important;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .realtime-news-item.important .realtime-news-title-row > a,
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .realtime-news-item.important .realtime-news-title-row > h3 {
+  color:#a00000 !important;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .realtime-news-item:not(.important):hover :where(
+  .realtime-news-source-cell,
+  .realtime-news-source-cell span,
+  time strong,
+  time span,
+  .realtime-news-title-row > a,
+  .realtime-news-title-row > h3,
+  article > p
+) {
+  color:#fff !important;
+}
+html[data-theme="tongdaxin"][data-tongdaxin-palette="light"]:root .realtime-news-health.success {
+  border-color:#008080;
+  background:#d8f0ec;
+  color:#006565;
+}

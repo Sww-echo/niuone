@@ -4,7 +4,9 @@ from __future__ import annotations
 import copy
 import os
 import re
+import signal
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -20,19 +22,25 @@ try:
     from app.core.paths import get_dashboard_home
     from app.strategies.registry import STRATEGY_DEFINITIONS, STRATEGY_SUITES
     from app.strategies.selection import strategy_daily_candidate_limit
+    from app.strategies.rules import replay_rule_evaluation_audit
+    from app.strategies.rules.schema import sha256_json
     from app.strategies.exits import (
         NIUONE_LIFECYCLE_CLIMAX_MIN_PNL_PCT,
         NIUONE_LIFECYCLE_CLIMAX_PARTIAL_RATIO,
     )
+    from app.storage.prompt_strategies import PromptStrategyStore
 except ImportError:  # pragma: no cover - legacy top-level import path
     from core.json_cache import read_json_cache, write_json_cache
     from core.paths import get_dashboard_home
     from strategies.registry import STRATEGY_DEFINITIONS, STRATEGY_SUITES
     from strategies.selection import strategy_daily_candidate_limit
+    from strategies.rules import replay_rule_evaluation_audit
+    from strategies.rules.schema import sha256_json
     from strategies.exits import (
         NIUONE_LIFECYCLE_CLIMAX_MIN_PNL_PCT,
         NIUONE_LIFECYCLE_CLIMAX_PARTIAL_RATIO,
     )
+    from storage.prompt_strategies import PromptStrategyStore
 
 from .historical_data import (
     DEFAULT_HISTORICAL_SOURCE_PRIORITY,
@@ -40,6 +48,13 @@ from .historical_data import (
     SUPPORTED_HISTORICAL_SOURCES,
 )
 from .niuone_exits import NiuOneStrategyBacktestPolicy
+from .prompt_strategy import (
+    PROMPT_BACKTEST_PROTOCOL_VERSION,
+    PromptStrategyBacktestPolicy,
+    PromptStrategyHistoricalSelector,
+    prompt_backtest_version_snapshot,
+    validate_prompt_backtest_version,
+)
 from .replay_cache import ReplayTapeCache
 from .selection import (
     NiuOneHistoricalContextProvider,
@@ -48,8 +63,7 @@ from .selection import (
     SelectionBacktestConfig,
 )
 from .service import (
-    load_current_industry_map,
-    load_current_theme_map,
+    load_current_classification_snapshot,
     run_historical_selection_backtest,
 )
 
@@ -58,30 +72,36 @@ MAX_BACKTEST_RANGE_DAYS = 366
 MAX_ACTIVE_JOBS = 2
 MIN_HISTORICAL_COVERAGE_RATIO = 0.85
 DEFAULT_HORIZONS = (1, 3, 5, 10, 20)
-UNSUPPORTED_SUITE_ID = "preset_text"
+PROMPT_SUITE_ID = "preset_text"
 BACKTEST_STATE_SCHEMA_VERSION = 2
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_BACKTEST_RISK_PROFILE = "aggressive"
 GENERIC_BACKTEST_RISK_PROFILE = "balanced"
-NIUONE_BACKTEST_PROTOCOL_VERSION = "niuone-backtest-v32"
+NIUONE_BACKTEST_PROTOCOL_VERSION = "niuone-backtest-v43"
 GENERIC_BACKTEST_PROTOCOL_VERSION = "selection-backtest-v2"
 NIUONE_BACKTEST_RISK_PROFILES: dict[str, dict[str, Any]] = {
     "aggressive": {
         "id": "aggressive",
         "label": "进取",
         "description": (
-            "默认档位；允许更高账户风险、总仓和同题材持仓以争取收益；"
-            "仍保留结构止损、涨停、T+1 和单票绝对上限。"
+            "默认档位；允许更高账户风险和总仓以争取收益；同题材不再按只数限制，"
+            "仍保留主题风险/敞口、结构止损、涨停、T+1 和单票绝对上限。"
         ),
         "policy_options": {
             "risk_budget_scale": 1.35,
             "position_budget_scale": 1.15,
-            "max_new_positions_per_session": 3,
-            "max_open_positions": 6,
-            "max_industry_positions": 3,
         },
     },
 }
+
+
+def configured_max_open_positions() -> int:
+    """Read the account-wide count ceiling used by Practice and NiuOne."""
+    try:
+        value = int(os.environ.get("DASHBOARD_MAX_OPEN_POSITIONS", "6"))
+    except (TypeError, ValueError):
+        value = 6
+    return max(1, value)
 
 
 class BacktestTaskError(ValueError):
@@ -131,23 +151,66 @@ def _suite_payload(suite_id: str, definition: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def backtest_strategy_options(*, today: date | None = None) -> dict[str, Any]:
+def _prompt_version_option(version: Mapping[str, Any]) -> dict[str, Any]:
+    plan = version.get("execution_plan") or {}
+    strategy = plan.get("strategy") or {}
+    return {
+        "version_id": str(version.get("version_id") or ""),
+        "revision": int(version.get("revision") or 0),
+        "status": str(version.get("status") or ""),
+        "name": str(strategy.get("name") or "文字策略"),
+        "description": str(strategy.get("description") or ""),
+        "plan_sha256": str(version.get("plan_sha256") or ""),
+        "engine_version": str(version.get("engine_version") or ""),
+        "activated_at": str(version.get("activated_at") or ""),
+        "active": str(version.get("status") or "") == "active",
+    }
+
+
+def _backtestable_prompt_versions(
+    store: PromptStrategyStore,
+) -> list[dict[str, Any]]:
+    return [
+        version
+        for version in store.list_versions(limit=200)
+        if str(version.get("status") or "") in {"active", "retired"}
+    ]
+
+
+def backtest_strategy_options(
+    *,
+    today: date | None = None,
+    prompt_store: PromptStrategyStore | None = None,
+) -> dict[str, Any]:
     resolved_today = today or date.today()
     default_end = resolved_today - timedelta(days=35)
     options = [
         _suite_payload(str(suite_id), dict(definition))
         for suite_id, definition in STRATEGY_SUITES.items()
     ]
+    prompt_versions: list[dict[str, Any]] = []
+    prompt_error = ""
+    try:
+        prompt_versions = _backtestable_prompt_versions(
+            prompt_store or PromptStrategyStore()
+        )
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        prompt_error = f"冻结版本存储不可用（{type(exc).__name__}）"
+    version_options = [_prompt_version_option(item) for item in prompt_versions]
     options.append({
-        "id": UNSUPPORTED_SUITE_ID,
+        "id": PROMPT_SUITE_ID,
         "label": "预设文字策略",
-        "desc": "运行时由模型解释用户文字规则",
+        "desc": "按用户确认后冻结的结构化规则独立回放",
         "color": "#2dd4bf",
-        "strategy_ids": [],
-        "strategy_labels": [],
+        "strategy_ids": [PROMPT_SUITE_ID],
+        "strategy_labels": ["冻结文字策略"],
         "excluded_strategy_ids": [],
-        "supported": False,
-        "unsupported_reason": "预设文字策略依赖运行时模型解释，暂不提供确定性历史回测。",
+        "supported": bool(version_options),
+        "unsupported_reason": prompt_error or (
+            "尚无已激活的冻结文字策略版本，请先创建、确认并激活策略。"
+        ),
+        "backtest_protocol_version": PROMPT_BACKTEST_PROTOCOL_VERSION,
+        "prompt_versions": version_options,
     })
     return {
         "strategies": options,
@@ -173,14 +236,54 @@ def _parse_date(value: Any, field_name: str) -> date:
         raise BacktestTaskError(f"{field_name}必须使用 YYYY-MM-DD") from None
 
 
-def normalize_backtest_request(values: dict[str, Any]) -> dict[str, Any]:
+def normalize_backtest_request(
+    values: dict[str, Any],
+    *,
+    prompt_store: PromptStrategyStore | None = None,
+) -> dict[str, Any]:
     suite_id = str(values.get("strategy_id") or "").strip()
     definition = STRATEGY_SUITES.get(suite_id)
-    if definition is None:
-        if suite_id == UNSUPPORTED_SUITE_ID:
-            raise BacktestTaskError("预设文字策略暂不支持确定性历史回测")
+    prompt_version_snapshot: dict[str, Any] | None = None
+    if suite_id == PROMPT_SUITE_ID:
+        store = prompt_store or PromptStrategyStore()
+        requested_version_id = str(
+            values.get("prompt_strategy_version_id") or ""
+        ).strip()
+        try:
+            version = (
+                store.get_version(requested_version_id)
+                if requested_version_id else store.active_version()
+            )
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            raise BacktestTaskError(
+                f"无法读取冻结文字策略版本（{type(exc).__name__}）"
+            ) from exc
+        if version is None:
+            raise BacktestTaskError("请选择已激活的冻结文字策略版本")
+        if str(version.get("status") or "") not in {"active", "retired"}:
+            raise BacktestTaskError("所选文字策略版本尚未完成激活")
+        try:
+            prompt_version_snapshot = prompt_backtest_version_snapshot(version)
+        except ValueError as exc:
+            raise BacktestTaskError(str(exc)) from exc
+        option = _prompt_version_option(version)
+        strategy = {
+            "id": PROMPT_SUITE_ID,
+            "label": f"预设文字策略 · {option['name']}",
+            "desc": option["description"],
+            "color": "#2dd4bf",
+            "strategy_ids": [PROMPT_SUITE_ID],
+            "strategy_labels": [option["name"]],
+            "excluded_strategy_ids": [],
+            "supported": True,
+            "unsupported_reason": "",
+            "backtest_protocol_version": PROMPT_BACKTEST_PROTOCOL_VERSION,
+            "prompt_version": option,
+        }
+    elif definition is None:
         raise BacktestTaskError("未知策略")
-    strategy = _suite_payload(suite_id, dict(definition))
+    else:
+        strategy = _suite_payload(suite_id, dict(definition))
     if not strategy["supported"]:
         raise BacktestTaskError("该策略暂不支持历史回测")
     start = _parse_date(values.get("start_date"), "开始日期")
@@ -221,7 +324,19 @@ def normalize_backtest_request(values: dict[str, Any]) -> dict[str, Any]:
         "protocol_version": (
             NIUONE_BACKTEST_PROTOCOL_VERSION
             if suite_id == "niuone"
-            else GENERIC_BACKTEST_PROTOCOL_VERSION
+            else (
+                PROMPT_BACKTEST_PROTOCOL_VERSION
+                if suite_id == PROMPT_SUITE_ID
+                else GENERIC_BACKTEST_PROTOCOL_VERSION
+            )
+        ),
+        **(
+            {"max_open_positions": configured_max_open_positions()}
+            if suite_id == "niuone" else {}
+        ),
+        **(
+            {"prompt_strategy_version": prompt_version_snapshot}
+            if prompt_version_snapshot is not None else {}
         ),
     }
 
@@ -345,9 +460,17 @@ def _selector_for_request(
     request: dict[str, Any],
     *,
     eligible_symbols: Iterable[str],
-) -> RegisteredScorerSelector:
+) -> RegisteredScorerSelector | PromptStrategyHistoricalSelector:
     suite_id = str(request["strategy"]["id"])
     resolved_eligible_symbols = tuple(dict.fromkeys(eligible_symbols))
+    if suite_id == PROMPT_SUITE_ID:
+        version = request.get("prompt_strategy_version")
+        if not isinstance(version, Mapping):
+            raise BacktestTaskError("文字策略回测请求缺少冻结版本")
+        return PromptStrategyHistoricalSelector(
+            version,
+            eligible_symbols=resolved_eligible_symbols,
+        )
     context_provider = None
     if suite_id == "niuone":
         context_provider = NiuOneHistoricalContextProvider()
@@ -373,6 +496,58 @@ def _selector_for_request(
     )
 
 
+def _prompt_backtest_audit_manifest(
+    selection: Mapping[str, Any],
+    version: Mapping[str, Any],
+) -> dict[str, Any]:
+    audits: dict[str, dict[str, Any]] = {}
+
+    def collect(value: Any) -> None:
+        if isinstance(value, Mapping):
+            audit_sha256 = str(value.get("audit_sha256") or "")
+            if (
+                len(audit_sha256) == 64
+                and str(value.get("strategy_version_id") or "")
+                == str(version.get("version_id") or "")
+                and str(value.get("plan_sha256") or "")
+                == str(version.get("plan_sha256") or "")
+            ):
+                audits[audit_sha256] = dict(value)
+                return
+            for item in value.values():
+                collect(item)
+        elif isinstance(value, (tuple, list)):
+            for item in value:
+                collect(item)
+
+    collect(selection.get("signals") or ())
+    collect(selection.get("trades") or ())
+    plan = dict(version.get("execution_plan") or {})
+    replay_failures = [
+        audit_sha256
+        for audit_sha256, audit in audits.items()
+        if not replay_rule_evaluation_audit(audit, plan=plan).get("ok")
+    ]
+    stage_counts: dict[str, int] = {}
+    for audit in audits.values():
+        stage = str(audit.get("stage") or "unknown")
+        stage_counts[stage] = stage_counts.get(stage, 0) + 1
+    ordered_hashes = sorted(audits)
+    return {
+        "protocol_version": PROMPT_BACKTEST_PROTOCOL_VERSION,
+        "strategy_version_id": str(version.get("version_id") or ""),
+        "plan_sha256": str(version.get("plan_sha256") or ""),
+        "rule_engine_version": str(version.get("engine_version") or ""),
+        "isolated": True,
+        "production_state_writes": False,
+        "audit_count": len(ordered_hashes),
+        "audit_stage_counts": stage_counts,
+        "audit_chain_sha256": sha256_json(ordered_hashes),
+        "replay_verified": not replay_failures,
+        "replay_failure_count": len(replay_failures),
+    }
+
+
 def run_strategy_backtest_request(
     request: dict[str, Any],
     *,
@@ -387,10 +562,31 @@ def run_strategy_backtest_request(
         or (
             NIUONE_BACKTEST_PROTOCOL_VERSION
             if suite_id == "niuone"
-            else GENERIC_BACKTEST_PROTOCOL_VERSION
+            else (
+                PROMPT_BACKTEST_PROTOCOL_VERSION
+                if suite_id == PROMPT_SUITE_ID
+                else GENERIC_BACKTEST_PROTOCOL_VERSION
+            )
         )
     )
-    minimum_rows = 55 if needs_industry else 30
+    prompt_version: dict[str, Any] | None = None
+    if suite_id == PROMPT_SUITE_ID:
+        raw_version = request.get("prompt_strategy_version")
+        if not isinstance(raw_version, Mapping):
+            raise BacktestTaskError("文字策略回测请求缺少冻结版本")
+        try:
+            prompt_version = validate_prompt_backtest_version(raw_version)
+        except ValueError as exc:
+            raise BacktestTaskError(str(exc)) from exc
+        requirements = (
+            prompt_version["execution_plan"].get("stage_requirements") or {}
+        )
+        minimum_rows = max(
+            int((requirements.get(stage) or {}).get("minimum_bars") or 1)
+            for stage in ("selection", "entry", "exit")
+        )
+    else:
+        minimum_rows = 55 if needs_industry else 30
     if progress_callback is not None:
         progress_callback(2, "universe", "正在从 A 股列表接口构建策略候选范围")
     universe = universe_loader(request["strategy"])
@@ -405,8 +601,24 @@ def run_strategy_backtest_request(
     risk_profile = (
         NIUONE_BACKTEST_RISK_PROFILES[DEFAULT_BACKTEST_RISK_PROFILE]
         if suite_id == "niuone"
-        else {"label": "标准", "policy_options": {}}
+        else {
+            "label": (
+                "冻结规则独立组合"
+                if suite_id == PROMPT_SUITE_ID else "标准"
+            ),
+            "policy_options": {},
+        }
     )
+
+    policy_options = dict(risk_profile.get("policy_options") or {})
+    if suite_id == "niuone":
+        configured_limit = int(request["max_open_positions"])
+        policy_options.update({
+            "max_open_positions": configured_limit,
+            # NiuOne has no separate same-theme name-count ceiling; matching
+            # the book ceiling prevents this compatibility field tightening it.
+            "max_industry_positions": configured_limit,
+        })
 
     position_exit_strategy = (
         NiuOneStrategyBacktestPolicy(
@@ -418,9 +630,12 @@ def run_strategy_backtest_request(
             lifecycle_climax_min_pnl_pct=(
                 NIUONE_LIFECYCLE_CLIMAX_MIN_PNL_PCT
             ),
-            **dict(risk_profile.get("policy_options") or {}),
+            **policy_options,
         )
-        if suite_id == "niuone" else None
+        if suite_id == "niuone" else (
+            PromptStrategyBacktestPolicy(prompt_version)
+            if prompt_version is not None else None
+        )
     )
     if progress_callback is not None:
         progress_callback(
@@ -442,13 +657,17 @@ def run_strategy_backtest_request(
         ),
         selection_config=SelectionBacktestConfig(
             holding_sessions=DEFAULT_HORIZONS,
-            cooldown_sessions=(0 if suite_id == "niuone" else 20),
+            cooldown_sessions=(
+                0 if suite_id in {"niuone", PROMPT_SUITE_ID} else 20
+            ),
             slippage_bps=5,
         ),
         position_exit_strategy=position_exit_strategy,
+        warmup_calendar_days=(730 if suite_id == PROMPT_SUITE_ID else 150),
         minimum_coverage_ratio=MIN_HISTORICAL_COVERAGE_RATIO,
-        industry_loader=load_current_industry_map if needs_industry else None,
-        theme_loader=load_current_theme_map if needs_industry else None,
+        classification_loader=(
+            load_current_classification_snapshot if needs_industry else None
+        ),
         name_by_symbol=universe.get("name_by_symbol"),
         progress_callback=progress_callback,
         replay_cache=(
@@ -458,7 +677,11 @@ def run_strategy_backtest_request(
         replay_cache_identity=(
             {
                 "protocol_version": protocol_version,
-                "selector_id": suite_id,
+                "selector_id": (
+                    f"{suite_id}:{prompt_version['version_id']}:"
+                    f"{prompt_version['plan_sha256']}"
+                    if prompt_version is not None else suite_id
+                ),
                 "strategy_ids": tuple(request["strategy"]["strategy_ids"]),
                 "sources": tuple(request["sources"]),
                 "adjustment": str(request["adjustment"]),
@@ -466,8 +689,18 @@ def run_strategy_backtest_request(
             }
             if replay_cache_dir is not None else None
         ),
+        retain_historical_data=False,
     )
-    payload = run.to_dict()
+    # Serialize only the durable result sections. In particular, do not invoke a
+    # generic run serializer that could accidentally retain or copy raw K-lines.
+    payload = {
+        "selection": run.selection.to_dict(),
+        "warnings": list(run.warnings),
+        "industry_quality": (
+            run.industry_quality.to_dict() if run.industry_quality else None
+        ),
+        "replay_cache": dict(run.replay_cache or {}),
+    }
     name_by_symbol = universe.get("name_by_symbol") or {}
     source_counts: dict[str, int] = {}
     for series in run.data.series.values():
@@ -483,9 +716,9 @@ def run_strategy_backtest_request(
                 ),
                 "source": series.source,
                 "adjustment": series.adjustment,
-                "bar_count": len(series.bars),
-                "first_date": str(series.bars[0].get("date") or "") if series.bars else "",
-                "last_date": str(series.bars[-1].get("date") or "") if series.bars else "",
+                "bar_count": series.bar_count,
+                "first_date": series.first_date,
+                "last_date": series.last_date,
                 "attempts": [dict(item) for item in series.attempts],
             }
             for symbol, series in run.data.series.items()
@@ -498,12 +731,31 @@ def run_strategy_backtest_request(
         "version": protocol_version,
         "risk_profile": risk_profile_id,
         "risk_profile_label": str(risk_profile["label"]),
+        **(
+            {
+                "strategy_version_id": prompt_version["version_id"],
+                "plan_sha256": prompt_version["plan_sha256"],
+                "rule_engine_version": prompt_version["engine_version"],
+            }
+            if prompt_version is not None else {}
+        ),
     }
     payload["universe"] = copy.deepcopy(universe["metadata"])
     if needs_industry:
-        payload["universe"]["classification_provider"] = "eastmoney"
+        quality = payload.get("industry_quality")
+        classification_source = str(
+            quality.get("source") if isinstance(quality, Mapping) else ""
+        )
+        classification_provider = (
+            "iwencai"
+            if classification_source == "iwencai_current_industry_concept"
+            else "eastmoney"
+        )
+        payload["universe"]["classification_provider"] = classification_provider
         payload["universe"]["classification_basis"] = (
-            "eastmoney_concept" if suite_id == "niuone" else "eastmoney_industry"
+            f"{classification_provider}_concept"
+            if suite_id == "niuone"
+            else f"{classification_provider}_industry"
         )
     payload["warnings"].append(
         "automatic universe uses today's listed-stock membership; delisted and historically "
@@ -521,10 +773,12 @@ def run_strategy_backtest_request(
             "max_new_positions_per_session": (
                 position_exit_strategy.max_new_positions_per_session
             ),
+            "new_position_count_limited": False,
             "max_open_positions": position_exit_strategy.max_open_positions,
             "max_industry_positions": (
                 position_exit_strategy.max_industry_positions
             ),
+            "same_theme_position_count_limited": False,
             "board_lot": position_exit_strategy.board_lot,
             "model_order_units_replayed": False,
         }
@@ -541,10 +795,56 @@ def run_strategy_backtest_request(
         )
         if risk_profile_id == "aggressive":
             payload["warnings"].append(
-                "NiuOne aggressive backtest profile increases account-risk, "
-                "portfolio/theme exposure, and position-count budgets; it does "
-                "not weaken price-pattern, structural-stop, limit-up, or T+1 rules"
+                "NiuOne aggressive backtest profile increases account-risk and "
+                "portfolio/theme exposure; same-theme names have no separate count "
+                "cap, while price-pattern, structural-stop, limit-up, and T+1 rules remain"
             )
+    elif suite_id == PROMPT_SUITE_ID and prompt_version is not None:
+        prompt_strategy = prompt_version["execution_plan"]["strategy"]
+        payload["execution_assumptions"] = {
+            "engine": "prompt_strategy",
+            "isolated_portfolio": True,
+            "initial_cash": position_exit_strategy.initial_cash,
+            "board_lot": position_exit_strategy.board_lot,
+            "candidate_limit": int(prompt_strategy.get("candidate_limit") or 60),
+            "max_new_buys_per_cycle": int(
+                prompt_strategy.get("max_new_buys_per_cycle") or 0
+            ),
+            "effective_max_new_positions_per_session": (
+                position_exit_strategy.max_new_positions_per_session
+            ),
+            "max_open_positions": position_exit_strategy.max_open_positions,
+            "max_single_position_pct": (
+                position_exit_strategy.max_single_position_pct
+            ),
+            "max_total_position_pct": (
+                position_exit_strategy.max_total_position_pct
+            ),
+            "min_cash_reserve_pct": (
+                position_exit_strategy.min_cash_reserve_pct
+            ),
+            "position_policy": copy.deepcopy(
+                prompt_strategy.get("position") or {}
+            ),
+            "entry_timing": "next_session_open",
+            "exit_timing": "completed_daily_close",
+            "t_plus_one": True,
+            "slippage_bps": 5,
+        }
+        payload["prompt_backtest"] = _prompt_backtest_audit_manifest(
+            payload.get("selection") or {},
+            prompt_version,
+        )
+        payload["warnings"].append(
+            "prompt strategy entry signals are filled at the next session open and "
+            "exit rules are evaluated after completed daily bars at the close; exact "
+            "intraday trigger timing and queue priority cannot be reconstructed"
+        )
+        payload["warnings"].append(
+            "prompt strategy backtests enforce the static system position and cash "
+            "ceilings; production market-guidance may tighten those ceilings further, "
+            "but historical guidance snapshots are not reconstructed"
+        )
     payload["request"] = {
         "start_date": request["start_date"],
         "end_date": request["end_date"],
@@ -552,6 +852,17 @@ def run_strategy_backtest_request(
         "sources": list(request["sources"]),
         "risk_profile": risk_profile_id,
         "protocol_version": protocol_version,
+        **(
+            {"max_open_positions": int(request["max_open_positions"])}
+            if suite_id == "niuone" else {}
+        ),
+        **(
+            {
+                "prompt_strategy_version_id": prompt_version["version_id"],
+                "prompt_plan_sha256": prompt_version["plan_sha256"],
+            }
+            if prompt_version is not None else {}
+        ),
     }
     return payload
 
@@ -565,6 +876,11 @@ def _worker_error_message(payload: Mapping[str, Any], returncode: int) -> str:
     error_text = str(payload.get("error") or "").strip()
     error_type = str(payload.get("error_type") or "").strip()
     if not error_text:
+        if returncode == -int(getattr(signal, "SIGKILL", 9)):
+            return (
+                "回测子进程被系统强制终止（SIGKILL），通常是可用内存不足；"
+                "请缩短回测区间或避开全市场扫描后重试"
+            )
         return f"回测子进程异常退出（{returncode}）"
     duplicated_prefix = f"{error_type}: " if error_type else ""
     if error_type == "BacktestTaskError" and error_text.startswith(
@@ -598,6 +914,36 @@ class BacktestTaskManager:
 
     def options(self) -> dict[str, Any]:
         return backtest_strategy_options()
+
+    def cache_usage(self) -> dict[str, Any]:
+        if self._state_dir is None:
+            return {
+                "available": False,
+                "entry_count": 0,
+                "file_count": 0,
+                "temporary_file_count": 0,
+                "byte_count": 0,
+            }
+        return {
+            "available": True,
+            **ReplayTapeCache(self._state_dir / "replay-cache").usage(),
+        }
+
+    def clear_cache(self) -> dict[str, Any]:
+        if self._state_dir is None:
+            raise BacktestTaskError("当前回测运行模式未启用回放缓存")
+        with self._lock:
+            if any(
+                job.get("status") in {"queued", "running"}
+                for job in self._jobs.values()
+            ):
+                raise BacktestTaskError(
+                    "回测执行期间不能清理缓存，请先等待完成或终止任务"
+                )
+            return {
+                "available": True,
+                **ReplayTapeCache(self._state_dir / "replay-cache").clear(),
+            }
 
     def start(self, values: dict[str, Any]) -> dict[str, Any]:
         request = normalize_backtest_request(values)
@@ -692,7 +1038,11 @@ class BacktestTaskManager:
         expected_protocol = (
             NIUONE_BACKTEST_PROTOCOL_VERSION
             if strategy_id == "niuone"
-            else GENERIC_BACKTEST_PROTOCOL_VERSION
+            else (
+                PROMPT_BACKTEST_PROTOCOL_VERSION
+                if strategy_id == PROMPT_SUITE_ID
+                else GENERIC_BACKTEST_PROTOCOL_VERSION
+            )
         )
         if str(stored.get("protocol_version") or "") != expected_protocol:
             return None
@@ -704,7 +1054,7 @@ class BacktestTaskManager:
             and risk_profile not in NIUONE_BACKTEST_RISK_PROFILES
         ):
             return None
-        return {
+        request = {
             "strategy": copy.deepcopy(dict(strategy)),
             "start_date": str(stored.get("start_date") or ""),
             "end_date": str(stored.get("end_date") or ""),
@@ -713,13 +1063,32 @@ class BacktestTaskManager:
             "risk_profile": risk_profile,
             "protocol_version": expected_protocol,
         }
+        if strategy_id == "niuone":
+            try:
+                max_open_positions = int(stored.get("max_open_positions"))
+            except (TypeError, ValueError):
+                return None
+            if max_open_positions <= 0:
+                return None
+            request["max_open_positions"] = max_open_positions
+        if strategy_id == PROMPT_SUITE_ID:
+            raw_version = stored.get("prompt_strategy_version")
+            if not isinstance(raw_version, Mapping):
+                return None
+            try:
+                request["prompt_strategy_version"] = (
+                    validate_prompt_backtest_version(raw_version)
+                )
+            except ValueError:
+                return None
+        return request
 
     def _load_persisted_jobs(self) -> list[tuple[str, dict[str, Any]]]:
         if self._state_dir is None:
             return []
         resumed: list[tuple[str, dict[str, Any]]] = []
         with self._lock:
-            for strategy_id in STRATEGY_SUITES:
+            for strategy_id in (*STRATEGY_SUITES, PROMPT_SUITE_ID):
                 path = self._state_path(str(strategy_id))
                 payload = read_json_cache(path) if path is not None else None
                 job = payload.get("job") if isinstance(payload, dict) else None

@@ -157,30 +157,6 @@ def create_market_router(
             enforce_limits=False,
         )
 
-    @router.api_route("/api/x_media", methods=["GET", "HEAD"])
-    async def x_media(request: Request) -> Response:
-        limited = await enforce_api_limits(request)
-        if limited is not None:
-            return limited
-        if request.method == "HEAD":
-            return Response(status_code=200, headers={"Cache-Control": "no-store"})
-        media_url = str(request.query_params.get("url") or "").strip()
-        try:
-            body, content_type = await run_in_threadpool(services.fetch_x_media, media_url)
-        except Exception:
-            return Response(
-                content=b"media unavailable",
-                status_code=404,
-                media_type="text/plain",
-                headers={"Cache-Control": "no-store"},
-            )
-        return Response(
-            content=body,
-            status_code=200,
-            media_type=content_type,
-            headers={"Cache-Control": "public, max-age=604800, immutable"},
-        )
-
     @router.api_route("/api/indices", methods=["GET", "HEAD"])
     async def indices(request: Request) -> Response:
         ttl = services.API_TTLS["indices"]
@@ -195,7 +171,9 @@ def create_market_router(
                 "indices",
                 services.INDICES_SNAPSHOT_FILE,
                 ttl,
+                cacheable=services.market_indices_available,
             ),
+            cacheable=services.market_indices_available,
         )
 
     @router.api_route("/api/market_breadth", methods=["GET", "HEAD"])
@@ -214,32 +192,20 @@ def create_market_router(
     @router.api_route("/api/sectors", methods=["GET", "HEAD"])
     async def sectors(request: Request) -> Response:
         ttl = services.API_TTLS["sectors"]
-        fallback = {
-            "sectors": [],
-            "items": [],
-            "gain_top": [],
-            "loss_top": [],
-            "industry_gain_top": [],
-            "industry_loss_top": [],
-            "concept_gain_top": [],
-            "concept_loss_top": [],
-        }
         return await cached_response(
             request,
             cache_key="sectors",
             ttl=ttl,
-            producer=lambda: services.run_dashboard_helper(
-                "sectors_dashboard_api.py",
-                fallback,
-                timeout=120,
-            ),
+            producer=services.produce_sectors_data,
             edge_ttl=ttl,
             browser_ttl=15,
             before_cache=lambda: services.seed_api_cache_from_json_file(
                 "sectors",
                 services.CRON_OUTPUT_DIR / "sectors_dashboard_cache.json",
                 ttl,
+                cacheable=services.market_sectors_available,
             ),
+            cacheable=services.market_sectors_available,
         )
 
     @router.api_route("/api/hot_stocks", methods=["GET", "HEAD"])
@@ -262,25 +228,11 @@ def create_market_router(
         def transform(payload: dict[str, Any]) -> dict[str, Any]:
             return services.apply_hot_stocks_sort(payload, sort_by)
 
-        def produce() -> dict[str, Any]:
-            payload = services.run_dashboard_helper(
-                "hot_stocks_dashboard_api.py",
-                {
-                    "items": [],
-                    "amount_top": [],
-                    "turnover_top": [],
-                    "volume_top": [],
-                    "gain_top": [],
-                },
-                timeout=120,
-            )
-            return transform(payload)
-
         return await cached_response(
             request,
             cache_key=cache_key,
             ttl=ttl,
-            producer=produce,
+            producer=lambda: services.produce_hot_stocks_data(sort_by),
             edge_ttl=ttl,
             browser_ttl=15,
             before_cache=lambda: services.seed_api_cache_from_json_file(
@@ -288,33 +240,9 @@ def create_market_router(
                 services.CRON_OUTPUT_DIR / "hot_stocks_dashboard_cache.json",
                 ttl,
                 transform,
+                cacheable=services.market_hot_stocks_available,
             ),
-        )
-
-    @router.api_route("/api/us_quotes", methods=["GET", "HEAD"])
-    async def us_quotes(request: Request) -> Response:
-        symbols = services.sanitize_symbols(str(request.query_params.get("symbols") or ""))
-        ttl = services.API_TTLS["us_quotes"]
-        return await cached_response(
-            request,
-            cache_key="us_quotes:" + ",".join(symbols),
-            ttl=ttl,
-            producer=lambda: services.fetch_us_quotes(symbols),
-            edge_ttl=ttl,
-            browser_ttl=10,
-        )
-
-    @router.api_route("/api/us_profiles", methods=["GET", "HEAD"])
-    async def us_profiles(request: Request) -> Response:
-        symbols = services.sanitize_symbols(str(request.query_params.get("symbols") or ""))
-        ttl = services.API_TTLS["us_profiles"]
-        return await cached_response(
-            request,
-            cache_key="us_profiles:" + ",".join(symbols),
-            ttl=ttl,
-            producer=lambda: services.fetch_us_profiles(symbols),
-            edge_ttl=ttl,
-            browser_ttl=3600,
+            cacheable=services.market_hot_stocks_available,
         )
 
     @router.api_route("/api/us_market_summary", methods=["GET", "HEAD"])

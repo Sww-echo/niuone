@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import math
 from typing import Any
 
 
@@ -9,11 +10,40 @@ NIUONE_ABSOLUTE_POSITION_CAP_PCT = {
     "niu_leader": 30.0,
     "niu_pullback": 25.0,
     "niu_emerging": 15.0,
-    "niu_reversal_probe": 6.25,
+    "niu_reversal_probe": 10.0,
 }
 
-NIUONE_MAX_OPEN_POSITIONS = 5
-NIUONE_MAX_NEW_POSITIONS_PER_TRADING_DAY = 2
+NIUONE_DEFAULT_MAX_OPEN_POSITIONS = 6
+# Compatibility name retained for protocol snapshots and older imports.  This
+# is only the default when no composition-layer setting is supplied; Practice,
+# strict-forward evaluation, and administrator backtests pass the configured
+# DASHBOARD_MAX_OPEN_POSITIONS value explicitly.  NiuOne openings are not
+# capped by a per-cycle, session, or trading-day counter.
+NIUONE_MAX_OPEN_POSITIONS = NIUONE_DEFAULT_MAX_OPEN_POSITIONS
+NIUONE_MAX_NEW_POSITIONS_PER_TRADING_DAY: int | None = None
+NIUONE_BUY_SIGNAL_SCORE_FIELDS = (
+    "best_decision_score",
+    "decision_score",
+    "selection_signal_score",
+    "best_score",
+    "score",
+)
+NIUONE_STRATEGY_PRIORITY = {
+    "niu_leader": 91.0,
+    "niu_pullback": 84.0,
+    "niu_emerging": 76.0,
+    "niu_reversal_probe": 70.0,
+}
+NIUONE_LIFECYCLE_PRIORITY_ADJUSTMENT = {
+    "markup": 4.0,
+    "climax": 2.0,
+    "divergence": 1.0,
+    "brewing": 0.0,
+    "fade": -20.0,
+}
+# Replacing a whole holding has friction and timing risk.  A tiny floating
+# point edge is not enough evidence to rotate the book.
+NIUONE_REPLACEMENT_PRIORITY_MARGIN = 3.0
 NIUONE_ENTRY_REGIMES = frozenset({
     "offensive",
     "rotation",
@@ -41,7 +71,7 @@ NIUONE_MARKUP_MOMENTUM_PROBE_MAX_STOP_ATR = 3.0
 NIUONE_MARKUP_MOMENTUM_PROBE_POSITION_CAP_PCT = 4.0
 NIUONE_MARKUP_MOMENTUM_PROBE_MAX_EXECUTION_GAP_PCT = 3.0
 
-# A 6.25% reversal probe is only the brewing-stage starting size. During
+# A 10% reversal probe is only the brewing-stage starting size. During
 # markup, a persistent emerging leader may first scale toward the early cap;
 # once the mainline is confirmed it may continue toward the final cap. The
 # structural-stop distance and portfolio risk budgets below still determine
@@ -158,8 +188,11 @@ NIUONE_REVERSAL_RISK_BUDGETS = {
     },
     "rotation": {
         **NIUONE_REGIME_RISK_BUDGETS["rotation"],
-        "per_trade_risk_pct": 0.30,
-        "max_sector_risk_pct": 0.60,
+        "per_trade_risk_pct": 1.00,
+        # Keep the theme ceiling at least as wide as one isolated Probe order;
+        # otherwise the requested 1% rotation budget would still be clipped to
+        # the old 0.60% theme-risk limit before execution.
+        "max_sector_risk_pct": 1.00,
         "max_sector_position_pct": 10.0,
     },
     "recovery": {
@@ -175,6 +208,203 @@ NIUONE_REVERSAL_RISK_BUDGETS = {
         "max_sector_position_pct": 5.0,
     },
 }
+
+
+def _priority_number(value: Any, default: float = 0.0) -> float:
+    try:
+        resolved = float(value)
+    except (TypeError, ValueError):
+        return default
+    return resolved if resolved == resolved else default
+
+
+def niuone_buy_signal_score(
+    item: Mapping[str, Any] | None,
+    *,
+    fallback: Any = None,
+) -> tuple[float | None, str]:
+    """Resolve the auditable score attached to one NiuOne BUY signal."""
+    values = item if isinstance(item, Mapping) else {}
+    for key in NIUONE_BUY_SIGNAL_SCORE_FIELDS:
+        if values.get(key) in (None, ""):
+            continue
+        score = _priority_number(values.get(key), math.nan)
+        if math.isfinite(score):
+            return round(score, 4), key
+    score = _priority_number(fallback, math.nan)
+    if math.isfinite(score):
+        return round(score, 4), "fallback"
+    return None, "unavailable"
+
+
+def niuone_add_signal_score_audit(
+    position: Mapping[str, Any] | None,
+    candidate: Mapping[str, Any] | None,
+    *,
+    fallback_signal_score: Any = None,
+) -> dict[str, Any]:
+    """Compare a repeated BUY signal with the holding's strongest filled BUY.
+
+    The hurdle is the highest score that actually produced a BUY fill, not the
+    latest observation score.  This keeps repeated intraday scans from
+    manufacturing an add and prevents a lower-score rebalance fill from
+    lowering the future scale-in hurdle.
+    """
+    values = position if isinstance(position, Mapping) else {}
+    previous_score: float | None = None
+    previous_source = "unavailable"
+    for key in (
+        "highest_buy_signal_score",
+        "last_buy_signal_score",
+        "entry_signal_score",
+    ):
+        score = _priority_number(values.get(key), math.nan)
+        if math.isfinite(score):
+            previous_score = round(score, 4)
+            previous_source = key
+            break
+    current_score, current_source = niuone_buy_signal_score(
+        candidate,
+        fallback=fallback_signal_score,
+    )
+    improved = bool(
+        previous_score is not None
+        and current_score is not None
+        and current_score > previous_score + 1e-9
+    )
+    return {
+        "eligible": improved,
+        "previous_score": previous_score,
+        "previous_score_source": previous_source,
+        "current_score": current_score,
+        "current_score_source": current_source,
+        "score_delta": (
+            round(current_score - previous_score, 4)
+            if previous_score is not None and current_score is not None
+            else None
+        ),
+    }
+
+
+def niuone_portfolio_priority(
+    item: Mapping[str, Any] | None,
+    strategy_name: str | None = None,
+) -> dict[str, Any]:
+    """Return an auditable current priority for a candidate or open holding.
+
+    The registered strategy certainty is the base.  A holding that has since
+    become a confirmed strong leader is promoted to the leader tier, while a
+    faded/inactive theme is explicitly demoted.  Current decision score is
+    preferred; entry score is only a fallback when the holding is absent from
+    the latest candidate set.
+    """
+    values = item if isinstance(item, Mapping) else {}
+    resolved_strategy = str(
+        strategy_name
+        or values.get("best_strategy")
+        or values.get("buy_strategy")
+        or values.get("strategy_id")
+        or values.get("initial_buy_strategy")
+        or ""
+    ).strip()
+    strategy_priority = NIUONE_STRATEGY_PRIORITY.get(resolved_strategy, 0.0)
+
+    lifecycle_stage = str(
+        values.get("niuone_lifecycle_stage")
+        or values.get("lifecycle_stage")
+        or ""
+    ).strip().lower()
+    mainline_state = str(values.get("mainline_state") or "").strip().lower()
+    strong = values.get("stock_strong") is True
+    leader = values.get("stock_leader_tier") is True
+    if strong and leader:
+        strategy_priority = max(
+            strategy_priority,
+            NIUONE_STRATEGY_PRIORITY["niu_leader"],
+        )
+    elif (
+        values.get("mainline_confirmed") is True
+        and lifecycle_stage in {"markup", "climax", "divergence"}
+    ):
+        strategy_priority = max(
+            strategy_priority,
+            NIUONE_STRATEGY_PRIORITY["niu_pullback"],
+        )
+    elif (
+        values.get("mainline_cross_day_persistent") is True
+        and mainline_state == "emerging"
+    ):
+        strategy_priority = max(
+            strategy_priority,
+            NIUONE_STRATEGY_PRIORITY["niu_emerging"],
+        )
+
+    signal_score = 0.0
+    signal_score_source = "unavailable"
+    for key in (
+        "best_decision_score",
+        "decision_score",
+        "current_decision_score",
+        "selection_signal_score",
+        "entry_signal_score",
+        "best_score",
+        "score",
+    ):
+        if values.get(key) not in (None, ""):
+            signal_score = _priority_number(values.get(key), 0.0)
+            signal_score_source = key
+            break
+    mainline_score = max(
+        0.0,
+        min(100.0, _priority_number(values.get("mainline_score"), 0.0)),
+    )
+    lifecycle_adjustment = NIUONE_LIFECYCLE_PRIORITY_ADJUSTMENT.get(
+        lifecycle_stage,
+        0.0,
+    )
+    if mainline_state in {"fading", "inactive"}:
+        lifecycle_adjustment = min(lifecycle_adjustment, -20.0)
+    strength_adjustment = (4.0 if leader else 0.0) + (3.0 if strong else 0.0)
+    priority_score = (
+        strategy_priority
+        + signal_score * 2.0
+        + mainline_score * 0.05
+        + lifecycle_adjustment
+        + strength_adjustment
+    )
+    return {
+        "score": round(priority_score, 4),
+        "strategy_id": resolved_strategy,
+        "strategy_priority": round(strategy_priority, 4),
+        "signal_score": round(signal_score, 4),
+        "signal_score_source": signal_score_source,
+        "mainline_score": round(mainline_score, 4),
+        "lifecycle_stage": lifecycle_stage,
+        "lifecycle_adjustment": round(lifecycle_adjustment, 4),
+        "strength_adjustment": round(strength_adjustment, 4),
+    }
+
+
+def niuone_priority_is_higher(
+    incoming: Mapping[str, Any] | None,
+    holding: Mapping[str, Any] | None,
+    *,
+    incoming_strategy: str | None = None,
+    holding_strategy: str | None = None,
+    minimum_margin: float = NIUONE_REPLACEMENT_PRIORITY_MARGIN,
+) -> bool:
+    """Return true only for a material, non-tied portfolio priority upgrade."""
+    incoming_priority = niuone_portfolio_priority(
+        incoming,
+        incoming_strategy,
+    )["score"]
+    holding_priority = niuone_portfolio_priority(
+        holding,
+        holding_strategy,
+    )["score"]
+    return float(incoming_priority) >= (
+        float(holding_priority) + max(0.0, float(minimum_margin))
+    )
 
 
 def niuone_risk_budget(

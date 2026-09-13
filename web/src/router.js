@@ -1,6 +1,8 @@
 import { createRouter, createWebHistory } from 'vue-router'
 
 const dashboardPaths = [
+  '/',
+  '/candidates',
   '/practice',
   '/watchlist',
   '/technical-analysis',
@@ -9,22 +11,19 @@ const dashboardPaths = [
   '/industry-flow',
   '/dragon-tiger',
   '/market-monitor',
-  '/x-monitor',
-  '/us-ratings',
+  '/realtime-news',
 ]
 
 const routes = [
-  {
-    path: '/',
-    redirect: '/practice',
-  },
   ...dashboardPaths.map(path => ({
     path,
     component: () => import('./components/DashboardPage.vue'),
+    meta: { dashboardHeader: true },
   })),
   {
     path: '/admin',
     component: () => import('./components/AdminPage.vue'),
+    meta: { dashboardHeader: true },
   },
   {
     path: '/admin/backtest/:strategyId',
@@ -33,6 +32,7 @@ const routes = [
   {
     path: '/admin/settings/:group',
     component: () => import('./components/AdminPage.vue'),
+    meta: { dashboardHeader: true },
   },
   {
     path: '/:pathMatch(.*)*',

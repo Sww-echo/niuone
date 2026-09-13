@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from typing import Any
 from urllib.parse import parse_qs
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 
@@ -43,7 +44,7 @@ def parse_admin_form(body: bytes, services: Any) -> dict[str, str]:
     result: dict[str, str] = {}
     multi_value_kinds = {
         "time_list",
-        "handle_list",
+        "news_sources",
         "stock_universe",
         "strategy_multi",
         "strategy_single",
@@ -124,6 +125,33 @@ class AdminAccess:
             )
         return parse_admin_form(body, self.services), None
 
+    async def read_json(
+        self,
+        request: Request,
+    ) -> tuple[dict[str, Any] | None, Response | None]:
+        body = await read_request_body(request, self.services.MAX_POST_BODY_BYTES)
+        if body is None:
+            return None, JSONResponse(
+                {"error": "request_too_large"},
+                status_code=413,
+                headers={"Cache-Control": "no-store"},
+            )
+        try:
+            value = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None, JSONResponse(
+                {"error": "invalid_json"},
+                status_code=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        if not isinstance(value, dict):
+            return None, JSONResponse(
+                {"error": "json_object_required"},
+                status_code=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        return value, None
+
 
 def create_admin_router(
     *,
@@ -157,6 +185,135 @@ def create_admin_router(
             )
         payload = await run_in_threadpool(services.build_admin_config_payload)
         return json_response(request, payload, cache_control="no-store")
+
+    @router.get("/api/admin/prompt-strategies")
+    async def prompt_strategies(request: Request) -> Response:
+        limited = rate_limit(request)
+        if limited is not None:
+            return limited
+        if not await access.session_valid(request):
+            return JSONResponse(
+                {"error": "admin_password_required"},
+                status_code=403,
+                headers={"Cache-Control": "no-store"},
+            )
+        payload = await run_in_threadpool(services.build_prompt_strategy_admin_payload)
+        return json_response(request, payload, cache_control="no-store")
+
+    @router.post("/api/admin/prompt-strategies/drafts")
+    async def create_prompt_strategy_draft(request: Request) -> Response:
+        rejected = await access.require_action(request)
+        if rejected is not None:
+            return rejected
+        body, invalid = await access.read_json(request)
+        if invalid is not None:
+            return invalid
+        try:
+            draft = await run_in_threadpool(
+                services.create_prompt_strategy_draft,
+                str((body or {}).get("raw_prompt") or ""),
+            )
+        except ValueError as exc:
+            return JSONResponse(
+                {"error": str(exc)},
+                status_code=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        except RuntimeError as exc:
+            return JSONResponse(
+                {"error": str(exc)},
+                status_code=503,
+                headers={"Cache-Control": "no-store"},
+            )
+        return json_response(
+            request,
+            {"ok": True, "draft": draft},
+            cache_control="no-store",
+            status_code=201,
+        )
+
+    @router.post("/api/admin/prompt-strategies/drafts/{draft_id}/refine")
+    async def refine_prompt_strategy_draft(request: Request, draft_id: str) -> Response:
+        rejected = await access.require_action(request)
+        if rejected is not None:
+            return rejected
+        return StreamingResponse(
+            services.stream_refine_prompt_strategy_draft(draft_id),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-store, no-transform",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @router.post("/api/admin/prompt-strategies/drafts/{draft_id}/activate")
+    async def activate_prompt_strategy_draft(request: Request, draft_id: str) -> Response:
+        rejected = await access.require_action(request)
+        if rejected is not None:
+            return rejected
+        body, invalid = await access.read_json(request)
+        if invalid is not None:
+            return invalid
+        try:
+            version = await run_in_threadpool(
+                services.activate_prompt_strategy_draft,
+                draft_id,
+                confirmed_plan_sha256=str(
+                    (body or {}).get("confirmed_plan_sha256") or ""
+                ),
+            )
+        except ValueError as exc:
+            return JSONResponse(
+                {"error": str(exc)},
+                status_code=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        except RuntimeError as exc:
+            return JSONResponse(
+                {"error": str(exc)},
+                status_code=503,
+                headers={"Cache-Control": "no-store"},
+            )
+        return json_response(
+            request,
+            {"ok": True, "version": version},
+            cache_control="no-store",
+        )
+
+    @router.get("/api/admin/prompt-strategies/versions/{version_id}/evaluations")
+    async def prompt_strategy_evaluations(request: Request, version_id: str) -> Response:
+        limited = rate_limit(request)
+        if limited is not None:
+            return limited
+        if not await access.session_valid(request):
+            return JSONResponse(
+                {"error": "admin_password_required"},
+                status_code=403,
+                headers={"Cache-Control": "no-store"},
+            )
+        code = str(request.query_params.get("code") or "").strip()
+        try:
+            limit = int(request.query_params.get("limit") or "100")
+        except ValueError:
+            limit = 100
+        try:
+            evaluations = await run_in_threadpool(
+                services.prompt_strategy_evaluations,
+                version_id,
+                code=code,
+                limit=limit,
+            )
+        except ValueError as exc:
+            return JSONResponse(
+                {"error": str(exc)},
+                status_code=404,
+                headers={"Cache-Control": "no-store"},
+            )
+        return json_response(
+            request,
+            {"items": evaluations},
+            cache_control="no-store",
+        )
 
     @router.post("/api/admin/session")
     async def create_admin_session(request: Request) -> Response:

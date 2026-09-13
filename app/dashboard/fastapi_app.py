@@ -29,6 +29,7 @@ from app.dashboard.routers import (
     create_market_router,
     create_messages_router,
     create_practice_router,
+    create_realtime_news_router,
     create_system_router,
     create_watchlist_tracker_router,
     create_technical_analysis_router,
@@ -40,6 +41,7 @@ DEFAULT_WEB_DIST_DIR = PROJECT_ROOT / "web" / "dist"
 GZIP_MIN_BYTES = int(os.environ.get("DASHBOARD_GZIP_MIN_BYTES", "1024") or "1024")
 SPA_DASHBOARD_PATHS = (
     "/",
+    "/candidates",
     "/practice",
     "/watchlist",
     "/technical-analysis",
@@ -48,8 +50,7 @@ SPA_DASHBOARD_PATHS = (
     "/industry-flow",
     "/dragon-tiger",
     "/market-monitor",
-    "/x-monitor",
-    "/us-ratings",
+    "/realtime-news",
 )
 SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
@@ -168,12 +169,15 @@ def create_app(
             legacy.get_or_create_admin_token()
             legacy.restore_practice_manual_cycle_state()
             legacy.start_b1_scheduler()
+            legacy.start_practice_fast_cycle()
             legacy.start_kline_prewarm_scheduler()
             legacy.start_pending_decision_executor()
             legacy.start_practice_equity_heartbeat()
             legacy.start_daily_market_history_reset()
             legacy.start_market_breadth_sampler()
+            legacy.start_market_breadth_auto_recovery()
             legacy.start_industry_flow_sampler()
+            legacy.start_market_api_prewarm()
             projection_enabled = str(
                 os.environ.get("DASHBOARD_PUBLIC_PROJECTION_ENABLED", "1") or "1"
             ).strip().lower() not in {"0", "false", "no", "off"}
@@ -376,6 +380,12 @@ def create_app(
         )
     )
     app.include_router(
+        create_realtime_news_router(
+            services=legacy,
+            cached_response=cached_native_api_response,
+        )
+    )
+    app.include_router(
         create_market_router(
             services=legacy,
             cached_response=cached_native_api_response,
@@ -450,13 +460,16 @@ def run(*, host: str, port: int, legacy_module: ModuleType | None = None) -> Non
     import uvicorn
 
     app = create_app(legacy_module=legacy_module)
+    access_log = str(
+        os.environ.get("DASHBOARD_ACCESS_LOG", "1") or "1"
+    ).strip().lower() not in {"0", "false", "no", "off"}
     uvicorn.run(
         app,
         host=host,
         port=port,
         proxy_headers=False,
         server_header=False,
-        access_log=True,
+        access_log=access_log,
     )
 
 

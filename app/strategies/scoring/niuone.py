@@ -26,7 +26,13 @@ from ..niuone_risk import (
 )
 from ..policy import (
     NIUONE_DAILY_V_MIN_RECOVERY_RATIO,
+    NIUONE_MATURE_MIN_MARKET_AMOUNT_PERCENTILE,
+    NIUONE_MATURE_MIN_THEME_AMOUNT_PERCENTILE,
     NIUONE_TODAY_OBSERVATION_THRESHOLD,
+    NIUONE_THEME_ATTRIBUTION_CONFIDENCE_SCORE,
+    NIUONE_THEME_LEADER_MIN_ATTRIBUTION_WEIGHT,
+    niuone_turnover_blocker,
+    niuone_stock_activity_blocker,
 )
 from ..lifecycle import (
     niuone_lifecycle_entry_blocker,
@@ -72,18 +78,16 @@ NIUONE_DAILY_V_MIN_RISING_RATIO = 2 / 3
 NIUONE_THEME_ATTRIBUTION_CURRENT_WEIGHT = 0.75
 NIUONE_THEME_ATTRIBUTION_HISTORY_WEIGHT = 0.25
 NIUONE_THEME_ATTRIBUTION_HISTORY_DECAY = 0.75
-NIUONE_THEME_ATTRIBUTION_CONFIDENCE_SCORE = 60.0
 NIUONE_THEME_ATTRIBUTION_CONFIDENCE_GAP = 5.0
 NIUONE_THEME_ATTRIBUTION_SOFTMAX_TEMPERATURE = 12.0
 NIUONE_THEME_ATTRIBUTION_MIN_MASS = 0.25
-NIUONE_THEME_LEADER_MIN_ATTRIBUTION_WEIGHT = 0.15
 NIUONE_THEME_RETURN_CORRELATION_LOOKBACK = 20
 NIUONE_THEME_RETURN_CORRELATION_MIN_OBSERVATIONS = 8
 NIUONE_THEME_RETURN_CORRELATION_MIN_PEERS = 3
 NIUONE_THEME_RETURN_CORRELATION_RANK_FULL_SPREAD = 15.0
 NIUONE_MIN_ATTRIBUTED_THEME_MASS = 1.5
 NIUONE_TODAY_BREADTH_PRIOR_MASS = 4.0
-NIUONE_CONTEXT_VERSION = 12
+NIUONE_CONTEXT_VERSION = 13
 
 
 def _mean(values: list[float], default: float = 0.0) -> float:
@@ -394,6 +398,12 @@ def _member_metrics(item: dict[str, Any]) -> dict[str, Any] | None:
         item.get("themes") or latest.get("themes"),
         fallback=industry,
     )
+    quote_amount = safe_float(quote.get("amount"))
+    row_amount = safe_float(latest.get("quote_amount"))
+    resolved_amount = quote_amount if quote_amount is not None else row_amount
+    turnover = safe_float(quote.get("turnover"))
+    if turnover is None:
+        turnover = safe_float(latest.get("quote_turnover"))
     return {
         "code": _stock_code(item.get("code") or latest.get("symbol_code")),
         "name": str(item.get("name") or latest.get("stock_name") or ""),
@@ -405,7 +415,13 @@ def _member_metrics(item: dict[str, Any]) -> dict[str, Any] | None:
         "trend_aligned": bool(ema20 and ema50 and close >= ema20 >= ema50),
         "new_high20": bool(highs and close >= max(highs)),
         "volume_ratio": volume_ratio,
-        "amount": safe_float(quote.get("amount")) or safe_float(latest.get("quote_amount")) or 0.0,
+        "amount": max(0.0, resolved_amount or 0.0),
+        "amount_available": (
+            resolved_amount is not None
+            and math.isfinite(resolved_amount)
+            and resolved_amount > 0
+        ),
+        "turnover": turnover,
         "change_pct": live_change if live_change is not None else (safe_float(latest.get("change_pct")) or 0.0),
         "live_change_available": live_change is not None,
         "previous_close": previous_close,
@@ -1566,9 +1582,9 @@ def build_niuone_context(
         member["amount_percentile"] = _percentile_from_sorted(float(member["amount"]), sorted_amount)
         member["strong_score"] = _clamp(
             member["ret20_percentile"] * 0.30
-            + member["ret5_percentile"] * 0.25
+            + member["ret5_percentile"] * 0.20
             + member["volume_percentile"] * 0.15
-            + member["amount_percentile"] * 0.10
+            + member["amount_percentile"] * 0.15
             + (100.0 if member["trend_aligned"] else (60.0 if member["above_ema20"] else 0.0)) * 0.10
             + (100.0 if member["new_high20"] else 0.0) * 0.10
         )
@@ -1930,6 +1946,9 @@ def build_niuone_context(
 
         theme_ret5 = sorted(float(member["ret5"]) for member in theme_members)
         theme_ret20 = sorted(float(member["ret20"]) for member in theme_members)
+        theme_amounts_sorted = sorted(
+            float(member["amount"]) for member in theme_members
+        )
         attributed_leader_rank_by_code = {
             str(member.get("code") or ""): index
             for index, member in enumerate(strong_members, start=1)
@@ -1942,6 +1961,24 @@ def build_niuone_context(
         }
         for rank_index, member in enumerate(sorted(theme_members, key=lambda item: float(item["strong_score"]), reverse=True), start=1):
             code = str(member["code"])
+            market_amount_percentile = float(member["amount_percentile"])
+            theme_amount_percentile = _percentile_from_sorted(
+                float(member["amount"]),
+                theme_amounts_sorted,
+            )
+            activity_score = _clamp(
+                market_amount_percentile * 0.65
+                + theme_amount_percentile * 0.25
+                + float(member["volume_percentile"]) * 0.10
+            )
+            activity_confirmed = bool(
+                member.get("amount_available")
+                and niuone_turnover_blocker(member.get("turnover")) is None
+                and market_amount_percentile
+                >= NIUONE_MATURE_MIN_MARKET_AMOUNT_PERCENTILE
+                and theme_amount_percentile
+                >= NIUONE_MATURE_MIN_THEME_AMOUNT_PERCENTILE
+            )
             today_rank = attributed_today_rank_by_code.get(code)
             today_rank_score = (
                 100 - (today_rank - 1) / max(1, len(today_ranked_members) - 1) * 100
@@ -2005,6 +2042,24 @@ def build_niuone_context(
                 "attribution_observation_count": attribution.get("attribution_observation_count"),
                 "attribution_wave_count": attribution.get("attribution_wave_count"),
                 "strong_score": round(float(member["strong_score"]), 2),
+                "amount": round(float(member["amount"]), 2),
+                "amount_available": bool(member.get("amount_available")),
+                "turnover": member.get("turnover"),
+                "market_amount_percentile": round(
+                    market_amount_percentile,
+                    2,
+                ),
+                "theme_amount_percentile": round(
+                    theme_amount_percentile,
+                    2,
+                ),
+                "volume_participation_percentile": round(
+                    float(member["volume_percentile"]),
+                    2,
+                ),
+                "activity_score": round(activity_score, 2),
+                "activity_confirmed": activity_confirmed,
+                "activity_gate_required": True,
                 "strong": bool(
                     member["strong"]
                     and _theme_leadership_eligible(attribution)
@@ -2179,6 +2234,15 @@ def build_niuone_context(
                     "theme_member_count",
                     "strong",
                     "strong_score",
+                    "amount",
+                    "amount_available",
+                    "turnover",
+                    "market_amount_percentile",
+                    "theme_amount_percentile",
+                    "volume_participation_percentile",
+                    "activity_score",
+                    "activity_confirmed",
+                    "activity_gate_required",
                     "role",
                     "leader_rank",
                     "leader_tier",
@@ -2592,6 +2656,19 @@ def _entry_metrics(
     market = context.get("market") if isinstance(context.get("market"), dict) else {}
     if not isinstance(theme, dict) or not isinstance(stock, dict):
         return None
+    if "quote_turnover" in latest:
+        # Holding-only rescans retain the full-market amount ranks, but must
+        # use this scan's actual turnover, including a missing fresh value.
+        stock["turnover"] = latest.get("quote_turnover")
+        stock["activity_confirmed"] = niuone_stock_activity_blocker(
+            strategy_name,
+            {
+                "stock_activity_data_available": stock.get("amount_available"),
+                "stock_market_amount_percentile": stock.get("market_amount_percentile"),
+                "stock_theme_amount_percentile": stock.get("theme_amount_percentile"),
+                "turnover": stock.get("turnover"),
+            },
+        ) is None
     close = float(common["close"])
     atr = float(common["atr"])
     intraday_low = safe_float(common.get("row_intraday_low"))
@@ -2609,7 +2686,11 @@ def _entry_metrics(
         float(common["stop_atr"]),
         regime,
     )
-    score_before_external = (float(theme["score"]) * 0.55 + float(stock["strong_score"]) * 0.45) / 10
+    theme_score = safe_float(theme.get("score"))
+    stock_score = safe_float(stock.get("strong_score"))
+    if theme_score is None or stock_score is None:
+        return None
+    score_before_external = (theme_score * 0.55 + stock_score * 0.45) / 10
     raw_external = float(stock.get("dragon_tiger_adjustment") or 0.0) + float(stock.get("news_adjustment") or 0.0)
     positive_suppressed = bool(
         raw_external > 0 and float(common["extension_atr"]) > 1.5
@@ -2869,6 +2950,23 @@ def _payload(
         "stock_leader_tier": bool(stock.get("leader_tier")),
         "stock_strong": bool(stock.get("strong")),
         "stock_strong_score": stock.get("strong_score"),
+        "stock_activity_gate_required": bool(
+            stock.get("activity_gate_required")
+        ),
+        "stock_activity_data_available": bool(stock.get("amount_available")),
+        "turnover": stock.get("turnover"),
+        "stock_amount": stock.get("amount"),
+        "stock_market_amount_percentile": stock.get(
+            "market_amount_percentile"
+        ),
+        "stock_theme_amount_percentile": stock.get(
+            "theme_amount_percentile"
+        ),
+        "stock_volume_participation_percentile": stock.get(
+            "volume_participation_percentile"
+        ),
+        "stock_activity_score": stock.get("activity_score"),
+        "stock_activity_confirmed": bool(stock.get("activity_confirmed")),
         "stock_reversal_leader_rank": stock.get("today_leader_rank"),
         "stock_reversal_leader_tier": bool(stock.get("today_leader_tier")),
         "stock_reversal_strong": bool(stock.get("reversal_strong")),
@@ -2939,9 +3037,9 @@ def _payload(
             "min_entry_extension_atr",
             0.0,
         ),
-        # Retained as a compatibility field for older Dashboard payloads.  A
-        # NiuOne entry no longer has a fixed daily-gain cap; the execution
-        # layer rejects only a quote that is actually at its board limit.
+        # Retained for older Dashboard payloads. Scoring does not cap daily
+        # gains; first Probe entries recheck the actual quote at execution,
+        # alongside the board-limit guard shared by all entry routes.
         "max_entry_change_pct": chase_limits.get("max_entry_change_pct"),
         "max_entry_extension_atr": chase_limits["max_entry_extension_atr"],
         "gap_buffer_pct": safe_round(metrics["gap_buffer_pct"], 3),

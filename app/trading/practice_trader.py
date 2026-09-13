@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import concurrent.futures
 import copy
+import hashlib
 import json
+import sqlite3
 import math
 import os
 import re
@@ -33,13 +35,39 @@ from pathlib import Path
 from typing import Any
 
 from a_share_calendar import is_a_share_trading_day as calendar_is_a_share_trading_day, trading_day_status
-from core.model_api import build_model_request, parse_model_response, request_model
+from core.model_api import (
+    build_model_request,
+    parse_model_response,
+    request_model,
+    request_model_complete,
+)
+from core.model_request_guard import (
+    ModelAdmissionError,
+    ModelRequestExpired,
+    budgeted_model_call,
+    remaining_model_seconds,
+    model_request_budget,
+)
+from app.trading.decision_freshness import decision_expiry, decision_is_expired
+from core.shared_model_config import (
+    LEGACY_SUMMARY_MODEL_ENV_NAMES,
+    SHARED_MODEL_ENV_NAMES,
+    resolve_shared_model_config,
+)
 from market_data.news_precheck import (
+    NewsPrecheckConfig,
+    cached_news_record_matches_source,
+    fetch_candidate_news_records,
     format_cached_news_record,
     format_cached_news_records,
-    news_search_tools,
 )
+from market_data.tencent_kline_cache import merge_live_quote, quote_trade_date
 from niuone_paths import get_dashboard_env_file, get_dashboard_home
+from trading.news_decision_context import (
+    DEFAULT_DECISION_NEWS_MAX_ITEMS,
+    format_important_realtime_news_for_prompt,
+    load_important_realtime_news_decision_context,
+)
 from screening.stock_universe import (
     STOCK_UNIVERSE_ENV,
     friendly_stock_universe,
@@ -97,12 +125,34 @@ from strategies.exits import (
     NIUONE_REVERSAL_MAINLINE_WEAK_CONFIRMATIONS,
     SHAOFU_MIN_HOLD_TRADING_DAYS,
     SHAOFU_SOFT_EXIT_CONFIRMATIONS,
+    SOFT_EXIT_CONFIRMATIONS,
+    SOFT_EXIT_REDUCE_RATIO,
+    arbitrate_staged_soft_exit,
     evaluate_shaofu_soft_exit,
     evaluate_strategy_time_exit,
     niuone_climax_runner_active,
+    niuone_hard_exit_evidence,
+    niuone_stop_levels,
     resolve_niuone_partial_take_profit,
 )
+from strategies.exit_feedback import (
+    EXIT_FEEDBACK_ALGORITHM_VERSION,
+    EXIT_FEEDBACK_DEFAULT_COOLDOWN_SAMPLES,
+    EXIT_FEEDBACK_DEFAULT_MIN_MONTHS,
+    EXIT_FEEDBACK_DEFAULT_MIN_SAMPLES,
+    effective_exit_feedback_parameters,
+)
+from strategies.display import (
+    localize_decision_display_fields,
+    localize_strategy_text,
+    mainline_mode_label,
+    mainline_state_label,
+    stock_role_label,
+)
 from strategies.lifecycle import NIUONE_LIFECYCLE_STAGES
+from trading.accounting import ACCOUNTING_AUDIT_FIELDS, trade_counts_for_account
+from trading.realized_returns import annotate_realized_returns
+from trading.lifecycles import _trade_identity
 from trading.fees import (
     A_SHARE_COMMISSION_RATE,
     A_SHARE_MINIMUM_COMMISSION,
@@ -125,6 +175,8 @@ from strategies.performance import (
 )
 from strategies.policy import (
     candidate_buy_blockers as _strategy_candidate_buy_blockers,
+    niu_reversal_entry_price_blocker,
+    niuone_turnover_blocker,
     niuone_markup_rebalance_observation,
     niuone_markup_rebalance_reentry_blocker,
     niuone_markup_upgrade_blocker,
@@ -135,6 +187,22 @@ from strategies.prompts import (
     build_strategy_prompt_sections,
     format_preset_strategy_section,
 )
+from strategies.prompt_strategy import (
+    build_preset_decision_audit,
+    build_preset_exit_audit,
+    build_preset_strategy_snapshot,
+    format_frozen_preset_exit_section,
+    normalize_preset_strategy_interpretation,
+    preset_candidate_facts,
+    validate_preset_buy_audit,
+    validate_preset_sell_audit,
+)
+from storage.prompt_strategies import PromptStrategyStore
+from strategies.prompt_runtime import (
+    evaluate_frozen_strategy_stage,
+    resolve_prompt_order_shares,
+)
+from strategies.rules import replay_rule_evaluation_audit
 from strategies.niuone_risk import (
     NIUONE_ABSOLUTE_POSITION_CAP_PCT,
     NIUONE_ENTRY_REGIMES,
@@ -151,8 +219,12 @@ from strategies.niuone_risk import (
     NIUONE_MARKUP_UPGRADE_MAX_PNL_PCT,
     NIUONE_MARKUP_UPGRADE_MIN_PNL_PCT,
     NIUONE_MARKUP_UPGRADE_POSITION_CAP_PCT,
-    NIUONE_MAX_NEW_POSITIONS_PER_TRADING_DAY,
-    NIUONE_MAX_OPEN_POSITIONS,
+    NIUONE_REPLACEMENT_PRIORITY_MARGIN,
+    NIUONE_DEFAULT_MAX_OPEN_POSITIONS,
+    niuone_add_signal_score_audit,
+    niuone_buy_signal_score,
+    niuone_portfolio_priority,
+    niuone_priority_is_higher,
     niuone_risk_budget,
     niuone_structural_stop_limits,
     niuone_structure_risk_ok,
@@ -200,6 +272,18 @@ def env_token_count(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
+def token_count_value(raw: Any, default: int) -> int:
+    compact = str(raw or "").replace(",", "").replace("_", "").strip()
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)([kKmM]?)", compact)
+    if not match:
+        return default
+    number = float(match.group(1))
+    unit = match.group(2).lower()
+    multiplier = 1_000_000 if unit == "m" else 1_000 if unit == "k" else 1
+    value = int(number * multiplier)
+    return value if value > 0 else default
+
+
 def env_float(name: str, default: float) -> float:
     try:
         value = os.environ.get(name)
@@ -232,28 +316,23 @@ def env_hhmm(name: str, default: str) -> dtime:
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 DASHBOARD_HOME = get_dashboard_home(PROJECT_ROOT)
+REALTIME_NEWS_CACHE_FILE = DASHBOARD_HOME / "news" / "realtime_news_latest.json"
 
 
 def load_dashboard_env() -> None:
     allowed = {
-        "DASHBOARD_NEWS_MODEL",
-        "DASHBOARD_NEWS_API_MODE",
-        "DASHBOARD_NEWS_CONTEXT_LENGTH",
-        "DASHBOARD_NEWS_MAX_TOKENS",
-        "DASHBOARD_NEWS_BASE_URL",
-        "DASHBOARD_NEWS_API_KEY",
-        "DASHBOARD_NEWS_TIMEOUT",
-        "DASHBOARD_NEWS_MAX_RETRIES",
-        "DASHBOARD_NEWS_CONCURRENCY",
-        "DASHBOARD_DECISION_MODEL",
-        "DASHBOARD_DECISION_CONTEXT_LENGTH",
-        "DASHBOARD_DECISION_BASE_URL",
-        "DASHBOARD_DECISION_API_KEY",
-        "DASHBOARD_DECISION_MAX_TOKENS",
+        "IWENCAI_NEWS_PRECHECK_ENABLED",
+        "IWENCAI_ENABLED",
+        "IWENCAI_BASE_URL",
+        "IWENCAI_API_KEY",
+        "IWENCAI_TIMEOUT_SECONDS",
+        "IWENCAI_MAX_RETRIES",
+        "IWENCAI_MAX_CONCURRENCY",
         "DASHBOARD_DECISION_TIMEOUT",
         "DASHBOARD_DECISION_INTELLIGENCE_ENABLED",
         "DASHBOARD_DECISION_INTELLIGENCE_TTL_SECONDS",
         "DASHBOARD_DECISION_INTELLIGENCE_MAX_ITEMS",
+        "NEWSNOW_DECISION_ENABLED",
         "DASHBOARD_NOTIFICATION_ENABLED",
         "DASHBOARD_NOTIFICATION_TIMEOUT_SECONDS",
         "DASHBOARD_FEISHU_NOTIFICATION_ENABLED",
@@ -277,6 +356,10 @@ def load_dashboard_env() -> None:
         "DASHBOARD_MIN_CASH_RESERVE_PCT",
         "DASHBOARD_MARKET_GUIDANCE_ENABLED",
         "DASHBOARD_MORNING_MAX_OPEN_POSITIONS",
+        "DASHBOARD_EXIT_FEEDBACK_AUTO_TUNE_ENABLED",
+        "DASHBOARD_EXIT_FEEDBACK_MIN_SAMPLES",
+        "DASHBOARD_EXIT_FEEDBACK_MIN_MONTHS",
+        "DASHBOARD_EXIT_FEEDBACK_COOLDOWN_SAMPLES",
         STOCK_UNIVERSE_ENV,
         STRATEGY_SOURCE_ENV,
         PERSONA_STRATEGY_ENV,
@@ -285,7 +368,7 @@ def load_dashboard_env() -> None:
         TRADE_DISCIPLINE_TEXT_ENV,
         "CROSSDESK_BASE_URL",
         "CROSSDESK_API_KEY",
-    }
+    } | set(SHARED_MODEL_ENV_NAMES) | set(LEGACY_SUMMARY_MODEL_ENV_NAMES)
     path = get_dashboard_env_file(PROJECT_ROOT)
     if not path.exists():
         return
@@ -331,6 +414,73 @@ MARKET_ENV_CACHE: dict[str, Any] = {"ts": 0.0, "bullish": True, "index": "", "em
 MARKET_ENV_TTL_SECONDS = 300  # 5分钟缓存
 MARKET_SENTIMENT_CACHE: dict[str, Any] = {"ts": 0.0, "limit_up_count": 0, "sentiment": "neutral", "detail": ""}
 MARKET_SENTIMENT_TTL = 600  # 10分钟缓存
+
+
+def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(str(os.environ.get(name) or default).strip())
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def exit_feedback_auto_tune_config() -> dict[str, Any]:
+    """Read the existing Dashboard environment with defensive bounds."""
+    return {
+        "enabled": env_bool("DASHBOARD_EXIT_FEEDBACK_AUTO_TUNE_ENABLED", True),
+        "min_samples": _bounded_env_int(
+            "DASHBOARD_EXIT_FEEDBACK_MIN_SAMPLES",
+            EXIT_FEEDBACK_DEFAULT_MIN_SAMPLES,
+            20,
+            500,
+        ),
+        "min_months": _bounded_env_int(
+            "DASHBOARD_EXIT_FEEDBACK_MIN_MONTHS",
+            EXIT_FEEDBACK_DEFAULT_MIN_MONTHS,
+            2,
+            12,
+        ),
+        "cooldown_samples": _bounded_env_int(
+            "DASHBOARD_EXIT_FEEDBACK_COOLDOWN_SAMPLES",
+            EXIT_FEEDBACK_DEFAULT_COOLDOWN_SAMPLES,
+            5,
+            100,
+        ),
+    }
+
+
+def current_exit_feedback_policy(state: Mapping[str, Any]) -> dict[str, Any]:
+    raw = state.get("exit_feedback_policy")
+    if not isinstance(raw, Mapping):
+        summary = state.get("post_exit_observation_summary")
+        raw = summary.get("feedback_policy") if isinstance(summary, Mapping) else {}
+    policy = dict(raw) if isinstance(raw, Mapping) else {}
+    policy["enabled"] = bool(exit_feedback_auto_tune_config()["enabled"])
+    policy.setdefault("version", 0)
+    policy.setdefault("algorithm_version", EXIT_FEEDBACK_ALGORITHM_VERSION)
+    if policy["enabled"]:
+        if str(policy.get("status") or "") in {"", "disabled"}:
+            policy["status"] = "learning"
+            policy["action"] = "awaiting_first_review"
+            policy["reason"] = "等待首次盘后复盘生成有效样本与评估检查点"
+    else:
+        policy["status"] = "disabled"
+        policy["action"] = ""
+        policy["reason"] = "自动调参已在运行配置中关闭"
+    policy["parameters"] = effective_exit_feedback_parameters(policy)
+    return policy
+
+
+def exit_feedback_trade_audit(state: Mapping[str, Any]) -> dict[str, Any]:
+    policy = current_exit_feedback_policy(state)
+    return {
+        "exit_feedback_enabled": bool(policy.get("enabled")),
+        "exit_feedback_policy_version": int(policy.get("version") or 0),
+        "exit_feedback_algorithm_version": str(
+            policy.get("algorithm_version") or EXIT_FEEDBACK_ALGORITHM_VERSION
+        ),
+        "exit_feedback_parameters": dict(policy.get("parameters") or {}),
+    }
 
 
 def check_market_sentiment() -> dict[str, Any]:
@@ -433,16 +583,16 @@ TENCENT_QUOTE_URL = "https://qt.gtimg.cn/q="
 SINA_QUOTE_URL = "https://hq.sinajs.cn/list="
 EASTMONEY_STOCK_URL = "https://push2.eastmoney.com/api/qt/stock/get"
 EASTMONEY_UT = "bd1d9ddb04089700cf9c27f6f7426281"
-MODEL = os.environ.get("DASHBOARD_DECISION_MODEL") or "deepseek-v4-pro"
-DECISION_CONTEXT_LENGTH = env_token_count("DASHBOARD_DECISION_CONTEXT_LENGTH", 128000)
-DECISION_MAX_TOKENS = env_int("DASHBOARD_DECISION_MAX_TOKENS", 4096)
+_SHARED_MODEL = resolve_shared_model_config(os.environ)
+MODEL = _SHARED_MODEL.model
+DECISION_STREAM_MODE = _SHARED_MODEL.stream_mode
+DECISION_REASONING_EFFORT = _SHARED_MODEL.reasoning_effort
+DECISION_CONTEXT_LENGTH = token_count_value(_SHARED_MODEL.context_length, 128000)
+DECISION_MAX_TOKENS = token_count_value(_SHARED_MODEL.max_tokens, 4096)
+DECISION_RETRY_MAX_TOKENS = 65_536
+DECISION_JSON_SAME_LIMIT_RETRIES = 1
+DECISION_JSON_MAX_PARSE_ATTEMPTS = 6
 DECISION_REQUEST_TIMEOUT = env_int("DASHBOARD_DECISION_TIMEOUT", 180)
-NEWS_PRECHECK_REQUEST_TIMEOUT = max(5, env_int("DASHBOARD_NEWS_TIMEOUT", 45))
-NEWS_PRECHECK_MAX_RETRIES = max(1, env_int("DASHBOARD_NEWS_MAX_RETRIES", 1))
-NEWS_PRECHECK_CONCURRENCY = max(1, min(5, env_int("DASHBOARD_NEWS_CONCURRENCY", 5)))
-NEWS_PRECHECK_API_MODE = os.environ.get("DASHBOARD_NEWS_API_MODE") or "auto"
-NEWS_PRECHECK_CONTEXT_LENGTH = env_token_count("DASHBOARD_NEWS_CONTEXT_LENGTH", 128000)
-NEWS_PRECHECK_MAX_TOKENS = env_token_count("DASHBOARD_NEWS_MAX_TOKENS", 4096)
 PROVIDER_DISPLAY_NAME = "Crossdesk.ccwu.cc"
 CROSSDESK_PROVIDER_NAME = "Crossdesk.ccwu.cc"
 TRADE_LOG_LIMIT = 200
@@ -459,14 +609,31 @@ def now_ts() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _accounted_trade_executions(
+    executed: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return only fills that remain active after account-state reconciliation."""
+    return [
+        trade
+        for trade in executed
+        if isinstance(trade, dict) and trade_counts_for_account(trade)
+    ]
+
+
 def _notify_trade_executions_safely(executed: list[dict[str, Any]]) -> None:
     """Fan out persisted simulated fills without affecting trade execution."""
-    if not executed:
+    accounted_executions = _accounted_trade_executions(executed)
+    if not accounted_executions:
         return
     try:
         from notifications import notify_trade_executions
 
-        results = notify_trade_executions(executed)
+        display_rows = _realized_display_trade_history(accounted_executions)
+        display_by_key = {_trade_identity(row): row for row in display_rows}
+        results = notify_trade_executions([
+            display_by_key.get(_trade_identity(row), row)
+            for row in accounted_executions
+        ])
         failed_count = sum(1 for result in (results or []) if not bool(getattr(result, "ok", False)))
         if failed_count:
             print(
@@ -733,13 +900,398 @@ def default_state() -> dict[str, Any]:
     }
 
 
+def _reconcile_exit_feedback_policy_from_db(state: dict[str, Any]) -> None:
+    """Prefer the atomically active SQLite policy after a crash or stale JSON read."""
+    if not exit_feedback_auto_tune_config()["enabled"]:
+        return
+    try:
+        from niuniu_db import query_active_exit_feedback_policy as _query_policy
+
+        active = _query_policy()
+    except Exception:
+        return
+    if not isinstance(active, Mapping) or not active.get("active"):
+        return
+    state_policy = state.get("exit_feedback_policy")
+    state_version = int(
+        (state_policy or {}).get("version") or 0
+    ) if isinstance(state_policy, Mapping) else 0
+    active_version = int(active.get("version") or 0)
+    if active_version > state_version:
+        state["exit_feedback_policy"] = {
+            **dict(active),
+            "enabled": True,
+        }
+
+
+def _current_day_cash_replay(
+    state: Mapping[str, Any],
+    *,
+    today: str,
+) -> tuple[float, float] | None:
+    """Replay today's fills from a verified pre-trade cash boundary.
+
+    The replay is intentionally bounded to the current day.  It is only safe
+    when an intraday point before the first fill confirms that cash carried
+    forward unchanged from the latest prior-day equity point.
+    """
+    trades = [
+        trade
+        for trade in state.get("trade_log") or []
+        if isinstance(trade, Mapping)
+        and trade_counts_for_account(trade)
+        and str(trade.get("time") or "")[:10] == today
+    ]
+    if not trades:
+        return None
+    if any(str(trade.get("action") or "").upper() not in {"BUY", "SELL"} for trade in trades):
+        return None
+
+    prior_points = [
+        point
+        for key in ("daily_equity_history", "equity_history")
+        for point in state.get(key) or []
+        if isinstance(point, Mapping)
+        and str(point.get("time") or "")[:10] < today
+        and math.isfinite(_safe_float(point.get("cash"), float("nan")))
+        and math.isfinite(_safe_float(point.get("equity"), float("nan")))
+    ]
+    if not prior_points:
+        return None
+    prior = max(prior_points, key=lambda point: str(point.get("time") or ""))
+    prior_cash = _safe_float(prior.get("cash"), float("nan"))
+    prior_equity = _safe_float(prior.get("equity"), float("nan"))
+    if not math.isfinite(prior_cash) or not math.isfinite(prior_equity) or prior_equity <= 0:
+        return None
+
+    first_trade_time = min(str(trade.get("time") or "") for trade in trades)
+    pretrade_points = [
+        point
+        for point in state.get("equity_history") or []
+        if isinstance(point, Mapping)
+        and str(point.get("time") or "")[:10] == today
+        and str(point.get("time") or "") < first_trade_time
+        and math.isfinite(_safe_float(point.get("cash"), float("nan")))
+    ]
+    if not pretrade_points:
+        return None
+    pretrade = max(pretrade_points, key=lambda point: str(point.get("time") or ""))
+    if abs(_safe_float(pretrade.get("cash"), float("nan")) - prior_cash) > 0.01:
+        return None
+
+    expected_cash = prior_cash
+    for trade in sorted(trades, key=lambda item: str(item.get("time") or "")):
+        action = str(trade.get("action") or "").upper()
+        if action == "BUY":
+            has_complete_cash_fields = (
+                trade.get("total_cost") is not None
+                or (trade.get("amount") is not None and trade.get("fee") is not None)
+            )
+        else:
+            has_complete_cash_fields = (
+                trade.get("net_proceeds") is not None
+                or (trade.get("amount") is not None and trade.get("fee") is not None)
+            )
+        if not has_complete_cash_fields:
+            return None
+        cash_delta = _trade_cash_delta(trade)
+        if not math.isfinite(cash_delta):
+            return None
+        expected_cash += cash_delta
+    return round(expected_cash, 2), prior_equity
+
+
+def reconcile_current_day_cash_from_ledger(
+    state: dict[str, Any],
+    *,
+    today: str | None = None,
+) -> bool:
+    """Repair only a proven current-day cash drift; preserve older history."""
+    replay = _current_day_cash_replay(state, today=today or today_key())
+    if replay is None:
+        return False
+    expected_cash, _prior_equity = replay
+    current_cash = _safe_float(state.get("cash"), float("nan"))
+    if math.isfinite(current_cash) and abs(current_cash - expected_cash) <= 0.01:
+        return False
+    state["cash"] = expected_cash
+    return True
+
+
+def reconcile_current_day_equity_history_from_ledger(
+    state: dict[str, Any],
+    *,
+    today: str | None = None,
+) -> bool:
+    """Repair today's derived equity points without rewriting durable fills.
+
+    A same-minute equity timestamp can represent either the pre-trade heartbeat
+    or a post-trade snapshot because ``record_equity`` stores natural-minute
+    buckets.  Verified points whose cash already matches one of those states are
+    kept as anchors.  For a corrupted point, choose the feasible ledger state
+    that yields the smoothest path between anchors, then recompute only cash,
+    equity and total P&L percentage from its retained market value.
+
+    The repair fails closed unless the current-day cash ledger has a verified
+    prior-day boundary and every affected point satisfies
+    ``equity == cash + market_value`` before repair.  This prevents an incomplete
+    market-value snapshot from being treated as an accounting-only defect.
+    """
+    today = today or today_key()
+    replay = _current_day_cash_replay(state, today=today)
+    history = state.get("equity_history")
+    if replay is None or not isinstance(history, list):
+        return False
+
+    trades = sorted(
+        (
+            trade
+            for trade in state.get("trade_log") or []
+            if isinstance(trade, Mapping)
+            and trade_counts_for_account(trade)
+            and str(trade.get("time") or "")[:10] == today
+        ),
+        key=lambda trade: str(trade.get("time") or ""),
+    )
+    trade_times = [parse_ts(str(trade.get("time") or "")) for trade in trades]
+    if not trades or any(value is None for value in trade_times):
+        return False
+    resolved_trade_times = [value for value in trade_times if value is not None]
+    cash_deltas = [_trade_cash_delta(trade) for trade in trades]
+    if any(not math.isfinite(value) for value in cash_deltas):
+        return False
+
+    expected_cash, prior_equity = replay
+    prior_cash = round(expected_cash - sum(cash_deltas), 2)
+    cash_prefixes = [prior_cash]
+    for cash_delta in cash_deltas:
+        cash_prefixes.append(round(cash_prefixes[-1] + cash_delta, 2))
+    if abs(cash_prefixes[-1] - expected_cash) > 0.02:
+        return False
+
+    points: list[tuple[int, dict[str, Any], datetime]] = []
+    for index, raw_point in enumerate(history):
+        if not isinstance(raw_point, dict):
+            continue
+        time_text = str(raw_point.get("time") or "")
+        if time_text[:10] != today:
+            continue
+        point_time = parse_ts(time_text)
+        equity = _safe_float(raw_point.get("equity"), float("nan"))
+        cash = _safe_float(raw_point.get("cash"), float("nan"))
+        market_value = _safe_float(raw_point.get("market_value"), float("nan"))
+        if (
+            point_time is None
+            or not all(math.isfinite(value) for value in (equity, cash, market_value))
+            or abs(equity - cash - market_value) > 0.02
+        ):
+            return False
+        points.append((index, raw_point, point_time))
+    if not points:
+        return False
+    points.sort(key=lambda item: str(item[1].get("time") or ""))
+
+    # Each row contains (applied trade count, cash, reconstructed equity).
+    choices: list[list[tuple[int, float, float]]] = []
+    exact_trade_counts: list[int] = []
+    for _index, point, point_time in points:
+        if point_time.second:
+            lower = upper = sum(
+                trade_time <= point_time for trade_time in resolved_trade_times
+            )
+        else:
+            minute_start = point_time.replace(second=0, microsecond=0)
+            minute_end = minute_start + timedelta(minutes=1)
+            lower = sum(
+                trade_time < minute_start for trade_time in resolved_trade_times
+            )
+            upper = sum(
+                trade_time < minute_end for trade_time in resolved_trade_times
+            )
+        exact_count = sum(
+            trade_time <= point_time for trade_time in resolved_trade_times
+        )
+        exact_trade_counts.append(exact_count)
+        market_value = _safe_float(point.get("market_value"), 0.0)
+        row = [
+            (
+                trade_count,
+                cash_prefixes[trade_count],
+                cash_prefixes[trade_count] + market_value,
+            )
+            for trade_count in range(lower, upper + 1)
+        ]
+        recorded_cash = _safe_float(point.get("cash"), float("nan"))
+        anchored = [
+            candidate
+            for candidate in row
+            if abs(candidate[1] - recorded_cash) <= 0.02
+        ]
+        choices.append(anchored or row)
+
+    # Dynamic programming is only needed for corrupted trade-minute points.
+    # All verified cash points have a single anchored candidate.
+    scale = max(abs(prior_equity), 1.0)
+    costs: list[dict[int, float]] = []
+    parents: list[dict[int, int | None]] = []
+    for point_index, row in enumerate(choices):
+        row_costs: dict[int, float] = {}
+        row_parents: dict[int, int | None] = {}
+        for trade_count, _cash, equity in row:
+            tie_break = abs(trade_count - exact_trade_counts[point_index]) * 1e-15
+            if point_index == 0:
+                row_costs[trade_count] = tie_break
+                row_parents[trade_count] = None
+                continue
+            best: tuple[float, int] | None = None
+            previous_equity_by_count = {
+                candidate_count: candidate_equity
+                for candidate_count, _candidate_cash, candidate_equity
+                in choices[point_index - 1]
+            }
+            for previous_count, previous_cost in costs[-1].items():
+                step = (
+                    equity - previous_equity_by_count[previous_count]
+                ) / scale
+                candidate = (previous_cost + step * step + tie_break, previous_count)
+                if best is None or candidate < best:
+                    best = candidate
+            if best is None:
+                return False
+            row_costs[trade_count] = best[0]
+            row_parents[trade_count] = best[1]
+        if not row_costs:
+            return False
+        costs.append(row_costs)
+        parents.append(row_parents)
+
+    selected_count = min(costs[-1], key=lambda key: (costs[-1][key], key))
+    selected_counts: list[int] = []
+    for point_index in range(len(points) - 1, -1, -1):
+        selected_counts.append(selected_count)
+        previous_count = parents[point_index][selected_count]
+        if previous_count is None:
+            break
+        selected_count = previous_count
+    selected_counts.reverse()
+    if len(selected_counts) != len(points):
+        return False
+
+    initial_cash = _safe_float(state.get("initial_cash"), INITIAL_CASH)
+    changed = False
+    revised_points: list[dict[str, Any]] = []
+    for (history_index, point, _point_time), trade_count in zip(
+        points,
+        selected_counts,
+    ):
+        resolved_cash = cash_prefixes[trade_count]
+        market_value = _safe_float(point.get("market_value"), 0.0)
+        resolved_equity = round(resolved_cash + market_value, 2)
+        resolved_pnl_pct = round(
+            (resolved_equity / initial_cash - 1) * 100,
+            2,
+        ) if initial_cash > 0 else 0.0
+        needs_revision = (
+            abs(_safe_float(point.get("cash"), 0.0) - resolved_cash) > 0.01
+            or abs(_safe_float(point.get("equity"), 0.0) - resolved_equity) > 0.01
+            or abs(
+                _safe_float(point.get("pnl_pct"), resolved_pnl_pct)
+                - resolved_pnl_pct
+            ) > 0.005
+        )
+        revised = dict(point)
+        if needs_revision:
+            revised.update({
+                "cash": round(resolved_cash, 2),
+                "equity": resolved_equity,
+                "pnl_pct": resolved_pnl_pct,
+                "cash_reconciled_from_trade_ledger": True,
+            })
+            history[history_index] = revised
+            changed = True
+        revised_points.append(revised)
+
+    final_point = max(
+        revised_points,
+        key=lambda point: str(point.get("time") or ""),
+    )
+    daily_history = state.get("daily_equity_history")
+    if isinstance(daily_history, list) and any(
+        isinstance(point, Mapping)
+        and str(point.get("time") or "")[:10] == today
+        for point in daily_history
+    ):
+        revised_daily = [
+            point
+            for point in daily_history
+            if not (
+                isinstance(point, Mapping)
+                and str(point.get("time") or "")[:10] == today
+            )
+        ]
+        revised_daily.append(dict(final_point))
+        revised_daily.sort(
+            key=lambda point: str(point.get("time") or "")
+            if isinstance(point, Mapping)
+            else "",
+        )
+        if revised_daily != daily_history:
+            state["daily_equity_history"] = revised_daily[-EQUITY_HISTORY_LIMIT:]
+            changed = True
+    return changed
+
+
+def _realized_display_trade_history(
+    recent_trades: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Read durable fills for display only, with a bounded SQLite fallback."""
+    error_type = ""
+    try:
+        from niuniu_db import DB_PATH
+        from trading.niuone_forward import load_niuone_forward_trades_from_db, merge_forward_trade_rows
+
+        archived, _ = load_niuone_forward_trades_from_db(DB_PATH)
+        rows, _ = merge_forward_trade_rows(archived, recent_trades)
+    except (ImportError, OSError, ValueError, sqlite3.Error) as exc:
+        rows = recent_trades
+        error_type = type(exc).__name__
+    annotated = annotate_realized_returns(rows)
+    if error_type:
+        for row in annotated:
+            if row.get("realized_return_status") == "incomplete_history":
+                row["realized_return_status"] = f"history_unavailable:{error_type}"
+    return annotated
+
+
+def build_strategy_performance(state: dict[str, Any]) -> dict[str, Any]:
+    """Use the same durable source and revision precedence as forward reports."""
+    try:
+        from niuniu_db import DB_PATH
+        from trading.niuone_forward import load_niuone_forward_trades_from_db, merge_forward_trade_rows
+
+        archived, diagnostics = load_niuone_forward_trades_from_db(DB_PATH)
+        rows, _ = merge_forward_trade_rows(archived, state.get("trade_log") or [])
+        source = {"kind": "durable_ledger_with_recent_state", **diagnostics}
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        rows = state.get("trade_log") or []
+        source = {"kind": "recent_state_only", "error_type": type(exc).__name__}
+    result = track_strategy_performance(state, trade_rows=rows)
+    result["source"] = source
+    result["history_complete"] = source["kind"] == "durable_ledger_with_recent_state"
+    if not result["history_complete"]:
+        result["summary"]["win_rate"] = None
+        for bucket in result["buy_strategy"].values():
+            bucket["win_rate"] = None
+    return result
+
+
 def load_state() -> dict[str, Any]:
     if not STATE_FILE.exists():
         state = default_state()
         save_state(state)
         return state
     try:
-        state = json.loads(STATE_FILE.read_text())
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except Exception:
         state = default_state()
     base = default_state()
@@ -750,6 +1302,9 @@ def load_state() -> dict[str, Any]:
     base.setdefault("pending_decisions", [])
     base.setdefault("equity_history", [])
     base.setdefault("daily_equity_history", [])
+    reconcile_current_day_cash_from_ledger(base)
+    reconcile_current_day_equity_history_from_ledger(base)
+    _reconcile_exit_feedback_policy_from_db(base)
     return base
 
 
@@ -850,6 +1405,24 @@ def _compact_account_state_json(state: Mapping[str, Any]) -> dict[str, Any]:
     return compacted
 
 
+def _write_state_file_atomically(payload: Mapping[str, Any]) -> None:
+    """Replace the canonical account JSON without exposing a partial file."""
+    tmp = STATE_FILE.with_name(
+        f"{STATE_FILE.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        tmp.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp.replace(STATE_FILE)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 _STATE_FILE_THREAD_LOCK = threading.RLock()
 _STATE_FILE_LOCK_DEPTH = threading.local()
 
@@ -917,6 +1490,8 @@ def reconcile_positions_with_trade_log(state: dict[str, Any]) -> list[str]:
     for trade in state.get("trade_log") or []:
         if not isinstance(trade, dict):
             continue
+        if not trade_counts_for_account(trade):
+            continue
         action = str(trade.get("action") or "").upper()
         code = normalize_code(str(trade.get("code") or ""))
         shares = trade_shares(trade.get("shares"))
@@ -966,6 +1541,8 @@ def reconcile_positions_with_trade_log(state: dict[str, Any]) -> list[str]:
 
 def _trade_cash_delta(trade: Mapping[str, Any]) -> float:
     """Return the signed cash movement recorded by one durable fill."""
+    if not trade_counts_for_account(trade):
+        return 0.0
     action = str(trade.get("action") or "").upper()
     try:
         shares = max(0, int(float(trade.get("shares") or 0)))
@@ -1003,8 +1580,10 @@ def _apply_trade_to_account_snapshot(
     positions: dict[str, Any],
     trade: Mapping[str, Any],
     templates: Mapping[str, Any],
-) -> None:
+) -> bool:
     """Replay one branch-only fill onto another branch's position snapshot."""
+    if not trade_counts_for_account(trade):
+        return False
     action = str(trade.get("action") or "").upper()
     code = normalize_code(str(trade.get("code") or ""))
     try:
@@ -1012,7 +1591,7 @@ def _apply_trade_to_account_snapshot(
     except (TypeError, ValueError):
         shares = 0
     if action not in {"BUY", "SELL"} or not code or shares <= 0:
-        return
+        return False
 
     template = templates.get(code)
     if not isinstance(template, Mapping):
@@ -1059,6 +1638,16 @@ def _apply_trade_to_account_snapshot(
             "avg_cost": round((old_qty * old_avg_cost + total_cost) / new_qty, 4),
         })
         position.pop("shares", None)
+        if old_qty <= 0:
+            opened_at = str(trade.get("time") or "")
+            position[POSITION_LIFECYCLE_ID_FIELD] = str(
+                trade.get(POSITION_LIFECYCLE_ID_FIELD)
+                or _new_position_lifecycle_id(code, opened_at)
+            )
+            position["position_opened_at"] = opened_at
+            position.pop(AUTO_EXIT_COMPLETED_KEYS_FIELD, None)
+            for field in AUTO_EXIT_MONOTONIC_BOOL_FIELDS:
+                position.pop(field, None)
         if not position.get("last_price"):
             position["last_price"] = _safe_float(trade.get("price"), 0.0)
         if old_qty <= 0:
@@ -1068,6 +1657,21 @@ def _apply_trade_to_account_snapshot(
                 position["entry_reason"] = trade.get("reason")
             if isinstance(trade.get("strategy_mark"), Mapping):
                 position["strategy_mark"] = copy.deepcopy(trade.get("strategy_mark"))
+            for key in (
+                "preset_strategy_snapshot",
+                "preset_strategy_interpretation",
+                "preset_strategy_prompt_protocol",
+                "preset_strategy_prompt_sha256",
+                "preset_strategy_interpretation_sha256",
+                "preset_strategy_candidate_pool_sha256",
+                "preset_strategy_candidate_pool_count",
+                "prompt_strategy_version_id",
+                "prompt_strategy_plan_sha256",
+                "prompt_strategy_entry_evaluation_id",
+                "prompt_strategy_entry_audit",
+            ):
+                if trade.get(key) not in (None, "", {}):
+                    position[key] = copy.deepcopy(trade.get(key))
         lots = position.get("buy_date_lots")
         lots = dict(lots) if isinstance(lots, Mapping) else {}
         trade_date = str(trade.get("time") or "")[:10]
@@ -1075,10 +1679,10 @@ def _apply_trade_to_account_snapshot(
             lots[trade_date] = int(lots.get(trade_date, 0) or 0) + shares
         position["buy_date_lots"] = lots
         positions[code] = position
-        return
+        return True
 
-    if existing is None:
-        return
+    if existing is None or shares > position_qty(existing):
+        return False
     remaining_qty = max(0, position_qty(existing) - shares)
     lots = existing.get("buy_date_lots")
     lots = dict(lots) if isinstance(lots, Mapping) else {}
@@ -1098,28 +1702,103 @@ def _apply_trade_to_account_snapshot(
         existing["qty"] = remaining_qty
         existing.pop("shares", None)
         existing["buy_date_lots"] = lots
+    return True
 
 
 def merge_divergent_trade_account_state(
     state: dict[str, Any],
     current: Mapping[str, Any],
     state_only_trades: list[dict[str, Any]],
-) -> None:
+) -> int:
     """Merge disjoint fills without dropping either writer's cash or positions."""
     positions = copy.deepcopy(current.get("positions") or {})
     templates = state.get("positions") or {}
     cash = _safe_float(current.get("cash"), _safe_float(state.get("cash"), 0.0))
+    rejected_trade_count = 0
     for trade in sorted(state_only_trades, key=lambda item: str(item.get("time") or "")):
-        cash += _trade_cash_delta(trade)
-        _apply_trade_to_account_snapshot(positions, trade, templates)
+        applied = _apply_trade_to_account_snapshot(positions, trade, templates)
+        if applied:
+            cash += _trade_cash_delta(trade)
+            continue
+        try:
+            rejected_sell_shares = max(
+                0,
+                int(float(trade.get("shares") or 0)),
+            )
+        except (TypeError, ValueError):
+            rejected_sell_shares = 0
+        if (
+            trade_counts_for_account(trade)
+            and str(trade.get("action") or "").upper() == "SELL"
+            and normalize_code(str(trade.get("code") or ""))
+            and rejected_sell_shares > 0
+        ):
+            trade.update({
+                "accounting_status": "rejected",
+                "accounting_rejected": True,
+                "accounting_rejection_reason": (
+                    "concurrent_sell_exceeds_available_position"
+                ),
+                "accounting_rejected_at": now_ts(),
+            })
+            rejected_trade_count += 1
     state["cash"] = round(cash, 2)
     state["positions"] = positions
+    return rejected_trade_count
+
+
+def _repair_pending_equity_after_accounting_rejection(
+    state: dict[str, Any],
+    point_time: str,
+) -> bool:
+    """Replace a stale branch point with the post-merge canonical account mark."""
+    if not point_time:
+        return False
+    cash = _safe_float(state.get("cash"), 0.0)
+    market_value = 0.0
+    for position in (state.get("positions") or {}).values():
+        if not isinstance(position, Mapping):
+            continue
+        quantity = position_qty(position)
+        price = _safe_float(
+            position.get("last_price") or position.get("avg_cost"),
+            0.0,
+        )
+        market_value += max(0, quantity) * max(0.0, price)
+    initial_cash = _safe_float(state.get("initial_cash"), INITIAL_CASH)
+    if initial_cash <= 0:
+        initial_cash = INITIAL_CASH
+    total_equity = cash + market_value
+    repaired = {
+        "time": point_time,
+        "equity": round(total_equity, 2),
+        "cash": round(cash, 2),
+        "market_value": round(market_value, 2),
+        "pnl_pct": round((total_equity / initial_cash - 1) * 100, 2),
+        "account_created_at": str(state.get("created_at") or ""),
+    }
+    changed = False
+    for key in ("equity_history", "daily_equity_history"):
+        history = state.get(key)
+        if not isinstance(history, list):
+            continue
+        for index, point in enumerate(history):
+            if not isinstance(point, Mapping):
+                continue
+            if str(point.get("time") or "") != point_time:
+                continue
+            history[index] = {**dict(point), **repaired}
+            changed = True
+    return changed
 
 
 def save_state(state: dict[str, Any]) -> None:
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     with state_file_write_lock():
+        reconcile_current_day_cash_from_ledger(state)
+        reconcile_current_day_equity_history_from_ledger(state)
         pending_equity_sync_time = str(state.pop(_PENDING_EQUITY_DB_SYNC_TIME, "") or "")
+        rejected_trade_count = 0
         state["updated_at"] = now_ts()
 
         # Merge append-only logs with the on-disk copy before replacing the file.
@@ -1129,20 +1808,27 @@ def save_state(state: dict[str, Any]) -> None:
         if STATE_FILE.exists():
             current = json.loads(STATE_FILE.read_text(encoding="utf-8"))
             current.pop(_PENDING_EQUITY_DB_SYNC_TIME, None)
+            reconcile_current_day_cash_from_ledger(current)
+            reconcile_current_day_equity_history_from_ledger(current)
 
             def merge_list(key: str, identity_fields: tuple[str, ...], prefer_state: bool = False) -> None:
                 merged = []
-                seen = set()
+                merged_by_identity: dict[tuple[str, ...], dict[str, Any]] = {}
                 first = state.get(key) if prefer_state else current.get(key)
                 second = current.get(key) if prefer_state else state.get(key)
                 for item in (first or []) + (second or []):
                     if not isinstance(item, dict):
                         continue
                     ident = tuple(json.dumps(item.get(f, ""), ensure_ascii=False, sort_keys=True) for f in identity_fields)
-                    if ident in seen:
+                    retained = merged_by_identity.get(ident)
+                    if retained is not None:
+                        if key == "trade_log" and not trade_counts_for_account(item):
+                            for field in ACCOUNTING_AUDIT_FIELDS:
+                                if field in item:
+                                    retained[field] = copy.deepcopy(item[field])
                         continue
-                    seen.add(ident)
                     merged.append(item)
+                    merged_by_identity[ident] = item
                 state[key] = merged
 
             trade_identity_fields = ("time", "action", "code", "shares", "price", "reason")
@@ -1172,7 +1858,7 @@ def save_state(state: dict[str, Any]) -> None:
                         for item in (state.get("trade_log") or [])
                         if isinstance(item, dict) and trade_id(item) not in current_trade_ids
                     ]
-                    merge_divergent_trade_account_state(
+                    rejected_trade_count += merge_divergent_trade_account_state(
                         state,
                         current,
                         state_only_trades,
@@ -1183,6 +1869,11 @@ def save_state(state: dict[str, Any]) -> None:
                     # cash/positions from disk; quote refresh can safely run again.
                     state["cash"] = current.get("cash", state.get("cash"))
                     state["positions"] = current.get("positions", state.get("positions", {}))
+            elif not state_has_unseen_trades:
+                # With an identical durable ledger there is no legitimate cash
+                # movement.  Keep the on-disk balance so a stale quote/history
+                # writer cannot roll back proceeds from an already-saved fill.
+                state["cash"] = current.get("cash", state.get("cash"))
 
             merge_list("decision_log", ("time", "b1_generated_at", "decision"))
             merge_list("trade_log", trade_identity_fields)
@@ -1193,11 +1884,18 @@ def save_state(state: dict[str, Any]) -> None:
             prefer_state_equity = not current_has_unseen_trades or state_has_unseen_trades
             merge_list("equity_history", ("time",), prefer_state=prefer_state_equity)
             merge_list("daily_equity_history", ("time",), prefer_state=prefer_state_equity)
+            reconcile_current_day_equity_history_from_ledger(state)
 
             # Position snapshots are mutable and can be stale even when the
             # append-only trade merge succeeded. Re-apply the retained ledger
             # after merging so a completed SELL cannot be resurrected.
             reconcile_positions_with_trade_log(state)
+            _merge_position_auto_exit_guards(state, current)
+            if rejected_trade_count:
+                _repair_pending_equity_after_accounting_rejection(
+                    state,
+                    pending_equity_sync_time,
+                )
 
             # Preserve the newest decision marker and its error as one logical
             # value. A stale quote refresh must not clear an error written by a
@@ -1224,12 +1922,13 @@ def save_state(state: dict[str, Any]) -> None:
             if current_market_time > state_market_time:
                 state["market_decision_context"] = current_market_ctx
 
-        unarchived_history = {
-            kind: list(state.get(kind) or [])
-            for kind in JSON_RECENT_HISTORY_LIMITS
-            if isinstance(state.get(kind), list)
-        }
-        history_archived = _archive_account_history_before_compaction(state)
+        # Commit the complete account state before writing any SQLite projection.
+        # If the replace fails (for example because a bind-mounted state file is
+        # owned by root), no trade, decision, or history row may become visible.
+        full_state = dict(state)
+        _write_state_file_atomically(full_state)
+
+        history_archived = _archive_account_history_before_compaction(full_state)
 
         prune_non_trading_day_equity_points(state)
         prune_future_intraday_equity_points(state)
@@ -1238,11 +1937,16 @@ def save_state(state: dict[str, Any]) -> None:
 
         if history_archived:
             persisted_state = _compact_account_state_json(state)
-        else:
-            # Existing JSON remains the recovery source until a complete archive
-            # transaction succeeds, including rows rejected by active-view cleanup.
-            persisted_state = dict(state)
-            persisted_state.update(unarchived_history)
+            try:
+                _write_state_file_atomically(persisted_state)
+            except OSError as exc:
+                # The full JSON above is already the committed recovery source.
+                # Compaction is optional and can be retried by a later save.
+                print(
+                    "[WARN] 账户状态已保存，但 JSON 压缩失败，保留完整历史: "
+                    f"{type(exc).__name__}",
+                    flush=True,
+                )
 
         equity_point_to_sync = next(
             (
@@ -1253,12 +1957,10 @@ def save_state(state: dict[str, Any]) -> None:
             ),
             None,
         )
-        tmp = STATE_FILE.with_name(f"{STATE_FILE.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-        tmp.write_text(
-            json.dumps(persisted_state, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        tmp.replace(STATE_FILE)
+        if rejected_trade_count:
+            # A stale writer may already have replaced today's mutable SQLite
+            # position snapshot before its oversell was rejected during merge.
+            _sync_positions_to_db(state)
 
         # Synchronize SQLite only after the canonical same-minute point is chosen.
         # Keeping this under the state-file lock preserves JSON/DB writer ordering.
@@ -1409,7 +2111,8 @@ def normalize_quote_price(price: float | None, *fallbacks: float | None) -> floa
 def build_quote(code: str, name: str, price: float, prev_close: float | None, open_price: float | None,
                 high: float | None, low: float | None, turnover_yuan: float | None, source: str,
                 quote_time: str | None = None, volume_lots: float | None = None,
-                volume_ratio: float | None = None) -> dict[str, Any]:
+                volume_ratio: float | None = None,
+                turnover: float | None = None) -> dict[str, Any]:
     change = round(price - prev_close, 2) if prev_close else None
     change_pct = round((change / prev_close) * 100, 2) if change is not None and prev_close else None
     return {
@@ -1423,6 +2126,7 @@ def build_quote(code: str, name: str, price: float, prev_close: float | None, op
         "change": change,
         "change_pct": change_pct,
         "turnover_yuan": turnover_yuan,
+        "turnover": turnover,
         "volume_lots": volume_lots,
         "volume_ratio": volume_ratio,
         "quote_time": quote_time or now_ts(),
@@ -1447,6 +2151,15 @@ def parse_tencent_quote_line(line: str) -> dict[str, Any] | None:
     price = normalize_quote_price(price, prev_close, open_price)
     if not price:
         return None
+    quote_time = ""
+    raw_quote_time = str(parts[30] if len(parts) > 30 else "").strip()
+    if len(raw_quote_time) >= 14 and raw_quote_time[:14].isdigit():
+        try:
+            quote_time = datetime.strptime(
+                raw_quote_time[:14], "%Y%m%d%H%M%S"
+            ).strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            quote_time = ""
     return build_quote(
         code=symbol,
         name=parts[1] if len(parts) > 1 else "",
@@ -1457,7 +2170,9 @@ def parse_tencent_quote_line(line: str) -> dict[str, Any] | None:
         low=low,
         turnover_yuan=turnover_wan * 10000 if turnover_wan is not None else None,
         source="Tencent qt realtime quote",
+        quote_time=quote_time or None,
         volume_lots=safe_quote_float(parts[6]),
+        turnover=safe_quote_float(parts[38]) if len(parts) > 38 else None,
     )
 
 
@@ -1512,6 +2227,7 @@ def quote_one_as_realtime(code: str) -> dict[str, Any] | None:
         source=q.get("source") or "cn_stock_tools quote fallback",
         volume_lots=q.get("volume_lots") if isinstance(q.get("volume_lots"), (int, float)) else None,
         volume_ratio=q.get("volume_ratio") if isinstance(q.get("volume_ratio"), (int, float)) else None,
+        turnover=q.get("turnover") if isinstance(q.get("turnover"), (int, float)) else None,
     )
 
 
@@ -1546,6 +2262,7 @@ def parse_eastmoney_stock(data: dict[str, Any]) -> dict[str, Any] | None:
         source="Eastmoney push2 stock/get realtime quote",
         volume_lots=data.get("f47") if isinstance(data.get("f47"), (int, float)) else None,
         volume_ratio=data.get("f50") if isinstance(data.get("f50"), (int, float)) else None,
+        turnover=data.get("f168") if isinstance(data.get("f168"), (int, float)) else None,
     )
 
 
@@ -1588,7 +2305,7 @@ def fetch_eastmoney_quotes(codes: list[str]) -> tuple[dict[str, dict[str, Any]],
                 "--data-urlencode", f"ut={EASTMONEY_UT}",
                 "--data-urlencode", "fltt=2",
                 "--data-urlencode", "invt=2",
-                "--data-urlencode", "fields=f43,f57,f58,f60,f169,f170,f46,f44,f45,f47,f48,f50",
+                "--data-urlencode", "fields=f43,f57,f58,f60,f169,f170,f46,f44,f45,f47,f48,f50,f168",
             ], capture_output=True, text=True, timeout=10)
             if proc.returncode != 0 or not proc.stdout.strip():
                 errors.append(f"{code}:curl{proc.returncode}")
@@ -1690,6 +2407,7 @@ def refresh_realtime_prices(state: dict[str, Any]) -> dict[str, Any]:
         state["last_quote_refresh"] = meta
         return meta
     quotes, quote_meta = fetch_realtime_quotes(codes)
+    applied_quote_times: list[str] = []
     meta["channel_counts"] = quote_meta.get("channel_counts", meta["channel_counts"])
     errors = quote_meta.get("errors") or []
     for code in codes:
@@ -1715,7 +2433,11 @@ def refresh_realtime_prices(state: dict[str, Any]) -> dict[str, Any]:
             pos["day_low"] = quote.get("low")
         if quote.get("name"):
             pos["name"] = pos.get("name") or quote["name"]
+        if quote.get("quote_time"):
+            applied_quote_times.append(str(quote["quote_time"]))
         meta["updated"] += 1
+    if applied_quote_times:
+        meta["quote_time"] = max(applied_quote_times)
     if errors:
         meta["error"] = " | ".join(errors)
     state["last_quote_refresh"] = meta
@@ -1756,10 +2478,57 @@ def apply_realtime_price_snapshot(
                 position[field] = refreshed[field]
         if not position.get("name") and refreshed.get("name"):
             position["name"] = refreshed["name"]
-
     refresh_meta = refreshed_state.get("last_quote_refresh")
     if isinstance(refresh_meta, dict):
         state["last_quote_refresh"] = dict(refresh_meta)
+
+
+def refresh_position_marks_without_trading() -> bool:
+    """Refresh account quote fields without creating trades or equity history."""
+
+    refreshed_state = load_state()
+    has_open_positions = any(
+        isinstance(position, dict) and position_qty(position) > 0
+        for position in (refreshed_state.get("positions") or {}).values()
+    )
+    has_today_sells = bool(build_today_sold_stocks(
+        refreshed_state,
+        quote_map={},
+    ))
+    if not has_open_positions and not has_today_sells:
+        return False
+
+    if has_open_positions:
+        try:
+            refresh_realtime_prices(refreshed_state)
+        except Exception as exc:
+            refreshed_state["last_quote_refresh"] = {
+                "time": now_ts(),
+                "updated": 0,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+    if has_today_sells:
+        refresh_today_sold_stocks(refreshed_state)
+
+    with state_file_write_lock():
+        state = load_state()
+        if has_open_positions:
+            apply_realtime_price_snapshot(state, refreshed_state)
+            state["last_quote_refresh"] = dict(
+                refreshed_state.get("last_quote_refresh") or {}
+            )
+        if has_today_sells:
+            apply_today_sold_quote_snapshot(state, refreshed_state)
+        save_state(state)
+    return True
+
+
+def refresh_position_marks_on_startup() -> bool:
+    """Recover stale marks after downtime; the live heartbeat owns session refreshes."""
+
+    if is_a_share_equity_heartbeat_clock(datetime.now()):
+        return False
+    return refresh_position_marks_without_trading()
 
 
 def refresh_position_intraday(state: dict[str, Any]) -> dict[str, Any]:
@@ -1808,11 +2577,20 @@ def _cached_today_sold_quotes(state: dict[str, Any], today: str) -> dict[str, di
     return quotes
 
 
+def enrich_portfolio_with_realized_history(state: dict[str, Any]) -> dict[str, Any]:
+    """Use archived fills only in the user-facing read path."""
+    return enrich_portfolio({
+        **state,
+        "trade_log": _realized_display_trade_history(state.get("trade_log") or []),
+    })
+
+
 def enrich_portfolio(state: dict[str, Any]) -> dict[str, Any]:
     positions = state.get("positions") or {}
     total_mv = 0.0
     rows = []
     today = today_key()
+    today_buy_costs = _today_buy_costs_by_code(state, today=today)
     for code, pos in positions.items():
         # Use last_price from portfolio state first to avoid network hangs
         price = pos.get("last_price") or pos.get("avg_cost") or 0
@@ -1826,7 +2604,20 @@ def enrich_portfolio(state: dict[str, Any]) -> dict[str, Any]:
         mv = price_float * qty
         cost = float(pos.get("avg_cost") or 0) * qty
         pnl = mv - cost
-        today_pnl, today_pnl_pct = position_today_pnl(pos, price_float, qty, prev_close_float)
+        today_pnl, today_pnl_pct = position_today_pnl(
+            pos,
+            price_float,
+            qty,
+            prev_close_float,
+            today=today,
+            today_cost=_position_today_buy_cost(
+                code,
+                pos,
+                qty,
+                today_buy_costs,
+                today=today,
+            ),
+        )
         change_pct = pos.get("change_pct")
         if change_pct is None and prev_close_float > 0:
             change_pct = (price_float / prev_close_float - 1) * 100
@@ -1875,6 +2666,13 @@ def enrich_portfolio(state: dict[str, Any]) -> dict[str, Any]:
             "entry_theme": pos.get("entry_theme") or "",
             "active_theme": pos.get("active_theme") or "",
             "entry_reason": pos.get("entry_reason") or "",
+            "prompt_strategy_version_id": pos.get("prompt_strategy_version_id") or "",
+            "prompt_strategy_plan_sha256": pos.get("prompt_strategy_plan_sha256") or "",
+            "prompt_strategy_exit_status": pos.get("prompt_strategy_exit_status") or "",
+            "prompt_strategy_exit_checked_at": pos.get("prompt_strategy_exit_checked_at") or "",
+            "prompt_strategy_pending_exit": bool(pos.get("prompt_strategy_pending_exit")),
+            "prompt_strategy_pending_exit_ready": bool(pos.get("prompt_strategy_pending_exit_ready")),
+            "prompt_strategy_pending_exit_reason": pos.get("prompt_strategy_pending_exit_reason") or "",
             "strategy_mark": strategy_mark,
             "strategy_mark_id": strategy_mark.get("strategy_id") or "",
             "strategy_mark_label": strategy_mark.get("label") or "",
@@ -1970,13 +2768,22 @@ def enrich_portfolio(state: dict[str, Any]) -> dict[str, Any]:
         if parse_ts(time_text) is not None and math.isfinite(equity):
             source_equity_times.append(time_text)
     source_last_equity_time = max(source_equity_times, default="")
-    today_sold_stocks = build_today_sold_stocks(state, today=today)
+    display_history = annotate_realized_returns(state.get("trade_log") or [])
+    display_by_key = {_trade_identity(row): row for row in display_history}
+    today_sold_stocks = build_today_sold_stocks(
+        state, today=today, trade_rows=display_history,
+    )
     today_sold_quote_refresh = state.get("today_sold_quote_refresh") or {}
     if (
         not isinstance(today_sold_quote_refresh, dict)
         or not str(today_sold_quote_refresh.get("quote_time") or "").startswith(today)
     ):
         today_sold_quote_refresh = {}
+    daily_pnl, daily_pnl_pct = account_today_pnl(
+        state,
+        current_equity=total_equity,
+        today=today,
+    )
     return {
         "generated_at": now_ts(),
         "source_updated_at": str(state.get("updated_at") or ""),
@@ -1987,10 +2794,16 @@ def enrich_portfolio(state: dict[str, Any]) -> dict[str, Any]:
         "total_equity": round(total_equity, 2),
         "total_pnl": round(total_equity - float(state.get("initial_cash") or INITIAL_CASH), 2),
         "total_pnl_pct": round((total_equity / float(state.get("initial_cash") or INITIAL_CASH) - 1) * 100, 2),
+        "daily_pnl": round(daily_pnl, 2) if daily_pnl is not None else None,
+        "daily_pnl_pct": round(daily_pnl_pct, 3) if daily_pnl_pct is not None else None,
         "sector_tide_open_risk_pct": round(sector_tide_open_risk_pct, 4),
         "niuone_open_risk_pct": round(niuone_open_risk_pct, 4),
         "positions": rows,
-        "trade_log": list(reversed(state.get("trade_log", [])[-TRADE_LOG_LIMIT:])),
+        "trade_log": list(reversed([
+            display_by_key.get(_trade_identity(trade), trade)
+            for trade in state.get("trade_log", [])
+            if isinstance(trade, dict) and trade_counts_for_account(trade)
+        ][-TRADE_LOG_LIMIT:])),
         "decision_log": list(reversed(state.get("decision_log", [])[-50:])),
         "pending_decisions": [
             item for item in state.get("pending_decisions", [])
@@ -1998,6 +2811,10 @@ def enrich_portfolio(state: dict[str, Any]) -> dict[str, Any]:
         ],
         "today_sold_stocks": today_sold_stocks,
         "today_sold_quote_refresh": today_sold_quote_refresh,
+        "post_exit_observation_summary": (
+            state.get("post_exit_observation_summary") or {}
+        ),
+        "exit_feedback_policy": current_exit_feedback_policy(state),
         "equity_history": state.get("equity_history", [])[-EQUITY_HISTORY_LIMIT:],
         "last_b1_generated_at": state.get("last_b1_generated_at") or "",
         "last_decision_at": state.get("last_decision_at") or "",
@@ -2022,12 +2839,83 @@ def available_to_sell(pos: dict[str, Any], today: str | None = None) -> int:
     return min(qty, total)
 
 
-def position_today_pnl(pos: dict[str, Any], price: float, qty: int, prev_close: float) -> tuple[float | None, float | None]:
+def _today_buy_costs_by_code(
+    state: Mapping[str, Any],
+    *,
+    today: str,
+) -> dict[str, dict[str, Any]]:
+    """Collect exact same-day buy costs from the durable trade ledger."""
+    totals: dict[str, dict[str, Any]] = {}
+    for trade in state.get("trade_log") or []:
+        if not isinstance(trade, Mapping) or not trade_counts_for_account(trade):
+            continue
+        if (
+            str(trade.get("action") or "").upper() != "BUY"
+            or str(trade.get("time") or "")[:10] != today
+        ):
+            continue
+        code = normalize_code(str(trade.get("code") or ""))
+        if not code:
+            continue
+        row = totals.setdefault(code, {"shares": 0, "cost": 0.0, "complete": True})
+        try:
+            shares = int(float(trade.get("shares") or 0))
+        except (TypeError, ValueError):
+            shares = 0
+        raw_total_cost = trade.get("total_cost")
+        if raw_total_cost is not None:
+            total_cost = _safe_float(raw_total_cost, float("nan"))
+        else:
+            amount = _safe_float(trade.get("amount"), float("nan"))
+            fee = _safe_float(trade.get("fee"), float("nan"))
+            total_cost = amount + fee
+        if shares <= 0 or not math.isfinite(total_cost) or total_cost <= 0:
+            row["complete"] = False
+            continue
+        row["shares"] = int(row["shares"]) + shares
+        row["cost"] = float(row["cost"]) + total_cost
+    return totals
+
+
+def _position_today_buy_cost(
+    code: str,
+    pos: Mapping[str, Any],
+    qty: int,
+    buy_costs: Mapping[str, Mapping[str, Any]],
+    *,
+    today: str,
+) -> float | None:
+    lots = pos.get("buy_date_lots") or {}
+    try:
+        today_qty = min(qty, max(0, int(lots.get(today, 0) or 0)))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if today_qty <= 0:
+        return None
+    row = buy_costs.get(normalize_code(code))
+    if not isinstance(row, Mapping) or row.get("complete") is not True:
+        return None
+    if int(row.get("shares") or 0) != today_qty:
+        return None
+    cost = _safe_float(row.get("cost"), float("nan"))
+    return cost if math.isfinite(cost) and cost > 0 else None
+
+
+def position_today_pnl(
+    pos: dict[str, Any],
+    price: float,
+    qty: int,
+    prev_close: float,
+    *,
+    today: str | None = None,
+    today_cost: float | None = None,
+) -> tuple[float | None, float | None]:
     if qty <= 0:
         return None, None
     avg_cost = float(pos.get("avg_cost") or 0)
     lots = pos.get("buy_date_lots") or {}
-    today_qty = min(qty, int(lots.get(today_key(), 0) or 0))
+    today = today or today_key()
+    today_qty = min(qty, int(lots.get(today, 0) or 0))
     historical_qty = max(0, qty - today_qty)
     pnl = 0.0
     base = 0.0
@@ -2039,14 +2927,96 @@ def position_today_pnl(pos: dict[str, Any], price: float, qty: int, prev_close: 
         base += prev_close * historical_qty
 
     if today_qty > 0:
-        if avg_cost <= 0:
+        exact_today_cost = _safe_float(today_cost, float("nan"))
+        if not math.isfinite(exact_today_cost) or exact_today_cost <= 0:
+            # The aggregate average cost is exact only when the whole position
+            # was opened today.  For mixed lots it would blend historical cost
+            # into today's return, so leave the value unavailable instead.
+            if historical_qty > 0 or avg_cost <= 0:
+                return None, None
+            exact_today_cost = avg_cost * today_qty
+        if exact_today_cost <= 0:
             return None, None
-        pnl += (price - avg_cost) * today_qty
-        base += avg_cost * today_qty
+        pnl += price * today_qty - exact_today_cost
+        base += exact_today_cost
 
     if base <= 0:
         return None, None
     return pnl, pnl / base * 100
+
+
+def account_today_pnl(
+    state: Mapping[str, Any],
+    *,
+    current_equity: float | None = None,
+    today: str | None = None,
+) -> tuple[float | None, float | None]:
+    """Return today's account P&L from positions and same-day fills."""
+    today = today or today_key()
+    positions = state.get("positions") or {}
+    if current_equity is None:
+        current_equity = _safe_float(state.get("cash"), 0.0) + portfolio_market_value(positions)
+    buy_costs = _today_buy_costs_by_code(state, today=today)
+    daily_pnl = 0.0
+    complete = True
+
+    for trade in state.get("trade_log") or []:
+        if not isinstance(trade, Mapping) or not trade_counts_for_account(trade):
+            continue
+        if (
+            str(trade.get("action") or "").upper() != "SELL"
+            or str(trade.get("time") or "")[:10] != today
+        ):
+            continue
+        trade_day_pnl = _safe_float(trade.get("day_pnl"), float("nan"))
+        if not math.isfinite(trade_day_pnl):
+            complete = False
+        else:
+            daily_pnl += trade_day_pnl
+
+    for code, pos in positions.items():
+        if not isinstance(pos, Mapping):
+            continue
+        qty = position_qty(pos)
+        if qty <= 0:
+            continue
+        price = _safe_float(
+            pos.get("last_price") or pos.get("close") or pos.get("avg_cost"),
+            0.0,
+        )
+        prev_close = _safe_float(pos.get("prev_close"), 0.0)
+        position_pnl, _position_pnl_pct = position_today_pnl(
+            dict(pos),
+            price,
+            qty,
+            prev_close,
+            today=today,
+            today_cost=_position_today_buy_cost(
+                str(code),
+                pos,
+                qty,
+                buy_costs,
+                today=today,
+            ),
+        )
+        if position_pnl is None or not math.isfinite(position_pnl):
+            complete = False
+        else:
+            daily_pnl += position_pnl
+
+    if complete:
+        opening_equity = float(current_equity) - daily_pnl
+        pnl_pct = daily_pnl / opening_equity * 100 if opening_equity > 0 else 0.0
+        return daily_pnl, pnl_pct
+
+    replay = _current_day_cash_replay(state, today=today)
+    if replay is None:
+        return None, None
+    expected_cash, opening_equity = replay
+    expected_equity = expected_cash + portfolio_market_value(positions)
+    daily_pnl = expected_equity - opening_equity
+    pnl_pct = daily_pnl / opening_equity * 100 if opening_equity > 0 else 0.0
+    return daily_pnl, pnl_pct
 
 
 def calc_trade_fees(amount: float, side: str) -> dict[str, float]:
@@ -2437,7 +3407,9 @@ def rebuild_intraday_equity_curve(
     today_trades = [
         trade
         for trade in state.get("trade_log", [])
-        if isinstance(trade, dict) and str(trade.get("time", "")).startswith(today)
+        if isinstance(trade, dict)
+        and trade_counts_for_account(trade)
+        and str(trade.get("time", "")).startswith(today)
     ]
     latest_trade_dt = None
     if today_trades:
@@ -2555,12 +3527,18 @@ def build_today_sold_stocks(
     *,
     quote_map: dict[str, dict[str, Any]] | None = None,
     quote_meta: dict[str, Any] | None = None,
+    trade_rows: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Build today's sold cards from the trade ledger without external I/O."""
     today = today or today_key()
     sold: dict[str, dict[str, Any]] = {}
-    for trade in state.get("trade_log", []) or []:
+    display_rows = trade_rows if trade_rows is not None else annotate_realized_returns(
+        state.get("trade_log") or [],
+    )
+    for trade in display_rows:
         if not isinstance(trade, dict):
+            continue
+        if not trade_counts_for_account(trade):
             continue
         if str(trade.get("action") or "").upper() != "SELL":
             continue
@@ -2583,6 +3561,7 @@ def build_today_sold_stocks(
             "buy_strategies": [],
             "first_sell_time": trade.get("time") or "",
             "last_sell_time": trade.get("time") or "",
+            "realized_cycles": {},
         })
         amount = float(trade.get("amount") or (float(trade.get("price") or 0) * shares))
         fee = float(trade.get("fee") or 0)
@@ -2593,6 +3572,8 @@ def build_today_sold_stocks(
         row["net_proceeds"] += net_proceeds
         row["realized_pnl"] += pnl
         row["fee"] += fee
+        cycle_key = trade.get("realized_cycle_key") or str(trade.get("time") or "")
+        row["realized_cycles"][cycle_key] = trade
         row["last_sell_time"] = max(str(row.get("last_sell_time") or ""), str(trade.get("time") or ""))
         reason = str(trade.get("reason") or "").strip()
         if reason and reason not in row["reasons"]:
@@ -2614,12 +3595,14 @@ def build_today_sold_stocks(
     for code, row in sold.items():
         shares = int(row["shares"] or 0)
         avg_sell_price = (float(row["sell_amount"]) / shares) if shares > 0 else 0.0
-        cost_basis = float(row["net_proceeds"]) - float(row["realized_pnl"])
         quote = resolved_quote_map.get(code) or {}
         current_price = quote.get("price") if isinstance(quote.get("price"), (int, float)) else None
         change_after_sell = ((float(current_price) / avg_sell_price - 1) * 100) if current_price and avg_sell_price > 0 else None
         after_sell_pnl = ((float(current_price) - avg_sell_price) * shares) if current_price and shares > 0 else None
-        realized_pnl = float(row["realized_pnl"])
+        cycles = list(row["realized_cycles"].values())
+        verified = all(item.get("realized_return_status") == "verified" for item in cycles)
+        realized_pnl = sum(float(item["cumulative_realized_pnl"]) for item in cycles) if verified else None
+        realized_buy_cost = sum(float(item["realized_buy_cost"]) for item in cycles) if verified else 0.0
         rows.append({
             "code": code,
             "name": row.get("name") or quote.get("name") or "",
@@ -2627,8 +3610,9 @@ def build_today_sold_stocks(
             "avg_sell_price": round(avg_sell_price, 3),
             "current_price": round(float(current_price), 3) if current_price else None,
             "current_change_pct": quote.get("change_pct"),
-            "realized_pnl": round(realized_pnl, 2),
-            "realized_pnl_pct": round((realized_pnl / cost_basis * 100), 2) if cost_basis > 0 else 0,
+            "realized_pnl": round(realized_pnl, 2) if realized_pnl is not None else None,
+            "realized_pnl_pct": round(realized_pnl / realized_buy_cost * 100, 2) if realized_buy_cost > 0 else None,
+            "realized_return_status": "verified" if verified else "incomplete_history",
             "sell_amount": round(float(row["sell_amount"]), 2),
             "net_proceeds": round(float(row["net_proceeds"]), 2),
             "fee": round(float(row["fee"]), 2),
@@ -2660,9 +3644,19 @@ def refresh_today_sold_stocks(state: dict[str, Any], today: str | None = None) -
     quote_map = _cached_today_sold_quotes(state, today)
     quote_meta: dict[str, Any] = {"quote_time": now_ts(), "updated": 0}
     try:
-        refreshed_quotes, quote_meta = fetch_realtime_quotes(
+        refreshed_quotes, fetched_meta = fetch_realtime_quotes(
             sorted(row["code"] for row in rows_without_quotes)
         )
+        quote_times = [
+            str(quote.get("quote_time") or "")
+            for quote in refreshed_quotes.values()
+            if isinstance(quote, dict) and quote.get("quote_time")
+        ]
+        quote_meta = {
+            **(fetched_meta if isinstance(fetched_meta, dict) else {}),
+            "quote_time": max(quote_times, default=now_ts()),
+            "updated": len(refreshed_quotes),
+        }
         quote_map.update(refreshed_quotes)
     except Exception as exc:
         quote_meta = {"quote_time": now_ts(), "updated": 0, "error": f"{type(exc).__name__}: {exc}"}
@@ -2676,6 +3670,25 @@ def refresh_today_sold_stocks(state: dict[str, Any], today: str | None = None) -
     state["today_sold_stocks"] = rows
     state["today_sold_quote_refresh"] = quote_meta
     return rows
+
+
+def apply_today_sold_quote_snapshot(
+    state: dict[str, Any],
+    refreshed_state: dict[str, Any],
+    today: str | None = None,
+) -> None:
+    """Merge fetched sold-stock quotes without restoring an older trade ledger."""
+    today = today or today_key()
+    quote_map = _cached_today_sold_quotes(refreshed_state, today)
+    quote_meta = refreshed_state.get("today_sold_quote_refresh")
+    resolved_meta = dict(quote_meta) if isinstance(quote_meta, dict) else {}
+    state["today_sold_stocks"] = build_today_sold_stocks(
+        state,
+        today=today,
+        quote_map=quote_map,
+        quote_meta=resolved_meta,
+    )
+    state["today_sold_quote_refresh"] = resolved_meta
 
 
 # ====== 自动止盈止损规则 ======
@@ -2717,7 +3730,13 @@ CONSENSUS_POSITION_BOOST = 1.5  # 策略共识≥3时仓位放大系数
 SELF_OPTIMIZATION_COOLDOWN = 3600  # 自优化最小间隔（秒）
 HIGH_VOL_REDUCTION = 0.7  # 高波动率仓位缩小系数
 LOW_VOL_BOOST = 1.3       # 低波动率仓位放大系数
-MAX_OPEN_POSITIONS = env_int("DASHBOARD_MAX_OPEN_POSITIONS", 6)
+MAX_OPEN_POSITIONS = env_int(
+    "DASHBOARD_MAX_OPEN_POSITIONS",
+    NIUONE_DEFAULT_MAX_OPEN_POSITIONS,
+)
+# Compatibility name retained in this module for historical imports and
+# monkeypatches.  It now reflects the configured account-wide count ceiling.
+NIUONE_MAX_OPEN_POSITIONS = MAX_OPEN_POSITIONS
 MAX_NEW_BUYS_PER_DECISION = env_int("DASHBOARD_MAX_NEW_BUYS_PER_DECISION", 2)
 MAX_SINGLE_POSITION_PCT = env_float("DASHBOARD_MAX_SINGLE_POSITION_PCT", 10.0)
 MAX_TOTAL_POSITION_PCT = env_float("DASHBOARD_MAX_TOTAL_POSITION_PCT", 80.0)
@@ -2739,6 +3758,7 @@ DECISION_INTELLIGENCE_ENABLED = env_bool("DASHBOARD_DECISION_INTELLIGENCE_ENABLE
 DECISION_INTELLIGENCE_TTL_SECONDS = max(15, env_int("DASHBOARD_DECISION_INTELLIGENCE_TTL_SECONDS", 75))
 DECISION_INTELLIGENCE_MAX_ITEMS = max(1, min(8, env_int("DASHBOARD_DECISION_INTELLIGENCE_MAX_ITEMS", 5)))
 DECISION_INTELLIGENCE_CACHE: dict[str, Any] = {"ts": 0.0, "data": None}
+NEWSNOW_DECISION_ENABLED = env_bool("NEWSNOW_DECISION_ENABLED", True)
 
 
 def market_session_phase(now: datetime | None = None) -> str:
@@ -3105,6 +4125,8 @@ def _market_context_base(now: datetime | None = None) -> dict[str, Any]:
         "phase": phase,
         "max_open_positions": MAX_OPEN_POSITIONS,
         "max_new_buys_per_decision": MAX_NEW_BUYS_PER_DECISION,
+        "niuone_opening_count_independent": True,
+        "niuone_max_open_positions": NIUONE_MAX_OPEN_POSITIONS,
         "max_total_position_pct": MAX_TOTAL_POSITION_PCT,
         "min_cash_reserve_pct": MIN_CASH_RESERVE_PCT,
         "buy_budget_multiplier": 1.0,
@@ -3573,6 +4595,9 @@ def compact_market_strategy_context(ctx: dict[str, Any]) -> dict[str, Any]:
         "buy_budget_multiplier", "allow_new_buys", "source_title", "source_time",
         "session_note", "guidance_lines", "overnight_us", "context_kind", "context_as_of",
         "refresh_mode", "market_snapshot", "source_kind", "trigger", "summary", "model_used",
+        "niuone_opening_count_independent", "niuone_max_open_positions",
+        "daily_loss_budget_exceeded", "daily_loss_budget_pnl_pct",
+        "daily_loss_budget_limit_pct",
     ):
         value = ctx.get(key)
         if key == "overnight_us" and not (isinstance(value, dict) and value.get("available")):
@@ -3614,7 +4639,24 @@ def select_current_market_strategy_context(
     return selected
 
 
-def format_market_strategy_context_for_prompt(ctx: dict[str, Any]) -> str:
+def _niuone_irrelevant_market_count_guidance(line: Any) -> bool:
+    """Return whether a shared market note is a count/pause rule NiuOne ignores."""
+    text = re.sub(r"\s+", "", str(line or ""))
+    quantity_rule = any(marker in text for marker in ("单轮", "单日", "午盘前", "上午最多", "下午最多"))
+    if not quantity_rule and any(marker in text for marker in ("最多", "至多", "不超过")):
+        quantity_rule = "只" in text or "笔" in text
+    pause_rule = any(
+        marker in text
+        for marker in ("暂停新开仓", "暂停买入", "不新开仓", "只卖不买")
+    )
+    return quantity_rule or pause_rule
+
+
+def format_market_strategy_context_for_prompt(
+    ctx: dict[str, Any],
+    *,
+    niuone_only: bool = False,
+) -> str:
     if not ctx.get("enabled"):
         return "【今日盘面监控指引】已关闭。"
     tone = str(ctx.get("tone") or "neutral")
@@ -3630,18 +4672,53 @@ def format_market_strategy_context_for_prompt(ctx: dict[str, Any]) -> str:
         position_bias = "轻仓观察，除非极高确定性否则不加仓"
     else:
         position_bias = "按候选确定性和账户状态自定仓位"
-    lines = [
-        "【今日盘面监控指引】",
-        (
-            f"风险级别：{ctx.get('tone_label', '中性')}；阶段：{ctx.get('phase', '-')}; "
-            f"节奏：最多{ctx.get('max_open_positions')}只、单轮新仓≤{ctx.get('max_new_buys_per_decision')}笔；"
-            f"仓位倾向：{position_bias}。"
-        ),
-    ]
-    if not ctx.get("allow_new_buys", True):
-        lines.append("执行层当前按盘面指引暂停买入，只允许卖出/持有。")
-    if ctx.get("session_note"):
-        lines.append(str(ctx.get("session_note")))
+    if niuone_only:
+        if not ctx.get("allow_new_buys", True):
+            position_bias = "盘面暂停字段不作用于牛牛开仓数量，仍按候选复合硬停止和风险预算复核"
+        lines = [
+            "【今日盘面监控指引】",
+            (
+                f"风险级别：{ctx.get('tone_label', '中性')}；阶段：{ctx.get('phase', '-')}; "
+                f"牛牛节奏：最多{ctx.get('niuone_max_open_positions', NIUONE_MAX_OPEN_POSITIONS)}只；"
+                f"仓位倾向：{position_bias}。"
+            ),
+            (
+                "本轮新开仓只执行牛牛规则：盘面仍参与单笔/组合/主题风险预算、总仓、现金及候选"
+                "自身复合硬停止判断，但不输出也不使用非牛牛持仓数、午盘保留名额、盘面单轮新仓数"
+                "或盘面暂停字段。"
+            ),
+        ]
+    else:
+        lines = [
+            "【今日盘面监控指引】",
+            (
+                f"风险级别：{ctx.get('tone_label', '中性')}；阶段：{ctx.get('phase', '-')}; "
+                f"非牛牛节奏：最多{ctx.get('max_open_positions')}只、单轮新仓≤{ctx.get('max_new_buys_per_decision')}笔；"
+                f"仓位倾向：{position_bias}。"
+            ),
+            (
+                f"牛牛开仓数量不受本次盘面评价影响，只受最多"
+                f"{ctx.get('niuone_max_open_positions', NIUONE_MAX_OPEN_POSITIONS)}只持仓约束；"
+                "盘面仍参与单笔/组合/主题风险预算、总仓、现金及候选自身复合硬停止判断。"
+            ),
+            (
+                "判断牛牛BUY时，禁止把当前持仓数与上述非牛牛上限比较，也禁止把午盘保留名额、"
+                "盘面单轮新仓数或盘面暂停字段作为HOLD理由；只有牛牛持仓达到"
+                f"{ctx.get('niuone_max_open_positions', NIUONE_MAX_OPEN_POSITIONS)}只才按满仓处理。"
+            ),
+        ]
+    if ctx.get("daily_loss_budget_exceeded"):
+        lines.append("日内亏损预算已经触发，所有策略本轮均暂停BUY；该独立风控不属于盘面评价限数。")
+    elif not ctx.get("allow_new_buys", True):
+        lines.append(
+            "执行层当前按盘面指引暂停非牛牛策略买入；牛牛不按该字段限数，"
+            "仍由候选自身复合硬停止和其他风险规则复核。"
+        )
+    if ctx.get("session_note") and not niuone_only:
+        lines.append(
+            "非牛牛策略专属午盘节奏（不得用于牛牛开仓数量判断）："
+            + str(ctx.get("session_note"))
+        )
     if ctx.get("source_title") or ctx.get("source_time"):
         lines.append(f"最新来源：{ctx.get('source_title') or '盘面监控'} {ctx.get('source_time') or ''}".strip())
     overnight_us = ctx.get("overnight_us") if isinstance(ctx.get("overnight_us"), dict) else {}
@@ -3667,11 +4744,26 @@ def format_market_strategy_context_for_prompt(ctx: dict[str, Any]) -> str:
         ]
         lines.extend(f"- {line}" for line in us_guidance[:6])
     guidance = ctx.get("guidance_lines") or []
+    if niuone_only:
+        guidance = [
+            line
+            for line in guidance
+            if not _niuone_irrelevant_market_count_guidance(line)
+        ]
     if guidance:
         lines.extend(f"- {line}" for line in guidance[:8])
     else:
         if ctx.get("phase") in {"morning", "lunch"}:
-            lines.append("- 暂无此刻盘面总结，按午盘前保留仓位和静态风控执行。")
+            if niuone_only:
+                lines.append(
+                    "- 暂无此刻盘面总结；牛牛仍只按最多"
+                    f"{ctx.get('niuone_max_open_positions', NIUONE_MAX_OPEN_POSITIONS)}只及静态风险预算执行。"
+                )
+            else:
+                lines.append(
+                    "- 暂无此刻盘面总结；非牛牛策略按午盘前保留仓位，"
+                    f"牛牛仍只按最多{ctx.get('niuone_max_open_positions', NIUONE_MAX_OPEN_POSITIONS)}只及静态风险预算执行。"
+                )
         else:
             lines.append("- 暂无此刻盘面总结，按静态风控执行。")
     return "\n".join(lines)
@@ -3982,10 +5074,36 @@ def build_decision_intelligence_context(
     money_flow = sources.get("money_flow") if isinstance(sources.get("money_flow"), dict) else {}
     hot_stocks = sources.get("hot_stocks") if isinstance(sources.get("hot_stocks"), dict) else {}
     market_flow = sources.get("market_flow") if isinstance(sources.get("market_flow"), dict) else {}
+    try:
+        realtime_news = load_important_realtime_news_decision_context(
+            REALTIME_NEWS_CACHE_FILE,
+            enabled=NEWSNOW_DECISION_ENABLED,
+            max_items=DEFAULT_DECISION_NEWS_MAX_ITEMS,
+        )
+    except Exception as exc:
+        realtime_news = {
+            "enabled": NEWSNOW_DECISION_ENABLED,
+            "available": False,
+            "status": "unavailable",
+            "items": [],
+            "error": type(exc).__name__,
+        }
+    source_status = {
+        key: _source_status(value if isinstance(value, dict) else {})
+        for key, value in sources.items()
+    }
+    if realtime_news.get("enabled"):
+        if realtime_news.get("error"):
+            news_status = "stale" if realtime_news.get("stale") else "error"
+        elif realtime_news.get("stale"):
+            news_status = "stale"
+        else:
+            news_status = str(realtime_news.get("status") or "empty")
+        source_status["realtime_news"] = news_status
     ctx = {
         "enabled": True,
         "generated_at": raw.get("generated_at") if isinstance(raw, dict) else now_ts(),
-        "source_status": {key: _source_status(value if isinstance(value, dict) else {}) for key, value in sources.items()},
+        "source_status": source_status,
         "portfolio": compact_portfolio_exposure_for_decision(portfolio),
         "market_guidance": compact_market_strategy_context(market_strategy_ctx),
         "indices": compact_indices_for_decision(sources.get("indices") if isinstance(sources.get("indices"), dict) else {}),
@@ -4011,6 +5129,7 @@ def build_decision_intelligence_context(
             "available": bool(str(news_context or "").strip()),
             "text": _compact_text(news_context, 1200) if news_context else "",
         },
+        "realtime_news": realtime_news,
     }
     ctx["candidate_alignment"] = build_candidate_market_alignment(candidates, sectors, money_flow, hot_stocks)
     ctx["decision_notes"] = derive_decision_intelligence_notes(ctx)
@@ -4098,6 +5217,12 @@ def format_decision_intelligence_context_for_prompt(ctx: dict[str, Any]) -> str:
         if sector_mappings:
             lines.append("隔夜美股映射：" + "；".join(sector_mappings[:DECISION_INTELLIGENCE_MAX_ITEMS]))
 
+    realtime_news_prompt = format_important_realtime_news_for_prompt(
+        ctx.get("realtime_news") if isinstance(ctx.get("realtime_news"), dict) else {}
+    )
+    if realtime_news_prompt:
+        lines.extend(realtime_news_prompt.splitlines())
+
     sectors = ctx.get("sectors") or {}
     lines.append("板块涨跌：涨幅 " + _format_rank_line(sectors.get("gain_top") or []))
     lines.append("板块涨跌：跌幅 " + _format_rank_line(sectors.get("loss_top") or []))
@@ -4124,8 +5249,10 @@ def format_decision_intelligence_context_for_prompt(ctx: dict[str, Any]) -> str:
     if source_status:
         lines.append("来源状态：" + "；".join(f"{key}={value}" for key, value in sorted(source_status.items())))
     lines.append(
-        "决策要求：每个BUY/SELL/HOLD都必须同时考虑盘面指引、隔夜美股/美股映射、指数/期货、板块与资金、候选消息面、账户仓位和现金状态；"
+        "决策要求：每个BUY/SELL/HOLD都必须同时考虑盘面指引、隔夜美股/美股映射、指数/期货、板块与资金、"
+        "已启用的财经快讯重要信息、有效的候选消息面、账户仓位和现金状态；"
         "若任一关键渠道与技术评分冲突，优先降仓、等待确认或HOLD，并在reason写明冲突来源。"
+        "消息面预检失败、超时、未检查、待判断或不可用不是冲突信号，统一按中性、权重0处理。"
     )
     return "\n".join(lines)
 
@@ -4169,52 +5296,13 @@ def check_daily_loss_budget(state: dict[str, Any]) -> tuple[bool, float]:
     today = today_key()
     positions = state.get("positions") or {}
     current_equity = float(state.get("cash") or 0) + portfolio_market_value(positions)
-
-    prior_points: list[dict[str, Any]] = []
-    for key in ("daily_equity_history", "equity_history"):
-        for point in state.get(key) or []:
-            if not isinstance(point, dict) or str(point.get("time") or "")[:10] >= today:
-                continue
-            equity = _safe_float(point.get("equity"), 0.0)
-            if equity > 0 and math.isfinite(equity):
-                prior_points.append(point)
-    if prior_points:
-        previous_equity = _safe_float(
-            max(prior_points, key=lambda point: str(point.get("time") or "")).get("equity"),
-            0.0,
-        )
-        pnl_pct = (current_equity / previous_equity - 1) * 100 if previous_equity > 0 else 0.0
-        return pnl_pct <= DAILY_LOSS_BUDGET_PCT, pnl_pct
-
-    daily_pnl = 0.0
-    complete = True
-    for trade in state.get("trade_log") or []:
-        if not isinstance(trade, dict) or not str(trade.get("time") or "").startswith(today):
-            continue
-        if str(trade.get("action") or "").upper() != "SELL":
-            continue
-        trade_day_pnl = _safe_float(trade.get("day_pnl"), float("nan"))
-        if not math.isfinite(trade_day_pnl):
-            complete = False
-        else:
-            daily_pnl += trade_day_pnl
-    for pos in positions.values():
-        if not isinstance(pos, dict):
-            continue
-        qty = position_qty(pos)
-        if qty <= 0:
-            continue
-        price = _safe_float(pos.get("last_price") or pos.get("close") or pos.get("avg_cost"), 0.0)
-        prev_close = _safe_float(pos.get("prev_close"), 0.0)
-        position_pnl, _position_pnl_pct = position_today_pnl(pos, price, qty, prev_close)
-        if position_pnl is None or not math.isfinite(position_pnl):
-            complete = False
-        else:
-            daily_pnl += position_pnl
-    if not complete:
+    _daily_pnl, pnl_pct = account_today_pnl(
+        state,
+        current_equity=current_equity,
+        today=today,
+    )
+    if pnl_pct is None:
         return False, 0.0
-    opening_equity = current_equity - daily_pnl
-    pnl_pct = daily_pnl / opening_equity * 100 if opening_equity > 0 else 0.0
     return pnl_pct <= DAILY_LOSS_BUDGET_PCT, pnl_pct
 
 
@@ -4252,6 +5340,126 @@ def trading_holding_days(pos: dict[str, Any], today: str | None = None) -> int:
             elapsed += 1
         current += timedelta(days=1)
     return elapsed
+
+
+def post_exit_reentry_audit(
+    state: dict[str, Any],
+    code: str,
+    candidate: Mapping[str, Any],
+    *,
+    price: float,
+    today: str,
+) -> tuple[str, dict[str, Any] | None]:
+    """Require a fresh reclaim before reopening a recent staged soft exit."""
+    watchlist = state.get("post_exit_reentry_watch")
+    if not isinstance(watchlist, dict):
+        return "", None
+    normalized = normalize_code(code)
+    watch = watchlist.get(normalized)
+    if not isinstance(watch, dict):
+        return "", None
+    elapsed = trading_holding_days(
+        {"buy_date_lots": {str(watch.get("exit_date") or ""): 100}},
+        today,
+    )
+    if elapsed > int(watch.get("expires_after_sessions") or 5):
+        watchlist.pop(normalized, None)
+        return "", None
+
+    feedback_policy = current_exit_feedback_policy(state)
+    feedback_parameters = effective_exit_feedback_parameters(feedback_policy)
+    required_volume_ratio = float(feedback_parameters["reentry_volume_ratio"])
+    required_amount_percentile = float(
+        feedback_parameters["reentry_amount_percentile"]
+    )
+
+    reclaim_level = max(
+        _safe_float(watch.get("exit_high"), 0.0),
+        _safe_float(watch.get("exit_bbi"), 0.0),
+        _safe_float(watch.get("exit_price"), 0.0),
+    )
+    volume_ratio = max(
+        _safe_float(candidate.get("volume_ratio"), 0.0),
+        _safe_float(candidate.get("projected_volume_ratio_20d"), 0.0),
+        _safe_float(candidate.get("amount_ratio"), 0.0),
+    )
+    amount_percentile = max(
+        _safe_float(candidate.get("market_amount_percentile"), 0.0),
+        _safe_float(candidate.get("stock_market_amount_percentile"), 0.0),
+        _safe_float(candidate.get("amount_percentile"), 0.0),
+    )
+    volume_supportive = (
+        volume_ratio >= required_volume_ratio
+        or amount_percentile >= required_amount_percentile
+    )
+    theme_state = str(candidate.get("mainline_state") or "").strip().lower()
+    watched_theme = str(
+        watch.get("active_theme") or watch.get("entry_theme") or ""
+    ).strip()
+    candidate_theme = str(
+        candidate.get("signal_theme") or candidate.get("active_theme") or ""
+    ).strip()
+    theme_matches = not watched_theme or not candidate_theme or watched_theme == candidate_theme
+    thesis_valid = theme_state not in {"fading", "inactive", "fade"} and theme_matches
+    audit = {
+        "exit_date": str(watch.get("exit_date") or ""),
+        "elapsed_sessions": elapsed,
+        "expires_after_sessions": int(watch.get("expires_after_sessions") or 5),
+        "reclaim_level": round(reclaim_level, 4),
+        "execution_price": round(float(price), 4),
+        "volume_ratio": round(volume_ratio, 4),
+        "amount_percentile": round(amount_percentile, 4),
+        "required_volume_ratio": required_volume_ratio,
+        "required_amount_percentile": required_amount_percentile,
+        "exit_feedback_policy_version": int(feedback_policy.get("version") or 0),
+        "theme_matches": theme_matches,
+        "reclaim_passed": bool(price > reclaim_level > 0),
+        "volume_supportive": bool(volume_supportive),
+        "thesis_valid": bool(thesis_valid),
+        "eligible": bool(
+            price > reclaim_level > 0
+            and volume_supportive
+            and thesis_valid
+        ),
+    }
+    if price <= reclaim_level or reclaim_level <= 0:
+        return f"软退出后5日观察期内尚未站回退出高点/BBI {reclaim_level:.2f}", audit
+    if not volume_supportive:
+        return "软退出后重新开仓缺少放量或成交额活跃度确认", audit
+    if not thesis_valid:
+        return "软退出后的原题材逻辑未恢复或已切换", audit
+    return "", audit
+
+
+def _create_post_exit_reentry_watch(
+    state: dict[str, Any],
+    *,
+    code: str,
+    position: Mapping[str, Any],
+    exit_date: str,
+    exit_price: float,
+    buy_strategy: str,
+    exit_signal: str,
+) -> None:
+    """Persist the local reclaim bar after a completed staged soft exit."""
+    state.setdefault("post_exit_reentry_watch", {})[normalize_code(code)] = {
+        "exit_date": exit_date,
+        "exit_price": round(float(exit_price), 4),
+        "exit_high": round(
+            max(
+                float(exit_price),
+                _safe_float(position.get("day_high"), 0.0),
+                _safe_float(position.get("high"), 0.0),
+            ),
+            4,
+        ),
+        "exit_bbi": round(_safe_float(position.get("bbi"), 0.0), 4),
+        "entry_theme": str(position.get("entry_theme") or ""),
+        "active_theme": str(position.get("active_theme") or ""),
+        "buy_strategy": buy_strategy,
+        "exit_signal": exit_signal,
+        "expires_after_sessions": 5,
+    }
 
 
 def is_shaofu_soft_exit_check_time(dt: datetime | None = None) -> bool:
@@ -4405,6 +5613,8 @@ def niuone_opened_position_codes_on_date(
     for raw_trade in state.get("trade_log") or []:
         if not isinstance(raw_trade, dict):
             continue
+        if not trade_counts_for_account(raw_trade):
+            continue
         if str(raw_trade.get("action") or "").upper() != "BUY":
             continue
         if str(raw_trade.get("time") or "")[:10] != target_date:
@@ -4447,6 +5657,11 @@ NIUONE_ENTRY_CONTEXT_FIELDS = (
     "entry_stock_sector_rank",
     "entry_stock_strong",
     "entry_stock_leader_tier",
+    "entry_stock_activity_score",
+    "entry_stock_market_amount_percentile",
+    "entry_stock_theme_amount_percentile",
+    "entry_stock_activity_confirmed",
+    "entry_turnover_pct",
     "entry_daily_v_recovery_ratio",
     "entry_signal_score",
     "entry_candidate_pool_size",
@@ -4750,9 +5965,14 @@ def niuone_candidate_selection_context(
 PRACTICE_CANDIDATE_EVIDENCE_FIELDS = (
     "code",
     "name",
+    "price",
+    "change_pct",
+    "amount_yi",
+    "turnover",
     "industry",
     "sector",
     "signal_theme",
+    "theme_attributions",
     "signal_theme_attribution_score",
     "signal_theme_attribution_weight",
     "signal_theme_historical_prior_score",
@@ -4777,6 +5997,16 @@ PRACTICE_CANDIDATE_EVIDENCE_FIELDS = (
     "actionable",
     "hard_blockers",
     "risk_flags",
+    "return_5d_pct",
+    "return_20d_pct",
+    "distance_ema20_pct",
+    "distance_bbi_pct",
+    "distance_high_20d_pct",
+    "volume_ratio_5d",
+    "volatility_20d_pct",
+    "current_j",
+    "above_ema20",
+    "above_bbi",
     "market_regime",
     "market_allows_buys",
     "market_hard_stop",
@@ -4792,6 +6022,12 @@ PRACTICE_CANDIDATE_EVIDENCE_FIELDS = (
     "stock_leader_rank",
     "stock_leader_tier",
     "stock_strong",
+    "stock_activity_data_available",
+    "stock_market_amount_percentile",
+    "stock_theme_amount_percentile",
+    "stock_volume_participation_percentile",
+    "stock_activity_score",
+    "stock_activity_confirmed",
     "daily_v_reversal",
     "daily_v_recovery_ratio",
     "stop_price",
@@ -5087,6 +6323,15 @@ def sync_niuone_position_context(state: dict[str, Any], b1_payload: dict[str, An
         normalized_code = normalize_code(code)
         candidate = candidates.get(normalized_code, {})
         stock = stocks.get(normalized_code) if isinstance(stocks.get(normalized_code), dict) else {}
+        pos.pop("current_decision_score", None)
+        if candidate:
+            current_decision_score = candidate.get("best_decision_score")
+            if current_decision_score is None:
+                current_decision_score = candidate.get("decision_score")
+            if current_decision_score is None:
+                current_decision_score = candidate.get("best_score")
+            if current_decision_score is not None:
+                pos["current_decision_score"] = current_decision_score
         theme_profiles = {
             str(item.get("industry") or "").strip(): dict(item)
             for item in (stock.get("theme_profiles") or [])
@@ -5667,6 +6912,129 @@ def _resolve_shaofu_soft_exit(
     return signal
 
 
+def _clear_staged_soft_exit_pending(
+    pos: dict[str, Any],
+    status: str = "clear",
+) -> None:
+    pos["soft_exit_status"] = status
+    for key in (
+        "soft_exit_pending_family",
+        "soft_exit_pending_signal",
+        "soft_exit_pending_reason",
+        "soft_exit_pending_count",
+        "soft_exit_required",
+        "soft_exit_last_session",
+    ):
+        pos.pop(key, None)
+
+
+def _resolve_staged_soft_exit(
+    pos: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    session_key: str,
+    evidence_count: int = 1,
+    confirmations_required: int | None = None,
+) -> dict[str, Any] | None:
+    """Apply the common score-veto/reduce/confirm policy to a soft exit."""
+    feedback_confirmations = int(
+        pos.get("exit_feedback_soft_exit_confirmations")
+        or SOFT_EXIT_CONFIRMATIONS
+    )
+    resolved_confirmations = max(
+        feedback_confirmations,
+        int(confirmations_required or feedback_confirmations),
+    )
+    feedback_reduce_ratio = float(
+        pos.get("exit_feedback_soft_exit_reduce_ratio")
+        or SOFT_EXIT_REDUCE_RATIO
+    )
+    source_signal = str(candidate.get("signal") or "soft_exit")
+    reason = str(candidate.get("reason") or "软退出条件成立")
+    decision = arbitrate_staged_soft_exit(
+        signal_family="soft_exit",
+        session_key=session_key,
+        previous_family=str(pos.get("soft_exit_pending_family") or ""),
+        previous_session=str(pos.get("soft_exit_last_session") or ""),
+        previous_count=max(
+            int(pos.get("soft_exit_pending_count") or 0),
+            max(0, int(evidence_count or 0) - 1),
+        ),
+        already_reduced=bool(
+            pos.get("soft_exit_reduced")
+            or pos.get("soft_exit_reduction_deferred")
+            or pos.get("partial_tp_done")
+        ),
+        sell_score=(
+            float(pos["sell_score"])
+            if isinstance(pos.get("sell_score"), (int, float))
+            else None
+        ),
+        evidence_count=evidence_count,
+        confirmations_required=resolved_confirmations,
+        reduce_ratio=feedback_reduce_ratio,
+    )
+    status = str(decision.get("status") or "runner_hold")
+    count = int(decision.get("count") or 0)
+    required = int(decision.get("required") or SOFT_EXIT_CONFIRMATIONS)
+    pos.update({
+        "soft_exit_status": status,
+        "soft_exit_pending_family": str(decision.get("signal_family") or "soft_exit"),
+        "soft_exit_pending_signal": source_signal,
+        "soft_exit_pending_reason": reason,
+        "soft_exit_pending_count": count,
+        "soft_exit_required": required,
+        "soft_exit_last_session": session_key,
+    })
+    if status in {"score_veto", "runner_hold"}:
+        return None
+
+    result = dict(candidate)
+    result["sell_ratio"] = float(decision.get("sell_ratio") or 1.0)
+    result["soft_exit_stage"] = status
+    result["soft_exit_confirmation_count"] = count
+    result["soft_exit_confirmations_required"] = required
+    result["source_signal"] = source_signal
+    result["exit_rule"] = (
+        "model_sell" if source_signal == "model_soft_exit"
+        else classify_exit_rule(reason, source_signal)
+    )
+    result["exit_feedback_policy_version"] = int(
+        pos.get("exit_feedback_policy_version") or 0
+    )
+    result["exit_feedback_parameters"] = {
+        "soft_exit_confirmations": resolved_confirmations,
+        "soft_exit_reduce_ratio": feedback_reduce_ratio,
+    }
+    if status == "reduce":
+        result["reason"] = (
+            f"软退出首次确认，先减仓{result['sell_ratio'] * 100:g}%保留观察仓；"
+            f"{reason}（确认{count}/{required}）"
+        )
+    else:
+        result["reason"] = f"软退出跨交易日确认，清理观察仓；{reason}（确认{count}/{required}）"
+    return result
+
+
+def _niuone_position_hard_exit_evidence(
+    pos: Mapping[str, Any], current_price: float,
+) -> dict[str, Any]:
+    levels = niuone_stop_levels(
+        pos, cost=_safe_float(pos.get("avg_cost"), 0.0),
+        break_even=NIUONE_BREAK_EVEN_AFTER_PARTIAL,
+    )
+    return niuone_hard_exit_evidence(
+        strategy_id=position_entry_strategy(pos),
+        current_price=current_price,
+        structural_stop=levels["effective_stop_price"],
+        cost_protection_stop=levels["cost_protection_stop_price"],
+        original_structural_stop=levels["original_structural_stop_price"],
+        market_hard_stop=bool(pos.get("market_hard_stop")),
+        theme_score=_safe_float(pos.get("mainline_score"), 100.0),
+        theme_state=str(pos.get("mainline_state") or ""),
+    )
+
+
 def evaluate_sell_signal(
     code: str,
     pos: dict[str, Any],
@@ -5677,6 +7045,7 @@ def evaluate_sell_signal(
     time_stop_allowed: bool | None = None,
     soft_exit_allowed: bool = True,
     soft_exit_confirmation_key: str = "",
+    exit_feedback_policy: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Evaluate the local sell rule stack for one open position.
 
@@ -5685,11 +7054,22 @@ def evaluate_sell_signal(
     tracking fields such as peak price and consecutive BBI-break days.
     """
     today = today or today_key()
+    feedback_parameters = effective_exit_feedback_parameters(exit_feedback_policy)
+    pos["exit_feedback_policy_version"] = int(
+        (exit_feedback_policy or {}).get("version") or 0
+    )
+    pos["exit_feedback_soft_exit_confirmations"] = int(
+        feedback_parameters["soft_exit_confirmations"]
+    )
+    pos["exit_feedback_soft_exit_reduce_ratio"] = float(
+        feedback_parameters["soft_exit_reduce_ratio"]
+    )
     entry_strategy = position_entry_strategy(pos)
     zettaranc_position = is_zettaranc_strategy(entry_strategy)
     shaofu_position = entry_strategy == "shaofu_b1"
     sector_tide_position = is_sector_tide_strategy(entry_strategy)
     niuone_position = is_niuone_strategy(entry_strategy)
+    staged_soft_seen = False
     realtime_price = float(pos.get("last_price") or pos.get("close") or pos.get("avg_cost") or 0)
     price = float(
         (pos.get("confirmed_close") if zettaranc_position else pos.get("close"))
@@ -5703,6 +7083,26 @@ def evaluate_sell_signal(
     )
     avg_cost = float(pos.get("avg_cost") or 0)
     if price <= 0 or avg_cost <= 0:
+        return None
+    if entry_strategy == STRATEGY_SOURCE_PRESET_TEXT:
+        if pos.get("prompt_strategy_version_id"):
+            evaluation = pos.get("prompt_strategy_exit_evaluation")
+            if (
+                pos.get("prompt_strategy_exit_status") == "true"
+                and isinstance(evaluation, Mapping)
+                and str(evaluation.get("plan_sha256") or "")
+                == str(pos.get("prompt_strategy_plan_sha256") or "")
+            ):
+                evidence = str(
+                    (evaluation.get("root") or {}).get("evidence")
+                    or "冻结文字策略退出条件成立"
+                )
+                return _sell_signal(
+                    f"冻结文字策略退出：{evidence}",
+                    "prompt_strategy_exit",
+                )
+            return None
+        # Legacy prompt positions retain their older model-audited exit path.
         return None
     if time_stop_allowed is not None:
         time_exit_allowed = time_stop_allowed
@@ -5765,6 +7165,8 @@ def evaluate_sell_signal(
     shaofu_stop = 0.0 if pos.get("shaofu_stop_source") == "fallback_pct" else float(
         pos.get("shaofu_stop_price") or pos.get("entry_stop_price") or 0
     )
+    if niuone_position:
+        pos.update(niuone_stop_levels(pos, cost=avg_cost, break_even=NIUONE_BREAK_EVEN_AFTER_PARTIAL))
     if (
         niuone_position
         and NIUONE_BREAK_EVEN_AFTER_PARTIAL
@@ -5773,7 +7175,13 @@ def evaluate_sell_signal(
         shaofu_stop = max(shaofu_stop, avg_cost)
         pos["entry_stop_price"] = round(shaofu_stop, 3)
         pos["entry_stop_source"] = "niu_breakeven"
-    if shaofu_stop > 0 and price < shaofu_stop:
+    if niuone_position:
+        hard_evidence = _niuone_position_hard_exit_evidence(pos, niuone_execution_price)
+        if hard_evidence["confirmed"]:
+            result = _sell_signal(hard_evidence["reason"], hard_evidence["signal"])
+            result["niuone_hard_exit_evidence"] = hard_evidence
+            return result
+    if not niuone_position and shaofu_stop > 0 and price < shaofu_stop:
         stop_labels = {
             "n_structure_low": "N型结构前低",
             "b1_low": "前置B1低点",
@@ -5817,41 +7225,54 @@ def evaluate_sell_signal(
                 if climax_runner_active
                 else NIUONE_LEADER_LOSS_CONFIRMATIONS
             )
-            if pos.get("market_hard_stop") and (theme_score < 55 or theme_state in {"fading", "inactive"}):
-                return _sell_signal(
-                    f"市场硬停止且主线转弱 ({pos.get('industry') or '-'}分数{theme_score:.1f}，状态{theme_state or '-'})",
-                    "niu_market_hard_stop",
+            leader_lost_count = int(pos.get("niu_leader_lost_count") or 0)
+            if not reversal_probe and leader_lost_count >= 1:
+                staged_soft_seen = True
+                staged = _resolve_staged_soft_exit(
+                    pos,
+                    _sell_signal(
+                        f"连续{leader_lost_count}个交易日跌出强势行业龙头梯队 "
+                        f"({pos.get('industry') or '-'}，当前排名"
+                        f"{pos.get('stock_leader_rank') or '-'}"
+                        f"{'，高潮减仓后余仓' if climax_runner_active else ''})",
+                        "niu_leader_lost",
+                    ),
+                    session_key=today,
+                    evidence_count=leader_lost_count,
+                    confirmations_required=leader_loss_confirmations,
                 )
-            if not reversal_probe and int(
-                pos.get("niu_leader_lost_count") or 0
-            ) >= leader_loss_confirmations:
-                return _sell_signal(
-                    f"连续{leader_loss_confirmations}个交易日跌出强势行业龙头梯队 "
-                    f"({pos.get('industry') or '-'}，当前排名"
-                    f"{pos.get('stock_leader_rank') or '-'}"
-                    f"{'，高潮减仓后余仓' if climax_runner_active else ''})",
-                    "niu_leader_lost",
+                if staged:
+                    return staged
+            mainline_weak_count = int(pos.get("mainline_weak_count") or 0)
+            if not reversal_probe and mainline_weak_count >= 1:
+                staged_soft_seen = True
+                staged = _resolve_staged_soft_exit(
+                    pos,
+                    _sell_signal(
+                        f"主线连续转弱 ({pos.get('industry') or '-'}分数{theme_score:.1f}，状态{theme_state or '-'})",
+                        "niu_mainline_faded",
+                    ),
+                    session_key=today,
+                    evidence_count=mainline_weak_count,
+                    confirmations_required=NIUONE_MAINLINE_WEAK_CONFIRMATIONS,
                 )
-            if not reversal_probe and (
-                int(pos.get("mainline_weak_count") or 0)
-                >= NIUONE_MAINLINE_WEAK_CONFIRMATIONS
-                or theme_state == "inactive"
-            ):
-                return _sell_signal(
-                    f"主线连续转弱 ({pos.get('industry') or '-'}分数{theme_score:.1f}，状态{theme_state or '-'})",
-                    "niu_mainline_faded",
+                if staged:
+                    return staged
+            if reversal_probe and mainline_weak_count >= 1:
+                staged_soft_seen = True
+                staged = _resolve_staged_soft_exit(
+                    pos,
+                    _sell_signal(
+                        "牛牛试仓所属题材未能维持主线酝酿强度 "
+                        f"({pos.get('industry') or '-'}分数{theme_score:.1f}，"
+                        f"状态{theme_state or '-'})",
+                        "niu_reversal_theme_failed",
+                    ),
+                    session_key=today,
+                    evidence_count=mainline_weak_count,
                 )
-            if reversal_probe and (
-                int(pos.get("mainline_weak_count") or 0)
-                >= NIUONE_REVERSAL_MAINLINE_WEAK_CONFIRMATIONS
-                or theme_state == "inactive"
-            ):
-                return _sell_signal(
-                    "牛牛试仓所属题材未能维持主线酝酿强度 "
-                    f"({pos.get('industry') or '-'}分数{theme_score:.1f}，"
-                    f"状态{theme_state or '-'})",
-                    "niu_reversal_theme_failed",
-                )
+                if staged:
+                    return staged
             if (
                 time_exit_allowed
                 and (
@@ -5937,11 +7358,21 @@ def evaluate_sell_signal(
                     f"市场复合风险硬停止且行业转弱 ({pos.get('industry') or '-'}分数{sector_score:.1f}，潮位{sector_status or '-'})",
                     "tide_market_hard_stop",
                 )
-            if int(pos.get("sector_weak_count") or 0) >= 2:
-                return _sell_signal(
-                    f"行业退潮连续两日 ({pos.get('industry') or '-'}分数{sector_score:.1f}<55)",
-                    "tide_sector_weak",
+            sector_weak_count = int(pos.get("sector_weak_count") or 0)
+            if sector_weak_count >= 1:
+                staged_soft_seen = True
+                staged = _resolve_staged_soft_exit(
+                    pos,
+                    _sell_signal(
+                        f"行业退潮连续{sector_weak_count}日 "
+                        f"({pos.get('industry') or '-'}分数{sector_score:.1f}<55)",
+                        "tide_sector_weak",
+                    ),
+                    session_key=today,
+                    evidence_count=sector_weak_count,
                 )
+                if staged:
+                    return staged
 
         strategy_time_exit = evaluate_strategy_time_exit(
             entry_strategy=entry_strategy,
@@ -5961,7 +7392,14 @@ def evaluate_sell_signal(
             strategy_variant=str(pos.get("reversal_basis") or ""),
         )
         if strategy_time_exit:
-            return strategy_time_exit
+            staged_soft_seen = True
+            staged = _resolve_staged_soft_exit(
+                pos,
+                strategy_time_exit,
+                session_key=today,
+            )
+            if staged:
+                return staged
 
         entry_stop = _safe_float(pos.get("entry_stop_price"), 0.0)
         initial_risk = avg_cost - entry_stop if 0 < entry_stop < avg_cost else 0.0
@@ -6037,6 +7475,8 @@ def evaluate_sell_signal(
                 f"持仓到期 ({hold_days}d ≥ {max_hold_days}d)",
                 "max_hold_days",
             )
+        if not staged_soft_seen and pos.get("soft_exit_pending_signal") != "model_soft_exit":
+            _clear_staged_soft_exit_pending(pos)
         return None
 
     chuhuo = pos.get("chuhuo_wushi") or {}
@@ -6094,13 +7534,18 @@ def evaluate_sell_signal(
 
     if max_pnl_pct > 0.8 and pnl_pct <= 0:
         signal = _sell_signal(f"盈转亏退出 (最高盈利{max_pnl_pct:.1f}%，现盈亏{pnl_pct:.1f}%)", "profit_to_loss")
-        return _resolve_shaofu_soft_exit(
-            pos,
-            signal,
-            hold_trading_days=hold_trading_days,
-            soft_exit_allowed=soft_exit_allowed,
-            confirmation_key=soft_exit_confirmation_key,
-        ) if shaofu_position else signal
+        if shaofu_position:
+            return _resolve_shaofu_soft_exit(
+                pos,
+                signal,
+                hold_trading_days=hold_trading_days,
+                soft_exit_allowed=soft_exit_allowed,
+                confirmation_key=soft_exit_confirmation_key,
+            )
+        staged_soft_seen = True
+        staged = _resolve_staged_soft_exit(pos, signal, session_key=today)
+        if staged:
+            return staged
     strategy_time_exit = evaluate_strategy_time_exit(
         entry_strategy=entry_strategy,
         hold_days=hold_days,
@@ -6115,17 +7560,29 @@ def evaluate_sell_signal(
         strategy_variant=str(pos.get("reversal_basis") or ""),
     )
     if strategy_time_exit:
-        return strategy_time_exit
+        staged_soft_seen = True
+        staged = _resolve_staged_soft_exit(
+            pos,
+            strategy_time_exit,
+            session_key=today,
+        )
+        if staged:
+            return staged
     if time_exit_allowed:
         if hold_days >= NO_PROGRESS_HOLD_DAYS and max_pnl_pct < NO_PROGRESS_MAX_PNL_PCT and pnl_pct <= 0:
             signal = _sell_signal(f"买入后{hold_days}日未兑现离场 ({TIME_EXIT_HHMM}尾盘检查，最高盈利{max_pnl_pct:.1f}%，先收队)", "no_progress")
-            return _resolve_shaofu_soft_exit(
-                pos,
-                signal,
-                hold_trading_days=hold_trading_days,
-                soft_exit_allowed=soft_exit_allowed,
-                confirmation_key=soft_exit_confirmation_key,
-            ) if shaofu_position else signal
+            if shaofu_position:
+                return _resolve_shaofu_soft_exit(
+                    pos,
+                    signal,
+                    hold_trading_days=hold_trading_days,
+                    soft_exit_allowed=soft_exit_allowed,
+                    confirmation_key=soft_exit_confirmation_key,
+                )
+            staged_soft_seen = True
+            staged = _resolve_staged_soft_exit(pos, signal, session_key=today)
+            if staged:
+                return staged
 
     sell_score = pos.get("sell_score")
     if isinstance(sell_score, (int, float)):
@@ -6134,26 +7591,36 @@ def evaluate_sell_signal(
                 f"防卖飞评分过低 ({sell_score}/5，{pos.get('sell_score_reason','')})",
                 "sell_score_exit",
             )
-            return _resolve_shaofu_soft_exit(
-                pos,
-                signal,
-                hold_trading_days=hold_trading_days,
-                soft_exit_allowed=soft_exit_allowed,
-                confirmation_key=soft_exit_confirmation_key,
-            ) if shaofu_position else signal
+            if shaofu_position:
+                return _resolve_shaofu_soft_exit(
+                    pos,
+                    signal,
+                    hold_trading_days=hold_trading_days,
+                    soft_exit_allowed=soft_exit_allowed,
+                    confirmation_key=soft_exit_confirmation_key,
+                )
+            staged_soft_seen = True
+            staged = _resolve_staged_soft_exit(pos, signal, session_key=today)
+            if staged:
+                return staged
         if sell_score <= SELL_SCORE_REDUCE_THRESHOLD and not pos.get("sell_score_half_done") and not pos.get("partial_tp_done"):
             signal = _sell_signal(
                 f"防卖飞评分中性 ({sell_score}/5，先减半观察BBI两日破位)",
                 "sell_score_reduce",
                 TAKE_PROFIT_PARTIAL_RATIO,
             )
-            return _resolve_shaofu_soft_exit(
-                pos,
-                signal,
-                hold_trading_days=hold_trading_days,
-                soft_exit_allowed=soft_exit_allowed,
-                confirmation_key=soft_exit_confirmation_key,
-            ) if shaofu_position else signal
+            if shaofu_position:
+                return _resolve_shaofu_soft_exit(
+                    pos,
+                    signal,
+                    hold_trading_days=hold_trading_days,
+                    soft_exit_allowed=soft_exit_allowed,
+                    confirmation_key=soft_exit_confirmation_key,
+                )
+            staged_soft_seen = True
+            staged = _resolve_staged_soft_exit(pos, signal, session_key=today)
+            if staged:
+                return staged
 
     low10 = float(pos.get("low10") or 0)
     if low10 > 0 and hold_days >= 3 and price <= low10 * 0.995:
@@ -6181,13 +7648,18 @@ def evaluate_sell_signal(
                 f"峰值回撤止盈 (最高盈利{max_pnl_pct:.1f}%，回撤{giveback:.1f}% ≥ {trailing_gap:.1f}%)",
                 "profit_giveback",
             )
-            return _resolve_shaofu_soft_exit(
-                pos,
-                signal,
-                hold_trading_days=hold_trading_days,
-                soft_exit_allowed=soft_exit_allowed,
-                confirmation_key=soft_exit_confirmation_key,
-            ) if shaofu_position else signal
+            if shaofu_position:
+                return _resolve_shaofu_soft_exit(
+                    pos,
+                    signal,
+                    hold_trading_days=hold_trading_days,
+                    soft_exit_allowed=soft_exit_allowed,
+                    confirmation_key=soft_exit_confirmation_key,
+                )
+            staged_soft_seen = True
+            staged = _resolve_staged_soft_exit(pos, signal, session_key=today)
+            if staged:
+                return staged
         atr20 = float(pos.get("atr20") or 0)
         if atr20 > 0:
             chandelier_stop = highest_price - ATR_CHANDELIER_MULT * atr20
@@ -6240,20 +7712,247 @@ def evaluate_sell_signal(
 
     if shaofu_position:
         _clear_shaofu_soft_exit_pending(pos)
+    if not staged_soft_seen:
+        _clear_staged_soft_exit_pending(pos)
     return None
 
 
-def _refresh_position_bbi(state: dict[str, Any], dt: datetime | None = None) -> None:
+def evaluate_prompt_position_exit(
+    code: str,
+    pos: dict[str, Any],
+    rows: list[dict[str, Any]],
+    *,
+    state: Mapping[str, Any],
+    dt: datetime,
+    store: PromptStrategyStore | None = None,
+) -> dict[str, Any] | None:
+    version_id = str(pos.get("prompt_strategy_version_id") or "")
+    if not version_id:
+        return None
+    strategy_store = store or PromptStrategyStore()
+    version = strategy_store.get_version(version_id)
+    if version is None:
+        raise ValueError("持仓绑定的文字策略版本不存在")
+    binding = strategy_store.active_position_binding(code)
+    if binding is None:
+        binding = strategy_store.bind_position(
+            code=code,
+            strategy_version_id=version_id,
+            entry_evaluation_id=str(
+                pos.get("prompt_strategy_entry_evaluation_id") or ""
+            ),
+        )
+        pos["prompt_strategy_binding_id"] = binding["binding_id"]
+    elif str(binding.get("strategy_version_id") or "") != version_id:
+        raise ValueError("持仓文字策略版本绑定不一致")
+    price = _safe_float(pos.get("last_price") or pos.get("close"), 0.0)
+    avg_cost = _safe_float(pos.get("avg_cost"), 0.0)
+    quote = {
+        "price": price,
+        "open": pos.get("day_open") or price,
+        "high": pos.get("day_high") or price,
+        "low": pos.get("day_low") or price,
+        "volume": pos.get("volume_lots") or 0,
+        "quote_time": str(pos.get("quote_time") or ""),
+    }
+    plan = version.get("execution_plan") or {}
+    exit_minimum_bars = max(
+        1,
+        min(
+            500,
+            int(
+                ((plan.get("stage_requirements") or {}).get("exit") or {}).get(
+                    "minimum_bars"
+                )
+                or 1
+            ),
+        ),
+    )
+    bar_status = str(
+        (((plan.get("strategy") or {}).get("data_contract") or {}).get(
+            "bar_status"
+        ))
+        or "closed"
+    )
+    evaluation_rows = merge_live_quote(
+        rows,
+        quote,
+        limit=min(501, exit_minimum_bars + (1 if bar_status == "closed" else 0)),
+    )
+    result = evaluate_frozen_strategy_stage(
+        version,
+        "exit",
+        evaluation_rows,
+        code=code,
+        name=str(pos.get("name") or ""),
+        runtime_facts={
+            "account.cash": _safe_float(state.get("cash"), 0.0),
+            "position.quantity": position_qty(pos),
+            "position.available_shares": available_to_sell(pos, dt.strftime("%Y-%m-%d")),
+            "position.avg_cost": avg_cost,
+            "position.pnl_pct": (
+                (price / avg_cost - 1.0) * 100.0
+                if price > 0 and avg_cost > 0
+                else None
+            ),
+            "position.hold_days": holding_days(pos, dt.strftime("%Y-%m-%d")),
+        },
+        data_context=prompt_strategy_data_context(quote, dt),
+    )
+    recorded = strategy_store.record_evaluation(version_id, result["audit"])
+    result["evaluation_id"] = recorded["evaluation_id"]
+    return result
+
+
+def validate_versioned_prompt_exit_evidence(
+    code: str,
+    pos: Mapping[str, Any],
+    *,
+    store: PromptStrategyStore | None = None,
+) -> str:
+    """Fail closed unless the pending exit matches its frozen, replayable audit."""
+    version_id = str(pos.get("prompt_strategy_version_id") or "")
+    evaluation_id = str(pos.get("prompt_strategy_exit_evaluation_id") or "")
+    audit_sha256 = str(pos.get("prompt_strategy_exit_audit_sha256") or "")
+    evaluation = pos.get("prompt_strategy_exit_evaluation")
+    if not version_id or not evaluation_id or len(audit_sha256) != 64:
+        return "文字策略退出缺少完整审计引用"
+    if pos.get("prompt_strategy_exit_status") != "true" or not isinstance(
+        evaluation,
+        Mapping,
+    ):
+        return "文字策略退出审计未证明规则成立"
+    strategy_store = store or PromptStrategyStore()
+    try:
+        version = strategy_store.get_version(version_id)
+        binding = strategy_store.active_position_binding(code)
+        recorded = strategy_store.get_evaluation(evaluation_id)
+    except Exception as exc:
+        return f"文字策略退出审计无法回放（{type(exc).__name__}）"
+    if version is None or str(version.get("plan_sha256") or "") != str(
+        pos.get("prompt_strategy_plan_sha256") or ""
+    ):
+        return "文字策略退出版本或计划指纹不一致"
+    if (
+        not isinstance(binding, Mapping)
+        or str(binding.get("strategy_version_id") or "") != version_id
+    ):
+        return "文字策略持仓版本绑定缺失或不一致"
+    if not isinstance(recorded, Mapping):
+        return "文字策略退出审计记录不存在"
+    audit = recorded.get("audit")
+    if not isinstance(audit, Mapping):
+        return "文字策略退出审计载荷缺失"
+    if (
+        str(recorded.get("strategy_version_id") or "") != version_id
+        or str(audit.get("strategy_version_id") or "") != version_id
+        or str(audit.get("stage") or "") != "exit"
+        or normalize_code(audit.get("code") or "") != normalize_code(code)
+        or str(audit.get("audit_sha256") or "") != audit_sha256
+        or str(audit.get("plan_sha256") or "")
+        != str(version.get("plan_sha256") or "")
+        or (audit.get("evaluation") or {}) != dict(evaluation)
+        or str(((audit.get("evaluation") or {}).get("status") or "")) != "true"
+    ):
+        return "文字策略退出审计与当前持仓证据不一致"
+    return ""
+
+
+def _refresh_position_bbi(
+    state: dict[str, Any],
+    dt: datetime | None = None,
+    *,
+    evaluate_prompt_exits: bool = False,
+) -> None:
     """Fetch daily K-lines for open positions and cache sell-rule indicators."""
     positions = state.get("positions") or {}
     if not positions:
         return
     import statistics as _st
+    prompt_store = PromptStrategyStore() if evaluate_prompt_exits else None
     for code, pos in positions.items():
         try:
+            if (
+                not evaluate_prompt_exits
+                and position_entry_strategy(pos) == STRATEGY_SOURCE_PRESET_TEXT
+                and pos.get("prompt_strategy_version_id")
+            ):
+                continue
+            if (
+                evaluate_prompt_exits
+                and position_entry_strategy(pos) == STRATEGY_SOURCE_PRESET_TEXT
+                and pos.get("prompt_strategy_version_id")
+                and pos.get("prompt_strategy_pending_exit")
+            ):
+                pending_version = (
+                    prompt_store.get_version(
+                        str(pos.get("prompt_strategy_version_id") or "")
+                    )
+                    if prompt_store is not None
+                    else None
+                )
+                pending_evaluation = pos.get("prompt_strategy_exit_evaluation")
+                if (
+                    pending_version is None
+                    or not pos.get("prompt_strategy_exit_evaluation_id")
+                    or not isinstance(pending_evaluation, Mapping)
+                    or str(pending_evaluation.get("plan_sha256") or "")
+                    != str(pending_version.get("plan_sha256") or "")
+                ):
+                    raise ValueError("待卖文字策略缺少可验证的冻结退出审计")
+                pending_as_of = dt or datetime.now()
+                pending_sellable = available_to_sell(
+                    pos,
+                    pending_as_of.strftime("%Y-%m-%d"),
+                )
+                pos["prompt_strategy_exit_status"] = "true"
+                pos["prompt_strategy_pending_exit_ready"] = pending_sellable > 0
+                pos["prompt_strategy_exit_checked_at"] = pending_as_of.strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+                continue
             script = STOCK_TOOLS_SCRIPT
+            requested_kline_count = 130
+            if (
+                evaluate_prompt_exits
+                and position_entry_strategy(pos) == STRATEGY_SOURCE_PRESET_TEXT
+                and pos.get("prompt_strategy_version_id")
+                and prompt_store is not None
+            ):
+                prompt_version = prompt_store.get_version(
+                    str(pos.get("prompt_strategy_version_id") or "")
+                )
+                prompt_plan = (prompt_version or {}).get("execution_plan") or {}
+                exit_minimum_bars = max(
+                    1,
+                    min(
+                        500,
+                        int(
+                            ((prompt_plan.get("stage_requirements") or {}).get("exit") or {}).get(
+                                "minimum_bars"
+                            )
+                            or 1
+                        ),
+                    ),
+                )
+                prompt_bar_status = str(
+                    (((prompt_plan.get("strategy") or {}).get("data_contract") or {}).get(
+                        "bar_status"
+                    ))
+                    or "closed"
+                )
+                requested_kline_count = min(
+                    501,
+                    exit_minimum_bars + (1 if prompt_bar_status == "closed" else 0),
+                )
             proc = subprocess.run(
-                [sys.executable, str(script), "kline", code, "130"],
+                [
+                    sys.executable,
+                    str(script),
+                    "kline",
+                    code,
+                    str(requested_kline_count),
+                ],
                 capture_output=True, text=True, timeout=20,
             )
             if proc.returncode != 0 or not proc.stdout.strip():
@@ -6266,6 +7965,57 @@ def _refresh_position_bbi(state: dict[str, Any], dt: datetime | None = None) -> 
             niuone_position = is_niuone_strategy(entry_strategy)
             rows = raw_rows
             as_of = dt or datetime.now()
+            if (
+                evaluate_prompt_exits
+                and entry_strategy == STRATEGY_SOURCE_PRESET_TEXT
+                and pos.get("prompt_strategy_version_id")
+            ):
+                prompt_exit = evaluate_prompt_position_exit(
+                    normalize_code(code),
+                    pos,
+                    raw_rows,
+                    state=state,
+                    dt=as_of,
+                    store=prompt_store,
+                )
+                if prompt_exit is not None:
+                    pos["prompt_strategy_exit_status"] = str(
+                        (prompt_exit.get("evaluation") or {}).get("status") or "unknown"
+                    )
+                    pos["prompt_strategy_exit_evaluation"] = _json_safe_copy(
+                        prompt_exit.get("evaluation") or {}
+                    )
+                    pos["prompt_strategy_exit_evaluation_id"] = str(
+                        prompt_exit.get("evaluation_id") or ""
+                    )
+                    pos["prompt_strategy_exit_audit_sha256"] = str(
+                        (prompt_exit.get("audit") or {}).get("audit_sha256") or ""
+                    )
+                    pos["prompt_strategy_exit_checked_at"] = as_of.strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+                    if pos["prompt_strategy_exit_status"] == "true":
+                        sellable = available_to_sell(
+                            pos,
+                            as_of.strftime("%Y-%m-%d"),
+                        )
+                        total_quantity = position_qty(pos)
+                        pos["prompt_strategy_pending_exit"] = (
+                            sellable < total_quantity
+                        )
+                        pos["prompt_strategy_pending_exit_ready"] = sellable > 0
+                        pos["prompt_strategy_pending_exit_reason"] = (
+                            "退出条件已成立，但全部或部分股份受T+1约束"
+                            if sellable < total_quantity
+                            else ""
+                        )
+                    else:
+                        pos["prompt_strategy_pending_exit"] = False
+                        pos["prompt_strategy_pending_exit_ready"] = False
+                        pos["prompt_strategy_pending_exit_reason"] = ""
+                # Frozen prompt positions have an independent exit rule stack.  Do
+                # not compute BBI/KDJ/ATR or any other legacy exit-only indicator.
+                continue
             if zettaranc_position:
                 rows = zettaranc_confirmed_rows(raw_rows, as_of)
             closes = [float(r.get("close")) for r in rows] if rows else (data.get("closes") or [])
@@ -6400,10 +8150,431 @@ def _refresh_position_bbi(state: dict[str, Any], dt: datetime | None = None) -> 
                 pos["luzhu_half_signal"] = bool(luzhu)
                 if luzhu:
                     pos["luzhu_half_detail"] = luzhu
-        except Exception:
+        except Exception as exc:
+            if evaluate_prompt_exits and pos.get("prompt_strategy_version_id"):
+                pos["prompt_strategy_exit_status"] = "unknown"
+                pos["prompt_strategy_exit_error"] = type(exc).__name__
+                pos["prompt_strategy_exit_checked_at"] = (
+                    (dt or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
+                )
             continue
 
+
+def _refresh_frozen_prompt_position_exits(
+    state: dict[str, Any],
+    dt: datetime,
+) -> None:
+    positions = state.get("positions") or {}
+    prompt_positions = {
+        code: pos
+        for code, pos in positions.items()
+        if isinstance(pos, dict)
+        and position_qty(pos) > 0
+        and position_entry_strategy(pos) == STRATEGY_SOURCE_PRESET_TEXT
+        and pos.get("prompt_strategy_version_id")
+    }
+    if not prompt_positions:
+        return
+    prompt_state = dict(state)
+    prompt_state["positions"] = prompt_positions
+    _refresh_position_bbi(
+        prompt_state,
+        dt,
+        evaluate_prompt_exits=True,
+    )
+
 AUTO_EXIT_PERSISTENCE_STATUS_KEY = "_auto_exit_persistence_status"
+AUTO_EXIT_ELIGIBLE_CODES_KEY = "_auto_exit_eligible_codes"
+AUTO_EXIT_REFRESH_BASELINE_KEY = "_auto_exit_refresh_baseline"
+POSITION_LIFECYCLE_ID_FIELD = "position_lifecycle_id"
+AUTO_EXIT_COMPLETED_KEYS_FIELD = "auto_exit_completed_idempotency_keys"
+AUTO_EXIT_IDEMPOTENCY_VERSION = "auto-exit-v1"
+POSITION_LIFECYCLE_VERSION = "position-lifecycle-v1"
+AUTO_EXIT_COMPLETED_KEYS_LIMIT = 32
+AUTO_EXIT_PARTIAL_SIGNALS = frozenset({
+    "luzhu_half",
+    "shaofu_soft_reduce",
+    "niu_lifecycle_climax_partial",
+    "niu_r_partial",
+    "niu_2r_partial",
+    "tide_2r_partial",
+    "niu_markup_rebalance_partial",
+    "partial_take_profit",
+})
+AUTO_EXIT_MONOTONIC_BOOL_FIELDS = frozenset({
+    "partial_tp_done",
+    "sell_score_half_done",
+    "luzhu_half_done",
+    "shaofu_soft_exit_reduced",
+    "niuone_lifecycle_climax_partial_done",
+})
+AUTO_EXIT_LAST_EVENT_FIELDS = (
+    "last_exit_rule",
+    "last_exit_label",
+    "last_exit_reason",
+    "last_exit_marked_at",
+    "last_exit_strategy_mark",
+)
+_AUTO_EXIT_ACCOUNT_POSITION_FIELDS = frozenset({
+    "avg_cost",
+    AUTO_EXIT_COMPLETED_KEYS_FIELD,
+    "buy_date_lots",
+    POSITION_LIFECYCLE_ID_FIELD,
+    "qty",
+    "shares",
+})
+_AUTO_EXIT_REFRESH_META_FIELDS = (
+    "last_quote_refresh",
+    "last_intraday_refresh",
+)
+
+
+def _stable_identity(prefix: str, value: Mapping[str, Any]) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return f"{prefix}:{hashlib.sha256(payload.encode('utf-8')).hexdigest()}"
+
+
+def _new_position_lifecycle_id(
+    code: str,
+    opened_at: str,
+    account_created_at: str = "",
+) -> str:
+    return _stable_identity(
+        POSITION_LIFECYCLE_VERSION,
+        {
+            "code": normalize_code(code),
+            "opened_at": str(opened_at or ""),
+            "account_created_at": str(account_created_at or ""),
+        },
+    )
+
+
+def _position_cycle_trades(
+    state: Mapping[str, Any],
+    code: str,
+) -> list[dict[str, Any]]:
+    """Return retained, accounted fills from the latest opening cycle."""
+    normalized = normalize_code(code)
+    rows = sorted(
+        (
+            trade
+            for trade in (state.get("trade_log") or [])
+            if isinstance(trade, dict)
+            and trade_counts_for_account(trade)
+            and normalize_code(trade.get("code") or "") == normalized
+        ),
+        key=lambda trade: str(trade.get("time") or ""),
+    )
+    opening_index: int | None = None
+    last_full_close_index = -1
+    running_qty = 0
+    quantity_known = False
+    for index, trade in enumerate(rows):
+        action = str(trade.get("action") or "").upper()
+        before_qty = trade.get("position_before_qty")
+        after_qty = trade.get("position_after_qty")
+        explicit_before = (
+            before_qty is not None and not isinstance(before_qty, bool)
+        )
+        explicit_after = after_qty is not None and not isinstance(after_qty, bool)
+        shares = max(0, int(_safe_float(trade.get("shares"), 0.0)))
+        if action == "BUY":
+            resolved_before = (
+                max(0, int(_safe_float(before_qty, 0.0)))
+                if explicit_before
+                else running_qty
+            )
+            if trade.get("position_opened") is True or resolved_before <= 0:
+                opening_index = index
+            running_qty = (
+                max(0, int(_safe_float(after_qty, 0.0)))
+                if explicit_after
+                else resolved_before + shares
+            )
+            quantity_known = True
+            continue
+        if action != "SELL":
+            continue
+        resolved_before = (
+            max(0, int(_safe_float(before_qty, 0.0)))
+            if explicit_before
+            else running_qty
+        )
+        resolved_after = (
+            max(0, int(_safe_float(after_qty, 0.0)))
+            if explicit_after
+            else max(0, resolved_before - shares)
+        )
+        explicit_close = trade.get("position_fully_closed") is True
+        if explicit_close or (
+            (quantity_known or explicit_before or explicit_after)
+            and resolved_after <= 0
+        ):
+            last_full_close_index = index
+            opening_index = None
+        running_qty = resolved_after
+        quantity_known = quantity_known or explicit_before or explicit_after
+    if opening_index is not None:
+        return rows[opening_index:]
+    return rows[last_full_close_index + 1:]
+
+
+def _ensure_position_lifecycle_id(
+    state: Mapping[str, Any],
+    code: str,
+    position: dict[str, Any],
+    durable_lifecycle_id: str = "",
+) -> tuple[str, list[dict[str, Any]]]:
+    cycle_trades = _position_cycle_trades(state, code)
+    lifecycle_id = str(position.get(POSITION_LIFECYCLE_ID_FIELD) or "")
+    lifecycle_id = lifecycle_id or str(durable_lifecycle_id or "")
+    if not lifecycle_id:
+        opening_trade = next(
+            (
+                trade
+                for trade in cycle_trades
+                if str(trade.get("action") or "").upper() == "BUY"
+            ),
+            None,
+        )
+        if opening_trade is not None:
+            lifecycle_id = str(
+                opening_trade.get(POSITION_LIFECYCLE_ID_FIELD) or ""
+            )
+            if not lifecycle_id:
+                lifecycle_id = _stable_identity(
+                    POSITION_LIFECYCLE_VERSION,
+                    {
+                        "code": normalize_code(code),
+                        "time": str(opening_trade.get("time") or ""),
+                        "shares": opening_trade.get("shares"),
+                        "price": opening_trade.get("price"),
+                    },
+                )
+        if not lifecycle_id:
+            lots = position.get("buy_date_lots")
+            lot_dates = (
+                sorted(str(day) for day in lots)
+                if isinstance(lots, Mapping)
+                else []
+            )
+            lifecycle_id = _stable_identity(
+                POSITION_LIFECYCLE_VERSION,
+                {
+                    "code": normalize_code(code),
+                    "entry_anchor": str(
+                        position.get("position_opened_at")
+                        or position.get("entry_signal_generated_at")
+                        or position.get("strategy_marked_at")
+                        or (lot_dates[0] if lot_dates else "legacy-open")
+                    ),
+                    "entry_strategy": position_entry_strategy(position),
+                },
+            )
+    position[POSITION_LIFECYCLE_ID_FIELD] = lifecycle_id
+    return lifecycle_id, cycle_trades
+
+
+def _bounded_auto_exit_keys(values: Any) -> list[str]:
+    keys: list[str] = []
+    iterable = (
+        values
+        if isinstance(values, (list, tuple, set, frozenset))
+        else []
+    )
+    for value in iterable:
+        key = str(value or "")
+        if key and key not in keys:
+            keys.append(key)
+    return keys[-AUTO_EXIT_COMPLETED_KEYS_LIMIT:]
+
+
+def _remember_auto_exit_key(position: dict[str, Any], key: str) -> None:
+    keys = _bounded_auto_exit_keys(position.get(AUTO_EXIT_COMPLETED_KEYS_FIELD))
+    if key and key not in keys:
+        keys.append(key)
+    position[AUTO_EXIT_COMPLETED_KEYS_FIELD] = keys[-AUTO_EXIT_COMPLETED_KEYS_LIMIT:]
+
+
+def _restore_auto_exit_markers(
+    position: dict[str, Any],
+    evidence: Mapping[str, Any],
+) -> None:
+    signal = str(
+        evidence.get("exit_signal")
+        or evidence.get("signal")
+        or evidence.get("source_signal")
+        or ""
+    )
+    if signal == "sell_score_reduce":
+        position["sell_score_half_done"] = True
+    if signal == "luzhu_half":
+        position["luzhu_half_done"] = True
+    if signal == "shaofu_soft_reduce":
+        position["shaofu_soft_exit_reduced"] = True
+    if signal == "niu_lifecycle_climax_partial":
+        position["niuone_lifecycle_climax_partial_done"] = True
+    if signal in {"niu_r_partial", "niu_2r_partial"}:
+        position["niuone_markup_rebalance_reduced"] = True
+    if signal in AUTO_EXIT_PARTIAL_SIGNALS:
+        position["partial_tp_done"] = True
+    if str(evidence.get("soft_exit_stage") or "") == "reduce":
+        position["soft_exit_reduced"] = True
+        position["soft_exit_status"] = "runner"
+    key = str(evidence.get("idempotency_key") or "")
+    if key:
+        _remember_auto_exit_key(position, key)
+
+
+def _recover_auto_exit_guards(
+    position: dict[str, Any],
+    lifecycle_id: str,
+    cycle_trades: list[dict[str, Any]],
+) -> set[str]:
+    keys = set(_bounded_auto_exit_keys(
+        position.get(AUTO_EXIT_COMPLETED_KEYS_FIELD)
+    ))
+    for trade in cycle_trades:
+        if str(trade.get("action") or "").upper() != "SELL":
+            continue
+        trade_lifecycle = str(trade.get(POSITION_LIFECYCLE_ID_FIELD) or "")
+        if trade_lifecycle and trade_lifecycle != lifecycle_id:
+            continue
+        _restore_auto_exit_markers(position, trade)
+        key = str(trade.get("idempotency_key") or "")
+        if key:
+            keys.add(key)
+    position[AUTO_EXIT_COMPLETED_KEYS_FIELD] = _bounded_auto_exit_keys(keys)
+    return keys
+
+
+def _auto_exit_idempotency_key(
+    code: str,
+    position: Mapping[str, Any],
+    lifecycle_id: str,
+    signal: Mapping[str, Any],
+) -> str:
+    signal_name = str(
+        signal.get("signal")
+        or signal.get("source_signal")
+        or signal.get("exit_rule")
+        or "unknown_exit"
+    )
+    cycle = "single"
+    if signal_name == "niu_markup_rebalance_partial":
+        cycle = str(
+            int(position.get("niuone_markup_rebalance_trim_count") or 0) + 1
+        )
+    return _stable_identity(
+        AUTO_EXIT_IDEMPOTENCY_VERSION,
+        {
+            "code": normalize_code(code),
+            "position_lifecycle_id": lifecycle_id,
+            "signal": signal_name,
+            "soft_exit_stage": str(signal.get("soft_exit_stage") or ""),
+            "cycle": cycle,
+        },
+    )
+
+
+def _durable_trade_idempotency_keys(state: Mapping[str, Any]) -> set[str]:
+    keys = {
+        str(trade.get("idempotency_key") or "")
+        for trade in (state.get("trade_log") or [])
+        if isinstance(trade, Mapping)
+        and trade_counts_for_account(trade)
+        and str(trade.get("idempotency_key") or "")
+    }
+    try:
+        from niuniu_db import query_trade_idempotency_keys as _query_keys
+
+        keys.update(_query_keys())
+    except Exception as exc:
+        print(
+            "[WARN] 成交幂等键读取失败，使用账户 JSON 防重: "
+            f"{type(exc).__name__}",
+            flush=True,
+        )
+    return keys
+
+
+def _durable_position_lifecycle_ids(codes: list[str]) -> dict[str, str]:
+    try:
+        from niuniu_db import query_latest_position_lifecycle_ids as _query_ids
+
+        return {
+            normalize_code(code): str(lifecycle_id)
+            for code, lifecycle_id in _query_ids(codes).items()
+            if normalize_code(code) and str(lifecycle_id or "")
+        }
+    except Exception as exc:
+        print(
+            "[WARN] 持仓周期读取失败，使用账户 JSON 恢复: "
+            f"{type(exc).__name__}",
+            flush=True,
+        )
+        return {}
+
+
+def _merge_position_auto_exit_guards(
+    state: dict[str, Any],
+    current: Mapping[str, Any],
+) -> None:
+    """Keep monotonic execution guards when a stale snapshot is saved."""
+    current_positions = {
+        normalize_code(code): position
+        for code, position in (current.get("positions") or {}).items()
+        if isinstance(position, Mapping) and normalize_code(code)
+    }
+    for code, position in (state.get("positions") or {}).items():
+        if not isinstance(position, dict):
+            continue
+        persisted = current_positions.get(normalize_code(code))
+        if persisted is None:
+            continue
+        incoming_lifecycle = str(position.get(POSITION_LIFECYCLE_ID_FIELD) or "")
+        persisted_lifecycle = str(
+            persisted.get(POSITION_LIFECYCLE_ID_FIELD) or ""
+        )
+        if (
+            incoming_lifecycle
+            and persisted_lifecycle
+            and incoming_lifecycle != persisted_lifecycle
+        ):
+            continue
+        if persisted_lifecycle and not incoming_lifecycle:
+            position[POSITION_LIFECYCLE_ID_FIELD] = persisted_lifecycle
+        merged_keys = _bounded_auto_exit_keys([
+            *_bounded_auto_exit_keys(
+                persisted.get(AUTO_EXIT_COMPLETED_KEYS_FIELD)
+            ),
+            *_bounded_auto_exit_keys(position.get(AUTO_EXIT_COMPLETED_KEYS_FIELD)),
+        ])
+        if merged_keys:
+            position[AUTO_EXIT_COMPLETED_KEYS_FIELD] = merged_keys
+        for field in AUTO_EXIT_MONOTONIC_BOOL_FIELDS:
+            if persisted.get(field) is True:
+                position[field] = True
+        for field in AUTO_EXIT_LAST_EVENT_FIELDS:
+            if field not in position and field in persisted:
+                position[field] = copy.deepcopy(persisted[field])
+
+
+def _auto_exit_refresh_baseline(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Capture only fields needed to distinguish refresh deltas from stale state."""
+    baseline = {
+        "positions": copy.deepcopy(state.get("positions") or {}),
+    }
+    for field in _AUTO_EXIT_REFRESH_META_FIELDS:
+        if field in state:
+            baseline[field] = copy.deepcopy(state[field])
+    return baseline
 
 
 def _default_persistence_status() -> dict[str, bool]:
@@ -6427,6 +8598,128 @@ def _pop_auto_exit_persistence_status(
     }
 
 
+def _position_account_identity(position: Mapping[str, Any]) -> tuple[Any, ...]:
+    try:
+        qty = int(position.get("qty") or position.get("shares") or 0)
+    except (TypeError, ValueError):
+        qty = 0
+    raw_lots = position.get("buy_date_lots")
+    lots: list[tuple[str, int]] = []
+    if isinstance(raw_lots, Mapping):
+        for day, raw_qty in raw_lots.items():
+            try:
+                lot_qty = int(raw_qty or 0)
+            except (TypeError, ValueError):
+                lot_qty = 0
+            lots.append((str(day), lot_qty))
+    return (
+        qty,
+        round(_safe_float(position.get("avg_cost"), 0.0), 8),
+        tuple(sorted(lots)),
+    )
+
+
+def _merge_refreshed_auto_exit_context(
+    canonical_state: dict[str, Any],
+    refreshed_state: Mapping[str, Any],
+    refresh_baseline: Mapping[str, Any],
+) -> set[str]:
+    """Carry quote/rule inputs onto unchanged canonical positions."""
+    canonical_positions = {
+        normalize_code(code): position
+        for code, position in (canonical_state.get("positions") or {}).items()
+        if isinstance(position, dict) and normalize_code(code)
+    }
+    refreshed_positions = {
+        normalize_code(code): position
+        for code, position in (refreshed_state.get("positions") or {}).items()
+        if isinstance(position, Mapping) and normalize_code(code)
+    }
+    baseline_positions = {
+        normalize_code(code): position
+        for code, position in (refresh_baseline.get("positions") or {}).items()
+        if isinstance(position, Mapping) and normalize_code(code)
+    }
+    eligible_codes: set[str] = set()
+    for code, refreshed_position in refreshed_positions.items():
+        canonical_position = canonical_positions.get(code)
+        if canonical_position is None:
+            continue
+        if _position_account_identity(canonical_position) != _position_account_identity(
+            refreshed_position
+        ):
+            continue
+        baseline_position = baseline_positions.get(code)
+        if baseline_position is None:
+            continue
+        for field in set(baseline_position) | set(refreshed_position):
+            if field not in _AUTO_EXIT_ACCOUNT_POSITION_FIELDS:
+                baseline_has_field = field in baseline_position
+                refreshed_has_field = field in refreshed_position
+                if (
+                    baseline_has_field == refreshed_has_field
+                    and baseline_position.get(field) == refreshed_position.get(field)
+                ):
+                    continue
+                if refreshed_has_field:
+                    canonical_position[field] = copy.deepcopy(
+                        refreshed_position[field]
+                    )
+                else:
+                    canonical_position.pop(field, None)
+        eligible_codes.add(code)
+
+    for field in _AUTO_EXIT_REFRESH_META_FIELDS:
+        baseline_has_field = field in refresh_baseline
+        refreshed_has_field = field in refreshed_state
+        if (
+            baseline_has_field == refreshed_has_field
+            and refresh_baseline.get(field) == refreshed_state.get(field)
+        ):
+            continue
+        if refreshed_has_field:
+            canonical_state[field] = copy.deepcopy(refreshed_state[field])
+        else:
+            canonical_state.pop(field, None)
+    return eligible_codes
+
+
+def _commit_refreshed_auto_exits(
+    refreshed_state: Mapping[str, Any],
+    refresh_baseline: Mapping[str, Any],
+    dt: datetime,
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, bool]]:
+    """Re-read, evaluate, and persist auto exits in one account transaction."""
+    with state_file_write_lock():
+        canonical_state = load_state()
+        eligible_codes = _merge_refreshed_auto_exit_context(
+            canonical_state,
+            refreshed_state,
+            refresh_baseline,
+        )
+        canonical_state.pop(AUTO_EXIT_PERSISTENCE_STATUS_KEY, None)
+        canonical_state[AUTO_EXIT_ELIGIBLE_CODES_KEY] = sorted(eligible_codes)
+        decision_log_size = len(canonical_state.get("decision_log") or [])
+        try:
+            executed = check_auto_exits(canonical_state, dt)
+        finally:
+            canonical_state.pop(AUTO_EXIT_ELIGIBLE_CODES_KEY, None)
+        new_decisions = [
+            entry
+            for entry in (canonical_state.get("decision_log") or [])[decision_log_size:]
+            if isinstance(entry, dict)
+        ]
+        canonical_state.pop(AUTO_EXIT_PERSISTENCE_STATUS_KEY, None)
+        record_equity(canonical_state)
+        save_state(canonical_state)
+        persistence_status = _sync_committed_account_projections(
+            canonical_state,
+            trades=executed,
+            decisions=new_decisions,
+        )
+    return canonical_state, executed, persistence_status
+
+
 def check_auto_exits(
     state: dict[str, Any],
     dt: datetime | None = None,
@@ -6446,17 +8739,49 @@ def check_auto_exits(
     positions = state.get("positions") or {}
     if not positions:
         return []
+    durable_idempotency_keys = _durable_trade_idempotency_keys(state)
+    durable_lifecycle_ids = _durable_position_lifecycle_ids([
+        normalize_code(code)
+        for code in positions
+        if normalize_code(code)
+    ])
+    eligible_raw = state.get(AUTO_EXIT_ELIGIBLE_CODES_KEY)
+    eligible_codes = (
+        {
+            normalize_code(code)
+            for code in eligible_raw
+            if normalize_code(code)
+        }
+        if isinstance(eligible_raw, (list, tuple, set, frozenset))
+        else None
+    )
     
     today = check_dt.strftime("%Y-%m-%d")
     time_exit_allowed = is_time_exit_check_time(check_dt)
     b3_exit_allowed = is_b3_exit_check_time(check_dt)
     soft_exit_allowed = is_shaofu_soft_exit_check_time(check_dt)
     soft_exit_confirmation_key = check_dt.strftime("%Y-%m-%d %H:%M")
+    feedback_policy = current_exit_feedback_policy(state)
     executed = []
     cash = float(state.get("cash") or 0)
     
     for code in list(positions.keys()):
+        if eligible_codes is not None and normalize_code(code) not in eligible_codes:
+            continue
         pos = positions[code]
+        position_lifecycle_id, cycle_trades = _ensure_position_lifecycle_id(
+            state,
+            code,
+            pos,
+            durable_lifecycle_ids.get(normalize_code(code), ""),
+        )
+        durable_idempotency_keys.update(
+            _recover_auto_exit_guards(
+                pos,
+                position_lifecycle_id,
+                cycle_trades,
+            )
+        )
         sellable = available_to_sell(pos, today)
         if sellable <= 0:
             continue
@@ -6477,6 +8802,7 @@ def check_auto_exits(
             b3_exit_allowed=b3_exit_allowed,
             soft_exit_allowed=soft_exit_allowed,
             soft_exit_confirmation_key=soft_exit_confirmation_key,
+            exit_feedback_policy=feedback_policy,
         )
         if not exit_signal:
             continue
@@ -6486,7 +8812,48 @@ def check_auto_exits(
             or latest_buy_strategy_for_code(state, code)
             or classify_buy_strategy(str(pos.get("entry_reason") or ""))
         )
-        exit_rule = classify_exit_rule(exit_reason, str(exit_signal.get("signal") or ""))
+        if (
+            entry_strategy == STRATEGY_SOURCE_PRESET_TEXT
+            and pos.get("prompt_strategy_version_id")
+        ):
+            prompt_exit_error = validate_versioned_prompt_exit_evidence(code, pos)
+            if prompt_exit_error:
+                pos["prompt_strategy_exit_error"] = prompt_exit_error
+                continue
+            pos.pop("prompt_strategy_exit_error", None)
+        exit_rule = str(exit_signal.get("exit_rule") or "").strip() or classify_exit_rule(
+            exit_reason,
+            str(exit_signal.get("signal") or ""),
+        )
+        auto_exit_idempotency_key = _auto_exit_idempotency_key(
+            code,
+            pos,
+            position_lifecycle_id,
+            {**exit_signal, "exit_rule": exit_rule},
+        )
+        if auto_exit_idempotency_key in durable_idempotency_keys:
+            _restore_auto_exit_markers(
+                pos,
+                {
+                    **exit_signal,
+                    "exit_signal": exit_signal.get("signal") or "",
+                    "idempotency_key": auto_exit_idempotency_key,
+                },
+            )
+            previous_block = state.get("last_auto_exit_duplicate_block")
+            if not isinstance(previous_block, Mapping) or str(
+                previous_block.get("idempotency_key") or ""
+            ) != auto_exit_idempotency_key:
+                state["auto_exit_duplicate_block_count"] = int(
+                    state.get("auto_exit_duplicate_block_count") or 0
+                ) + 1
+            state["last_auto_exit_duplicate_block"] = {
+                "time": now_ts(),
+                "code": normalize_code(code),
+                "signal": str(exit_signal.get("signal") or ""),
+                "idempotency_key": auto_exit_idempotency_key,
+            }
+            continue
         trade_time = now_ts()
         niuone_entry_context = (
             niuone_entry_context_from_position(pos)
@@ -6504,9 +8871,19 @@ def check_auto_exits(
         sell_ratio = float(exit_signal.get("sell_ratio") or 1.0)
         
         # 执行卖出
-        qty = min(sellable, position_qty(pos))
+        position_before_qty = position_qty(pos)
+        qty = min(sellable, position_before_qty)
         if sell_ratio < 1.0:
+            if (
+                exit_signal.get("soft_exit_stage") == "reduce"
+                and qty < 200
+            ):
+                pos["soft_exit_reduction_deferred"] = True
+                pos["soft_exit_status"] = "board_lot_runner_hold"
+                continue
             qty = max(100, int(qty * sell_ratio) // 100 * 100)
+            if exit_signal.get("soft_exit_stage") == "reduce":
+                pos["soft_exit_reduced"] = True
             if exit_signal.get("signal") == "sell_score_reduce":
                 pos["sell_score_half_done"] = True
             if exit_signal.get("signal") == "luzhu_half":
@@ -6557,10 +8934,22 @@ def check_auto_exits(
                         "niu_markup_rebalance_partial"
                     ),
                 })
-            pos["partial_tp_done"] = True
+            if exit_signal.get("signal") in {
+                "luzhu_half",
+                "shaofu_soft_reduce",
+                "niu_lifecycle_climax_partial",
+                "niu_r_partial",
+                "niu_2r_partial",
+                "tide_2r_partial",
+                "niu_markup_rebalance_partial",
+                "partial_take_profit",
+            }:
+                pos["partial_tp_done"] = True
         qty = qty // 100 * 100
         if qty <= 0:
             continue
+        _remember_auto_exit_key(pos, auto_exit_idempotency_key)
+        durable_idempotency_keys.add(auto_exit_idempotency_key)
         total_equity = portfolio_total_equity_for_limits(cash, positions)
         current_position_value = position_market_value(pos, float(price))
         current_market_value = portfolio_market_value(positions)
@@ -6579,6 +8968,17 @@ def check_auto_exits(
         cost_basis = qty * avg_cost
         realized_pnl = net_proceeds - cost_basis
         realized_pnl_pct = (realized_pnl / cost_basis * 100) if cost_basis > 0 else 0.0
+        day_reference_price = _safe_float(pos.get("prev_close"), 0.0)
+        day_pnl = (
+            net_proceeds - qty * day_reference_price
+            if day_reference_price > 0
+            else None
+        )
+        day_pnl_pct = (
+            day_pnl / (qty * day_reference_price) * 100
+            if day_pnl is not None and qty > 0
+            else None
+        )
         
         pos["qty"] = position_qty(pos) - qty
         pos.pop("shares", None)
@@ -6595,7 +8995,26 @@ def check_auto_exits(
             if lots[date] <= 0:
                 lots.pop(date, None)
         
-        if pos["qty"] <= 0:
+        position_closed = pos["qty"] <= 0
+        post_exit_watch_created = False
+        if position_closed and exit_signal.get("soft_exit_stage") == "exit":
+            _create_post_exit_reentry_watch(
+                state,
+                code=code,
+                position=pos,
+                exit_date=today,
+                exit_price=float(price),
+                buy_strategy=entry_strategy,
+                exit_signal=str(exit_signal.get("signal") or ""),
+            )
+            post_exit_watch_created = True
+        prompt_binding_release_error = ""
+        if position_closed and pos.get("prompt_strategy_version_id"):
+            try:
+                PromptStrategyStore().release_position(code)
+            except Exception as exc:
+                prompt_binding_release_error = type(exc).__name__
+        if position_closed:
             positions.pop(code, None)
         cash += net_proceeds
         
@@ -6614,17 +9033,36 @@ def check_auto_exits(
             "net_proceeds": round(net_proceeds, 2),
             "pnl": round(realized_pnl, 2),
             "pnl_pct": round(realized_pnl_pct, 2),
+            "day_reference_price": day_reference_price if day_reference_price > 0 else None,
+            "day_pnl": round(day_pnl, 2) if day_pnl is not None else None,
+            "day_pnl_pct": round(day_pnl_pct, 2) if day_pnl_pct is not None else None,
             "order_position_pct": order_position_pct,
             "position_before_trade_pct": position_before_trade_pct,
             "position_after_trade_pct": position_after_trade_pct,
             "total_position_after_trade_pct": total_position_after_trade_pct,
+            "position_before_qty": position_before_qty,
+            "position_after_qty": max(0, position_before_qty - qty),
+            "position_fully_closed": position_closed,
+            "position_lifecycle_id": position_lifecycle_id,
+            "idempotency_key": auto_exit_idempotency_key,
             "exit_signal": exit_signal.get("signal") or "",
             "buy_strategy": entry_strategy,
             "exit_rule": exit_rule,
             "strategy_mark": entry_mark,
             "exit_strategy_mark": exit_mark,
             "reason": exit_reason,
+            "post_exit_reentry_watch_created": post_exit_watch_created,
         }
+        executed_trade.update(exit_feedback_trade_audit(state))
+        for key in (
+            "niuone_hard_exit_evidence",
+            "soft_exit_stage",
+            "soft_exit_confirmation_count",
+            "soft_exit_confirmations_required",
+            "source_signal",
+        ):
+            if key in exit_signal:
+                executed_trade[key] = _json_safe_copy(exit_signal[key])
         if niuone_entry_context:
             executed_trade["niuone_entry_context"] = dict(
                 niuone_entry_context
@@ -6633,15 +9071,36 @@ def check_auto_exits(
             executed_trade["niuone_lifecycle_evidence"] = dict(
                 niuone_lifecycle_evidence
             )
+        if entry_strategy == STRATEGY_SOURCE_PRESET_TEXT and pos.get(
+            "prompt_strategy_version_id"
+        ):
+            executed_trade.update({
+                "prompt_strategy_version_id": str(
+                    pos.get("prompt_strategy_version_id") or ""
+                ),
+                "prompt_strategy_plan_sha256": str(
+                    pos.get("prompt_strategy_plan_sha256") or ""
+                ),
+                "prompt_strategy_exit_evaluation_id": str(
+                    pos.get("prompt_strategy_exit_evaluation_id") or ""
+                ),
+                "prompt_strategy_exit_audit_sha256": str(
+                    pos.get("prompt_strategy_exit_audit_sha256") or ""
+                ),
+                "prompt_strategy_binding_released": (
+                    position_closed and not prompt_binding_release_error
+                ),
+            })
+            if prompt_binding_release_error:
+                executed_trade["prompt_strategy_binding_release_error"] = (
+                    prompt_binding_release_error
+                )
         executed.append(executed_trade)
     
     if executed:
         state["cash"] = round(cash, 2)
         state.setdefault("trade_log", []).extend(executed)
         del state["trade_log"][:-TRADE_LOG_LIMIT]
-        trades_persisted = _sync_trades_to_db(executed)
-        if trades_persisted:
-            _sync_positions_to_db(state)
         # 记录系统自动退出决策
         log_entry = {
             "time": now_ts(),
@@ -6657,15 +9116,7 @@ def check_auto_exits(
             "executed": executed,
         }
         state.setdefault("decision_log", []).append(log_entry)
-        decision_persisted = _sync_decision_to_db(log_entry)
-        state[AUTO_EXIT_PERSISTENCE_STATUS_KEY] = {
-            "trades_persisted": trades_persisted,
-            "decision_persisted": decision_persisted,
-            "durable_evidence_persisted": (
-                trades_persisted and decision_persisted
-            ),
-        }
-    
+
     return executed
 
 
@@ -6673,6 +9124,7 @@ def run_auto_exits_once(dt: datetime | None = None) -> dict[str, Any]:
     """Run the side-effectful automatic exit script once for scheduled checks."""
     dt = dt or datetime.now()
     state = load_state()
+    refresh_baseline = _auto_exit_refresh_baseline(state)
     strategy_payload = load_latest_sector_tide_payload()
     sync_sector_tide_position_context(state, strategy_payload)
     sync_niuone_position_context(state, strategy_payload)
@@ -6680,12 +9132,14 @@ def run_auto_exits_once(dt: datetime | None = None) -> dict[str, Any]:
     refresh_realtime_prices(state)
     refresh_position_intraday(state)
     _refresh_position_bbi(state, dt)
+    _refresh_frozen_prompt_position_exits(state, dt)
     update_zettaranc_volume_context(state, dt)
-    state.pop(AUTO_EXIT_PERSISTENCE_STATUS_KEY, None)
-    executed = check_auto_exits(state, dt)
-    persistence_status = _pop_auto_exit_persistence_status(state)
-    record_equity(state)
-    save_state(state)
+    state, executed, persistence_status = _commit_refreshed_auto_exits(
+        state,
+        refresh_baseline,
+        dt,
+    )
+    executed = _accounted_trade_executions(executed)
     if executed:
         _notify_trade_executions_safely(executed)
     return {
@@ -6709,11 +9163,26 @@ def run_position_exit_checks_before_decision(
     if not any(isinstance(pos, dict) and position_qty(pos) > 0 for pos in positions.values()):
         return []
     current = dt or datetime.now()
+    baseline_value = state.pop(AUTO_EXIT_REFRESH_BASELINE_KEY, None)
+    refresh_baseline = (
+        baseline_value
+        if isinstance(baseline_value, Mapping)
+        else _auto_exit_refresh_baseline(state)
+    )
     refresh_realtime_prices(state)
     refresh_position_intraday(state)
     _refresh_position_bbi(state, current)
+    _refresh_frozen_prompt_position_exits(state, current)
     update_zettaranc_volume_context(state, current)
-    return check_auto_exits(state, current)
+    canonical_state, executed, persistence_status = _commit_refreshed_auto_exits(
+        state,
+        refresh_baseline,
+        current,
+    )
+    state.clear()
+    state.update(canonical_state)
+    state[AUTO_EXIT_PERSISTENCE_STATUS_KEY] = persistence_status
+    return executed
 
 
 def maybe_record_session_equity_heartbeat(min_interval_seconds: int = EQUITY_HEARTBEAT_MIN_SECONDS) -> bool:
@@ -6739,6 +9208,7 @@ def maybe_record_session_equity_heartbeat(min_interval_seconds: int = EQUITY_HEA
             "updated": 0,
             "error": f"{type(exc).__name__}: {exc}",
         }
+    refresh_today_sold_stocks(refreshed_state)
 
     # Re-read under the cross-process write lock after the network call. A trade
     # may have committed while quotes were loading; its same-minute point must
@@ -6759,14 +9229,22 @@ def maybe_record_session_equity_heartbeat(min_interval_seconds: int = EQUITY_HEA
                 save_state(state)
             return False
         apply_realtime_price_snapshot(state, refreshed_state)
+        apply_today_sold_quote_snapshot(
+            state,
+            refreshed_state,
+            today=commit_now.strftime("%Y-%m-%d"),
+        )
         recorded = record_equity(state)
         save_state(state)
         return recorded
 
 
 def load_crossdesk_config(base_url_env: str = "", api_key_env: str = "") -> tuple[str, str]:
-    env_base_url = os.environ.get(base_url_env) if base_url_env else ""
-    env_api_key = os.environ.get(api_key_env) if api_key_env else ""
+    shared = resolve_shared_model_config(os.environ)
+    env_base_url = shared.base_url if base_url_env == "DASHBOARD_DECISION_BASE_URL" else ""
+    env_api_key = shared.api_key if api_key_env == "DASHBOARD_DECISION_API_KEY" else ""
+    env_base_url = env_base_url or (os.environ.get(base_url_env) if base_url_env else "")
+    env_api_key = env_api_key or (os.environ.get(api_key_env) if api_key_env else "")
     env_base_url = env_base_url or os.environ.get("CROSSDESK_BASE_URL")
     env_api_key = env_api_key or os.environ.get("CROSSDESK_API_KEY")
     if env_base_url and env_api_key:
@@ -6840,6 +9318,37 @@ def parse_chat_completion_content(raw: str) -> tuple[str, str]:
     return parsed.content, parsed.detail
 
 
+def increased_model_output_limit(current_max: Any) -> int:
+    """Double a positive output limit up to the decision retry ceiling.
+
+    A caller that explicitly starts above the automatic ceiling keeps its
+    larger value so a retry can never reduce the configured output budget.
+    """
+    try:
+        current = int(current_max or 0)
+    except (TypeError, ValueError):
+        return 0
+    if current <= 0 or current >= DECISION_RETRY_MAX_TOKENS:
+        return current
+    return min(
+        DECISION_RETRY_MAX_TOKENS,
+        max(current + 2_000, current * 2),
+    )
+
+
+def decision_json_response_format(model_name: str) -> dict[str, str] | None:
+    """Use native JSON mode only for model IDs known to support it."""
+    normalized = str(model_name or "").strip().lower()
+    if normalized in {
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
+        "deepseek-v4-flash-vision-exp",
+    }:
+        return {"type": "json_object"}
+    return None
+
+
+@budgeted_model_call
 def request_chat_content(
     base_url: str,
     api_key: str,
@@ -6848,7 +9357,8 @@ def request_chat_content(
     max_retries: int = 3,
     timeout: int = 60,
     *,
-    api_mode: str = "chat",
+    api_mode: str = "auto",
+    stream_mode: str | None = None,
     tools: list[dict[str, Any]] | None = None,
     reasoning: dict[str, Any] | None = None,
 ) -> str:
@@ -6856,7 +9366,9 @@ def request_chat_content(
     import time as _time
     last_err: Exception | None = None
     request_payload = {**payload, "model": model_name}
-    for attempt in range(max_retries):
+    transport_attempt = 0
+    transport_attempt_limit = max(1, max_retries)
+    while transport_attempt < transport_attempt_limit:
         try:
             model_request = build_model_request(
                 base_url,
@@ -6866,45 +9378,67 @@ def request_chat_content(
                 api_mode=api_mode,
                 tools=tools,
                 reasoning=reasoning,
+                reasoning_effort=str(request_payload.get("reasoning_effort") or ""),
                 stream=bool(request_payload.get("stream", False)),
                 extra_payload=request_payload,
             )
-            parsed = request_model(
+            parsed = request_model_complete(
                 model_request,
                 api_key,
-                timeout=timeout,
+                timeout=remaining_model_seconds(timeout),
+                stream_mode=stream_mode or DECISION_STREAM_MODE,
                 opener=urllib.request.urlopen,
             )
-            content, detail = parsed.content, parsed.detail
-            if not (content or "").strip():
-                if "finish_reason=length" in detail:
-                    current_max = int(request_payload.get("max_tokens") or 0)
-                    if current_max > 0:
-                        request_payload["max_tokens"] = min(12000, max(current_max + 2000, current_max * 2))
-                raise RuntimeError(f"model={model_name} returned empty content ({detail or 'no response metadata'})")
-            return content
+        except (ModelAdmissionError, ModelRequestExpired):
+            raise
         except urllib.error.HTTPError as exc:
             last_err = format_http_error(exc, model_name)
         except Exception as exc:
             last_err = exc
-        if attempt < max_retries - 1:
-            _time.sleep(2 ** attempt)
+        else:
+            content, detail = parsed.content, parsed.detail
+            if (content or "").strip():
+                return content
+            empty_error = RuntimeError(
+                f"model={model_name} returned empty content "
+                f"({detail or 'no response metadata'})"
+            )
+            if "finish_reason=length" in detail:
+                current_max = int(request_payload.get("max_tokens") or 0)
+                increased_max = increased_model_output_limit(current_max)
+                if increased_max > current_max:
+                    request_payload["max_tokens"] = increased_max
+                    continue
+                raise empty_error
+            last_err = empty_error
+        transport_attempt += 1
+        if transport_attempt < transport_attempt_limit:
+            delay = 2 ** (transport_attempt - 1)
+            if remaining_model_seconds(timeout) <= delay:
+                raise ModelRequestExpired("model_retry_deadline_exceeded")
+            _time.sleep(delay)
     raise last_err or RuntimeError(f"model={model_name} request failed")
 
 
+@budgeted_model_call
 def request_chat_json_object(
     base_url: str,
     api_key: str,
     payload: dict,
     model_name: str,
     *,
-    max_parse_attempts: int = 3,
+    max_parse_attempts: int = DECISION_JSON_MAX_PARSE_ATTEMPTS,
     timeout: int = 60,
+    stream_mode: str | None = None,
 ) -> dict[str, Any]:
     """Request a JSON object, retrying truncated/malformed non-empty responses."""
     request_payload = dict(payload)
     last_error: Exception | None = None
+    same_limit_retries = 0
     for attempt in range(max(1, max_parse_attempts)):
+        request_kwargs: dict[str, Any] = {}
+        if stream_mode is not None:
+            request_kwargs["stream_mode"] = stream_mode
         content = request_chat_content(
             base_url,
             api_key,
@@ -6912,6 +9446,7 @@ def request_chat_json_object(
             model_name,
             max_retries=3,
             timeout=timeout,
+            **request_kwargs,
         )
         try:
             result = extract_json(content)
@@ -6923,11 +9458,18 @@ def request_chat_json_object(
             if attempt >= max_parse_attempts - 1:
                 break
             current_max = int(request_payload.get("max_tokens") or 0)
-            if current_max > 0:
-                request_payload["max_tokens"] = min(12000, max(current_max + 2000, current_max * 2))
+            increased_max = increased_model_output_limit(current_max)
+            if increased_max > current_max:
+                request_payload["max_tokens"] = increased_max
+                continue
+            if same_limit_retries < DECISION_JSON_SAME_LIMIT_RETRIES:
+                same_limit_retries += 1
+                continue
+            break
     raise last_error or RuntimeError(f"model={model_name} did not return a JSON object")
 
 
+@budgeted_model_call
 def api_call_with_retry(base_url: str, api_key: str, payload: dict, max_retries: int = 3, timeout: int = 60) -> dict:
     """带重试的 API 调用。空响应/JSON解析失败时自动重试。"""
     import time as _time
@@ -6939,44 +9481,37 @@ def api_call_with_retry(base_url: str, api_key: str, payload: dict, max_retries:
                 str(payload.get("model") or ""),
                 list(payload.get("messages") or []),
                 max_tokens=int(payload.get("max_tokens") or 0) or None,
-                api_mode="chat",
+                api_mode="auto",
+                reasoning_effort=str(payload.get("reasoning_effort") or ""),
                 stream=bool(payload.get("stream", False)),
                 extra_payload=payload,
             )
             parsed = request_model(
                 model_request,
                 api_key,
-                timeout=timeout,
+                timeout=remaining_model_seconds(timeout),
                 opener=urllib.request.urlopen,
             )
             if parsed.data is None:
                 raise ValueError("空响应")
             return parsed.data
+        except (ModelAdmissionError, ModelRequestExpired):
+            raise
         except Exception as e:
             last_err = e
             if attempt < max_retries - 1:
+                if remaining_model_seconds(timeout) <= 2 ** attempt:
+                    raise ModelRequestExpired("model_retry_deadline_exceeded") from e
                 _time.sleep(2 ** attempt)  # 1s, 2s, 4s 退避
     raise last_err
 
 
-def load_news_precheck_config() -> tuple[str, str, str] | None:
-    base_url = os.environ.get("DASHBOARD_NEWS_BASE_URL", "").strip()
-    api_key = os.environ.get("DASHBOARD_NEWS_API_KEY", "").strip()
-    model = os.environ.get("DASHBOARD_NEWS_MODEL", "").strip()
-    if not any((base_url, api_key, model)):
-        return None
-    missing = [
-        label
-        for label, value in (
-            ("DASHBOARD_NEWS_BASE_URL", base_url),
-            ("DASHBOARD_NEWS_API_KEY", api_key),
-            ("DASHBOARD_NEWS_MODEL", model),
-        )
-        if not value
-    ]
-    if missing:
-        raise RuntimeError("消息面预检配置不完整：" + "、".join(missing))
-    return base_url.rstrip("/"), api_key, model
+def load_news_precheck_config() -> NewsPrecheckConfig | None:
+    try:
+        return NewsPrecheckConfig.from_mapping(os.environ)
+    except ValueError as exc:
+        detail = str(exc).split(":", 1)[-1]
+        raise RuntimeError("消息面预检配置不完整：" + detail) from exc
 
 
 def compact_portfolio_for_decision(portfolio: dict[str, Any]) -> dict[str, Any]:
@@ -6984,6 +9519,12 @@ def compact_portfolio_for_decision(portfolio: dict[str, Any]) -> dict[str, Any]:
     compact_positions = []
     for pos in portfolio.get("positions", []) or []:
         exit_state = pos.get("exit_state") or {}
+        entry_strategy = str(
+            pos.get("buy_strategy")
+            or pos.get("strategy_id")
+            or pos.get("initial_buy_strategy")
+            or ""
+        )
         compact_positions.append({
             "code": pos.get("code"),
             "name": pos.get("name"),
@@ -7014,6 +9555,29 @@ def compact_portfolio_for_decision(portfolio: dict[str, Any]) -> dict[str, Any]:
             "pnl": pos.get("pnl"),
             "pnl_pct": pos.get("pnl_pct"),
             "buy_strategy": pos.get("buy_strategy"),
+            "niuone_priority": (
+                niuone_portfolio_priority(pos, entry_strategy)
+                if is_niuone_strategy(entry_strategy)
+                else {}
+            ),
+            "niuone_lifecycle_stage": pos.get("niuone_lifecycle_stage"),
+            "mainline_score": pos.get("mainline_score"),
+            "mainline_state": pos.get("mainline_state"),
+            "mainline_cross_day_persistent": pos.get(
+                "mainline_cross_day_persistent"
+            ),
+            "mainline_confirmed": pos.get("mainline_confirmed"),
+            "stock_strong": pos.get("stock_strong"),
+            "stock_leader_tier": pos.get("stock_leader_tier"),
+            "entry_signal_score": pos.get("entry_signal_score"),
+            "current_decision_score": pos.get("current_decision_score"),
+            "last_buy_signal_score": pos.get("last_buy_signal_score"),
+            "highest_buy_signal_score": pos.get(
+                "highest_buy_signal_score"
+            ),
+            "niuone_buy_signal_count": pos.get(
+                "niuone_buy_signal_count"
+            ),
             "entry_reason": pos.get("entry_reason"),
             "strategy_mark": pos.get("strategy_mark") or {},
             "strategy_mark_id": pos.get("strategy_mark_id") or "",
@@ -7053,7 +9617,11 @@ def compact_portfolio_for_decision(portfolio: dict[str, Any]) -> dict[str, Any]:
         "total_pnl_pct": portfolio.get("total_pnl_pct"),
         "sector_tide_open_risk_pct": portfolio.get("sector_tide_open_risk_pct"),
         "positions": compact_positions,
-        "recent_trades": (portfolio.get("trade_log") or [])[:8],
+        "recent_trades": [
+            trade
+            for trade in (portfolio.get("trade_log") or [])
+            if isinstance(trade, Mapping) and trade_counts_for_account(trade)
+        ][:8],
         "last_b1_generated_at": portfolio.get("last_b1_generated_at"),
         "last_decision_at": portfolio.get("last_decision_at"),
         "last_quote_refresh": portfolio.get("last_quote_refresh"),
@@ -7062,133 +9630,85 @@ def compact_portfolio_for_decision(portfolio: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def format_candidate_label(candidate: dict[str, Any]) -> str:
-    code = str(candidate.get("code") or "").strip()
-    name = str(candidate.get("name") or "").strip()
-    return " ".join(part for part in [code, name] if part).strip() or "未知股票"
-
-
-def build_single_candidate_news_prompt(candidate: dict[str, Any]) -> str:
-    label = format_candidate_label(candidate)
-    return f"""搜索以下A股最近3天的重大消息与市场舆情，只针对这一只股票：
-{label}
-
-请交叉核验公司公告或交易所披露、主流财经媒体、雪球与X/Twitter公开内容。
-公告和主流财经媒体用于确认事实；雪球和X只用于概括市场观点，不得把未经证实的帖子当作公司事实。无法访问某个平台或没有可核验内容时写“未见显著讨论”，不要编造。
-
-格式：
-- 代码 名称：事件：核心事实；影响：直接影响；舆情：雪球和X的代表性倾向或未见显著讨论（利好/利空/中性）
-如没有明确重大消息，输出：
-- 代码 名称：事件：未发现明确重大消息；影响：暂无；舆情：雪球和X未见显著讨论（中性）
-不要输出帖子原文、用户名、引用编号、链接、来源列表、检索日期、检索过程或 Markdown。"""
-
-
-def request_single_candidate_news_precheck(
-    candidate: dict[str, Any],
-    *,
-    base_url: str,
-    api_key: str,
-    model: str,
-) -> str:
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": build_single_candidate_news_prompt(candidate)}],
-        "max_tokens": NEWS_PRECHECK_MAX_TOKENS,
-    }
-    return request_chat_content(
-        base_url,
-        api_key,
-        payload,
-        model,
-        max_retries=NEWS_PRECHECK_MAX_RETRIES,
-        timeout=NEWS_PRECHECK_REQUEST_TIMEOUT,
-        api_mode=NEWS_PRECHECK_API_MODE,
-        tools=news_search_tools(model, NEWS_PRECHECK_API_MODE),
-        reasoning={"effort": "low"},
-    ).strip()
-
-
-def format_news_precheck_error(candidate: dict[str, Any], exc: Exception) -> str:
-    detail = clip_text(f"{type(exc).__name__}: {exc}", 160)
-    return f"- {format_candidate_label(candidate)}：消息面预检失败（{detail}）"
-
-
 def check_candidate_news_precheck(candidates: list[dict[str, Any]]) -> str:
-    """并发搜索 top5 候选股的最新消息面，返回结构化摘要。
+    """Retrieve through iWencai and judge with the decision model for top candidates.
 
-    Returns: 格式化的消息面文本，供决策 prompt 使用。
+    Only completed records carry decision weight. Retrieval or judgment failures
+    are omitted so missing auxiliary evidence cannot make a candidate look worse.
     """
     top_candidates = [c for c in candidates[:5] if isinstance(c, dict)]
     if not top_candidates:
         return ""
+    news_config = load_news_precheck_config()
+    if news_config is None:
+        return ""
     cached_records = [candidate.get("news_precheck") for candidate in top_candidates]
+    source_mode = "iwencai"
     cached_count = sum(
         1
         for record in cached_records
-        if isinstance(record, dict) and record.get("checked") is True
+        if cached_news_record_matches_source(record, source_mode, news_config.model)
     )
     if cached_count == len(top_candidates):
-        return format_cached_news_records(cached_records)
-
-    news_config = load_news_precheck_config()
-    if news_config is None:
-        available_cache = [
+        weighted_records = [
             record
             for record in cached_records
-            if isinstance(record, dict) and record.get("checked") is True
+            if news_precheck_record_has_decision_weight(record)
         ]
-        return format_cached_news_records(available_cache)
-    base_url, api_key, model = news_config
+        return format_cached_news_records(weighted_records) if weighted_records else ""
 
-    def fetch(candidate: dict[str, Any]) -> str:
-        return request_single_candidate_news_precheck(
-            candidate,
-            base_url=base_url,
-            api_key=api_key,
-            model=model,
+    missing_candidates = [
+        top_candidates[idx]
+        for idx in range(len(top_candidates))
+        if not cached_news_record_matches_source(
+            cached_records[idx], source_mode, news_config.model
         )
-
-    results: list[str] = [
-        format_cached_news_record(record)
-        if isinstance(record, dict) and record.get("checked") is True
-        else ""
+    ]
+    fresh_records = fetch_candidate_news_records(
+        missing_candidates,
+        news_config,
+        max_candidates=len(missing_candidates),
+    )
+    fresh_iter = iter(fresh_records)
+    combined_records = [
+        record
+        if cached_news_record_matches_source(record, source_mode, news_config.model)
+        else next(fresh_iter, {})
         for record in cached_records
     ]
-    failures: list[str] = []
-    success_count = cached_count
-    missing_indices = [idx for idx, result in enumerate(results) if not result]
-    workers = min(NEWS_PRECHECK_CONCURRENCY, len(missing_indices))
-    if workers <= 1:
-        for idx in missing_indices:
-            candidate = top_candidates[idx]
-            try:
-                results[idx] = fetch(candidate)
-                success_count += 1
-            except Exception as exc:
-                failures.append(format_news_precheck_error(candidate, exc))
-                results[idx] = failures[-1]
-    else:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            future_by_index = {
-                pool.submit(fetch, top_candidates[idx]): idx
-                for idx in missing_indices
-            }
-            for future in concurrent.futures.as_completed(future_by_index):
-                idx = future_by_index[future]
-                candidate = top_candidates[idx]
-                try:
-                    results[idx] = future.result()
-                    success_count += 1
-                except Exception as exc:
-                    failures.append(format_news_precheck_error(candidate, exc))
-                    results[idx] = failures[-1]
+    weighted_records = [
+        record
+        for record in combined_records
+        if news_precheck_record_has_decision_weight(record)
+    ]
+    lines = [
+        format_cached_news_record(record)
+        for record in weighted_records
+    ]
+    return "【消息面预检（同花顺问财）】\n" + "\n".join(lines) if lines else ""
 
-    if failures and success_count == 0:
-        raise RuntimeError("全部股票消息面预检失败：" + "；".join(failures[:3]))
 
-    content = "\n".join(item.strip() for item in results if item and item.strip()).strip()
-    source_label = "扫描缓存 + 实时补齐" if cached_count else "实时搜索"
-    return f"【消息面预检（{source_label}，并发{workers}）】\n{content}"
+def news_precheck_record_has_decision_weight(record: Any) -> bool:
+    """Return whether a precheck record may influence model trade decisions."""
+    return bool(
+        isinstance(record, Mapping)
+        and record.get("checked") is True
+        and record.get("available") is True
+        and str(record.get("summary") or "").strip()
+    )
+
+
+def candidate_news_tone_for_decision(candidate: Mapping[str, Any]) -> str:
+    """Map unavailable or unfinished prechecks to a zero-weight neutral label."""
+    record = candidate.get("news_precheck")
+    if isinstance(record, Mapping) and not news_precheck_record_has_decision_weight(record):
+        return "中性"
+    if candidate.get("news_available") is False:
+        return "中性"
+    label = str(candidate.get("news_tone_label") or "").strip()
+    if label in {"", "未检查", "不可用", "待判断", "判断不可用"}:
+        return "中性"
+    return label
 
 
 def current_strategy_source() -> str:
@@ -7207,6 +9727,235 @@ def current_strategy_suite() -> str:
 
 def current_preset_strategy_text() -> str:
     return decode_preset_strategy_text(os.environ.get(PRESET_STRATEGY_TEXT_ENV, ""))
+
+
+def active_frozen_prompt_strategy() -> dict[str, Any] | None:
+    if current_strategy_suite() != STRATEGY_SOURCE_PRESET_TEXT:
+        return None
+    return PromptStrategyStore().active_version()
+
+
+def load_prompt_strategy_rows(
+    code: str,
+    *,
+    quote: Mapping[str, Any] | None = None,
+    count: int = 120,
+    timeout: int = 20,
+) -> list[dict[str, Any]]:
+    bounded_count = max(1, min(501, int(count or 1)))
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(STOCK_TOOLS_SCRIPT),
+            "kline",
+            normalize_code(code),
+            str(bounded_count),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=max(5, min(30, int(timeout))),
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        raise RuntimeError("无法获取文字策略所需K线")
+    payload = json.loads(proc.stdout)
+    rows = [
+        dict(item)
+        for item in (payload.get("rows") or [])
+        if isinstance(item, Mapping)
+    ]
+    if not rows:
+        raise RuntimeError("文字策略K线为空")
+    quote_payload = dict(quote or {})
+    return (
+        merge_live_quote(rows, quote_payload, limit=bounded_count)
+        if quote_payload
+        else rows[-bounded_count:]
+    )
+
+
+def prompt_strategy_data_context(
+    quote: Mapping[str, Any],
+    evaluated_at: datetime,
+) -> dict[str, Any]:
+    evaluated_date = evaluated_at.strftime("%Y-%m-%d")
+    calendar = trading_day_status(evaluated_date, allow_refresh=False)
+    return {
+        "expected_closed_date": str(calendar.get("previous_trading_day") or "")[:10],
+        "expected_live_date": evaluated_date,
+        "evaluated_at": evaluated_at.strftime("%Y-%m-%d %H:%M:%S"),
+        "observed_at": str(quote.get("quote_time") or ""),
+        "quote_trade_date": quote_trade_date(quote),
+    }
+
+
+def build_local_prompt_decision(
+    candidates: list[dict[str, Any]],
+    state: dict[str, Any],
+    version: Mapping[str, Any],
+    market_strategy_ctx: Mapping[str, Any],
+) -> dict[str, Any]:
+    plan = version.get("execution_plan") or {}
+    strategy = plan.get("strategy") or {}
+    execution_mode = str(strategy.get("execution_mode") or "recommend_only")
+    if execution_mode != "simulation":
+        return {
+            "summary": f"冻结文字策略本轮生成{len(candidates)}个研究建议，不执行模拟交易",
+            "actions": [],
+            "recommendations": [
+                {
+                    "code": normalize_code(candidate.get("code") or ""),
+                    "name": str(candidate.get("name") or ""),
+                }
+                for candidate in candidates
+                if normalize_code(candidate.get("code") or "")
+            ],
+            "model": "LOCAL_PROMPT_RULE_ENGINE",
+            "provider": "local_rule",
+            "execution_mode": execution_mode,
+            "prompt_strategy_version_id": str(version.get("version_id") or ""),
+            "prompt_plan_sha256": str(version.get("plan_sha256") or ""),
+        }
+    max_new = min(
+        int(strategy.get("max_new_buys_per_cycle") or 0),
+        int(market_strategy_ctx.get("max_new_buys_per_decision") or 0),
+    )
+    allow_new = bool(market_strategy_ctx.get("allow_new_buys", True))
+    actions: list[dict[str, Any]] = []
+    positions = state.get("positions") or {}
+    position_policy = strategy.get("position") or {}
+    for candidate in candidates:
+        if len(actions) >= max_new or not allow_new:
+            break
+        code = normalize_code(candidate.get("code") or "")
+        if not code:
+            continue
+        existing_qty = position_qty(positions.get(code) or {})
+        if existing_qty > 0 and not bool(position_policy.get("allow_add", False)):
+            continue
+        provisional_shares = (
+            int(position_policy.get("value") or 0)
+            if str(position_policy.get("type") or "") == "fixed_shares"
+            else 100
+        )
+        actions.append({
+            "action": "BUY",
+            "code": code,
+            "name": str(candidate.get("name") or ""),
+            "shares": provisional_shares,
+            "reason": (
+                "冻结文字策略的选股条件已通过；成交前由本地引擎复核入场条件并按冻结仓位规则计算股数"
+            ),
+            "prompt_strategy_version_id": str(version.get("version_id") or ""),
+        })
+    return {
+        "summary": (
+            f"冻结文字策略本地决策：{len(actions)}个标的进入买前复核"
+            if actions
+            else "冻结文字策略本轮没有可执行的新买入"
+        ),
+        "actions": actions,
+        "model": "LOCAL_PROMPT_RULE_ENGINE",
+        "provider": "local_rule",
+        "execution_mode": execution_mode,
+        "prompt_strategy_version_id": str(version.get("version_id") or ""),
+        "prompt_plan_sha256": str(version.get("plan_sha256") or ""),
+    }
+
+
+def evaluate_prompt_entry_before_buy(
+    candidate: Mapping[str, Any],
+    *,
+    code: str,
+    name: str,
+    quote: Mapping[str, Any],
+    position: Mapping[str, Any] | None = None,
+    account_cash: float | None = None,
+    evaluated_at: datetime | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str]:
+    version_id = str(candidate.get("prompt_strategy_version_id") or "")
+    if not version_id:
+        return None, None, ""
+    store = PromptStrategyStore()
+    version = store.get_version(version_id)
+    active = store.active_version()
+    if version is None or active is None or active.get("version_id") != version_id:
+        return None, None, "文字策略候选版本已失效，请等待新版本重新选股"
+    selection_audit = candidate.get("prompt_rule_audit")
+    if not isinstance(selection_audit, Mapping):
+        return None, None, "文字策略候选缺少选股审计"
+    replay = replay_rule_evaluation_audit(
+        dict(selection_audit),
+        plan=dict(version.get("execution_plan") or {}),
+    )
+    if not replay.get("ok") or str((selection_audit.get("evaluation") or {}).get("status")) != "true":
+        return None, None, "文字策略候选选股审计无法回放"
+    try:
+        plan = version.get("execution_plan") or {}
+        entry_minimum_bars = max(
+            1,
+            min(
+                500,
+                int(
+                    ((plan.get("stage_requirements") or {}).get("entry") or {}).get(
+                        "minimum_bars"
+                    )
+                    or 1
+                ),
+            ),
+        )
+        bar_status = str(
+            (((plan.get("strategy") or {}).get("data_contract") or {}).get(
+                "bar_status"
+            ))
+            or "closed"
+        )
+        rows = load_prompt_strategy_rows(
+            code,
+            quote=quote,
+            count=min(
+                501,
+                entry_minimum_bars + (1 if bar_status == "closed" else 0),
+            ),
+        )
+        total_qty = position_qty(dict(position or {}))
+        available_qty = available_to_sell(dict(position or {})) if position else 0
+        avg_cost = _safe_float((position or {}).get("avg_cost"), 0.0)
+        price = _safe_float(quote.get("price"), 0.0)
+        result = evaluate_frozen_strategy_stage(
+            version,
+            "entry",
+            rows,
+            code=code,
+            name=name,
+            runtime_facts={
+                "account.cash": account_cash,
+                "position.quantity": total_qty,
+                "position.available_shares": available_qty,
+                "position.avg_cost": avg_cost,
+                "position.pnl_pct": (
+                    (price / avg_cost - 1.0) * 100.0
+                    if price > 0 and avg_cost > 0
+                    else None
+                ),
+                "position.hold_days": (
+                    holding_days(dict(position), today_key())
+                    if position
+                    else 0
+                ),
+            },
+            data_context=prompt_strategy_data_context(
+                quote,
+                evaluated_at or datetime.now(),
+            ),
+        )
+        recorded = store.record_evaluation(version_id, result["audit"])
+        result["evaluation_id"] = recorded["evaluation_id"]
+    except Exception as exc:
+        return None, version, f"文字策略买前复核失败（{type(exc).__name__}）"
+    if str(result["evaluation"].get("status") or "") != "true":
+        status = str(result["evaluation"].get("status") or "unknown")
+        return result, version, f"文字策略入场条件复核为{status}，本轮不买入"
+    return result, version, ""
 
 
 def current_trade_discipline_text(position_limit_desc: str, adaptive: dict[str, Any] | None = None) -> str:
@@ -7243,12 +9992,16 @@ def current_trade_discipline_text(position_limit_desc: str, adaptive: dict[str, 
                 "\n- 板块潮汐退出：行业分数<55连续两次、潮位硬停止、策略时间窗不延续、2R减半和2ATR跟踪。"
             )
         if any(is_niuone_strategy(strategy_id) for strategy_id in enabled):
+            custom = custom.replace(
+                "- 同板块持仓不超过2只（避免集中风险）",
+                "- 牛牛不设固定同板块或同题材持仓只数上限；集中风险由主题风险、主题敞口和组合预算限制。",
+            )
             custom += (
                 "\n- 牛牛战法执行层动态风险预算：进攻/轮动/修复/防守的单笔权益风险分别≤1.50%/1.00%/0.60%/0.30%，"
                 "策略内组合风险≤4.50%/3.00%/1.80%/0.90%，总仓≤70%/55%/35%/20%，主题风险≤3.00%/2.00%/1.20%/0.60%，主题敞口≤55%/40%/25%/12%；仅市场复合硬停止禁止新仓。"
-                f"领涨/转强/启动/试仓单票30%/25%/15%/6.25%仅为绝对上限，同一主题最多2只、当日跨轮最多新开{NIUONE_MAX_NEW_POSITIONS_PER_TRADING_DAY}只、同时最多持有{NIUONE_MAX_OPEN_POSITIONS}只。"
-                "\n- 牛牛战法按主线酝酿→主升→高潮→分歧→退幕识别；试仓只参与candidate/emerging早段，主升阶段围绕启动/领涨，高潮不追普遍新仓，分歧只观察核心股调整后转强或减仓，持续回落不触发买点，退幕只退出。最近30根日K还须满足：左侧至少回落5日和8%，低点后至少修复3日和6%，收复左侧跌幅须在60%（含）至200%（不含）之间，并确认右侧持续抬高；达到200%后不再按早期试仓。"
-                "试仓在进攻/轮动/修复/防守的单笔权益风险分别≤0.35%/0.30%/0.25%/0.15%，以右侧最近3根日K低点为止损；试仓/启动持仓浮盈在2%～12%、仍处主升且个股保持强势领涨时，跨日延续先向10%上限加仓，主线确认后再向20%上限加仓，每级一次，分歧/高潮/退幕不加仓。"
+                f"领涨/转强/启动/试仓单票30%/25%/15%/10%仅为绝对上限；不设固定同板块或同题材持仓只数上限，集中风险继续由主题风险和主题敞口预算约束。新开仓不设上午/下午、单轮或单日数量上限，盘面总结/评价产生的动态数量或暂停字段也不作用于牛牛，但同时最多持有{NIUONE_MAX_OPEN_POSITIONS}只。满仓时仅当新候选当前优先级严格高于可卖出的最低优先级牛牛持仓，才先卖后买完成换仓。"
+                "\n- 牛牛战法按主线酝酿→主升→高潮→分歧→退幕识别；试仓只参与酝酿候选和启动早段，主升阶段围绕启动/领涨，高潮不追普遍新仓，分歧只观察核心股调整后转强或减仓，持续回落不触发买点，退幕只退出。最近30根日K还须满足：左侧至少回落5日和8%，低点后至少修复3日和6%，收复左侧跌幅须在60%（含）至200%（不含）之间，并确认右侧持续抬高；达到200%后不再按早期试仓。"
+                "试仓在进攻/轮动/修复/防守的单笔权益风险分别≤0.35%/1.00%/0.25%/0.15%，以右侧最近3根日K低点为止损；试仓/启动持仓浮盈在2%～12%、仍处主升且个股保持强势领涨时，本地规则在跨日延续后向10%上限加仓，主线确认后再向20%上限加仓，不依赖模型主动提出ADD。此后同一战法再次出现BUY且评分严格刷新持仓期实际买入最高分时，可继续在原风险与阶段上限内加仓；分歧/高潮/退幕不加仓。"
                 "\n- 牛牛战法退出：试仓所属题材首次进入退幕即退出，3个交易日未延续右侧趋势也退出；成熟路径另按连续两个交易日跌出行业前三龙头梯队、主线连续转弱、市场硬停止叠加退幕和策略时间窗退出；高潮且不亏先减仓1/3，进攻/修复/防守试仓盘中达到0.75R先减仓50%，轮动试仓及成熟路径达到1R先减仓45%，余仓成本保护并按2ATR跟踪。"
             )
         return custom
@@ -7267,6 +10020,7 @@ def current_trade_discipline_text(position_limit_desc: str, adaptive: dict[str, 
         zettaranc_enabled=any(is_zettaranc_strategy(strategy_id) for strategy_id in enabled),
         sector_tide_enabled=any(is_sector_tide_strategy(strategy_id) for strategy_id in enabled),
         niuone_enabled=any(is_niuone_strategy(strategy_id) for strategy_id in enabled),
+        prompt_strategy_enabled=STRATEGY_SOURCE_PRESET_TEXT in enabled,
     )
 
 
@@ -7289,6 +10043,31 @@ def position_strategy_ids_for_prompt(positions: list[dict[str, Any]]) -> set[str
         values = [position_entry_strategy(pos), mark.get("component_strategy_id")]
         strategy_ids.update(str(value) for value in values if str(value or "") in known)
     return strategy_ids
+
+
+def preset_position_policy_context(state: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return private frozen policy data for prompt-driven open positions."""
+    positions = state.get("positions") if isinstance(state.get("positions"), Mapping) else {}
+    contexts: list[dict[str, Any]] = []
+    for raw_code, raw_pos in positions.items():
+        if not isinstance(raw_pos, Mapping):
+            continue
+        pos = dict(raw_pos)
+        if position_qty(pos) <= 0 or position_entry_strategy(pos) != STRATEGY_SOURCE_PRESET_TEXT:
+            continue
+        code = normalize_code(str(pos.get("code") or raw_code or ""))
+        if not code:
+            continue
+        contexts.append({
+            "code": code,
+            "name": str(pos.get("name") or ""),
+            "snapshot": _json_safe_copy(pos.get("preset_strategy_snapshot") or {}),
+            "interpretation": _json_safe_copy(pos.get("preset_strategy_interpretation") or {}),
+            "interpretation_sha256": str(
+                pos.get("preset_strategy_interpretation_sha256") or ""
+            ),
+        })
+    return contexts
 
 
 def load_decision_model_config() -> tuple[str, str]:
@@ -7316,30 +10095,49 @@ def call_model_decision(
     market_strategy_ctx: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     base_url, api_key = load_decision_model_config()
+    prompt_feedback_parameters = effective_exit_feedback_parameters(
+        portfolio.get("exit_feedback_policy")
+        if isinstance(portfolio.get("exit_feedback_policy"), Mapping)
+        else None
+    )
+    prompt_replacement_margin = float(
+        prompt_feedback_parameters["replacement_priority_margin"]
+    )
     market_env = check_market_environment()
     market_sent = check_market_sentiment()
     market_strategy_ctx = market_strategy_ctx or current_market_strategy_context()
-    market_strategy_prompt = format_market_strategy_context_for_prompt(market_strategy_ctx)
+    strategy_suite = current_strategy_suite()
+    active_strategy_ids = active_strategy_ids_for_decision()
+    niuone_only = bool(active_strategy_ids) and all(
+        is_niuone_strategy(strategy_id) for strategy_id in active_strategy_ids
+    )
+    market_strategy_prompt = format_market_strategy_context_for_prompt(
+        market_strategy_ctx,
+        niuone_only=niuone_only,
+    )
     sentiment_note = ""
     if market_sent.get("sentiment") == "cold":
         sentiment_note = f"⚠️市场情绪偏冷({market_sent.get('detail','')})，建议仓位减半"
     
     # === 实时消息面预检（top5候选） ===
     news_context = ""
+    news_precheck_error = ""
     try:
         top5 = candidates[:5]
         if top5:
             news_context = check_candidate_news_precheck(top5)
-    except Exception as e:
-        news_context = f"（消息面预检失败: {e}）"
+    except Exception as exc:
+        # Missing auxiliary news evidence is deliberately zero-weight. The
+        # failure remains observable in the precheck service/UI, not the model
+        # context where it could be mistaken for a candidate-specific risk.
+        news_precheck_error = f"precheck_{type(exc).__name__}"
+        news_context = ""
     
-    compact_candidates = candidates[:8]
+    compact_candidates = candidates[:100] if strategy_suite == STRATEGY_SOURCE_PRESET_TEXT else candidates[:8]
     # 自适应参数（市场情绪驱动）
     adaptive = get_adaptive_params()
     # 多战法上下文：统计战法分布，给每个候选标注最优战法
-    strategy_suite = current_strategy_suite()
     preset_strategy_text = current_preset_strategy_text()
-    active_strategy_ids = active_strategy_ids_for_decision()
     portfolio_positions = [p for p in (portfolio.get("positions") or []) if isinstance(p, dict)]
     position_strategy_ids = position_strategy_ids_for_prompt(portfolio_positions)
     strategy_prompt_sections = build_strategy_prompt_sections(
@@ -7348,16 +10146,38 @@ def call_model_decision(
         active_strategy_ids,
         b3_exit_hhmm=B3_EXIT_HHMM,
         time_exit_hhmm=TIME_EXIT_HHMM,
+        max_open_positions=NIUONE_MAX_OPEN_POSITIONS,
     )
     strategy_source_label = strategy_prompt_sections["strategy_source_label"]
     strategy_labels = strategy_prompt_sections["strategy_labels"]
     active_strategy_section = strategy_prompt_sections["active_strategy_section"]
     position_limit_desc = strategy_prompt_sections["position_limit_desc"]
-    position_exit_section = build_position_exit_prompt_section(
-        position_strategy_ids,
-        b3_exit_hhmm=B3_EXIT_HHMM,
-        time_exit_hhmm=TIME_EXIT_HHMM,
+    builtin_position_strategy_ids = position_strategy_ids - {
+        STRATEGY_SOURCE_PRESET_TEXT
+    }
+    builtin_position_exit_section = (
+        build_position_exit_prompt_section(
+            builtin_position_strategy_ids,
+            b3_exit_hhmm=B3_EXIT_HHMM,
+            time_exit_hhmm=TIME_EXIT_HHMM,
+        )
+        if builtin_position_strategy_ids
+        else ""
     )
+    private_preset_position_contexts = portfolio.get("_preset_position_policy_context")
+    private_preset_position_contexts = (
+        private_preset_position_contexts
+        if isinstance(private_preset_position_contexts, list)
+        else []
+    )
+    frozen_preset_exit_section = format_frozen_preset_exit_section(
+        private_preset_position_contexts
+    )
+    position_exit_section = "\n\n".join(
+        section
+        for section in (frozen_preset_exit_section, builtin_position_exit_section)
+        if section
+    ) or "当前没有带有效 strategy_mark 的持仓，无需加载历史持仓退出规则。"
     position_by_code = {
         normalize_code(pos.get("code") or ""): pos
         for pos in portfolio_positions
@@ -7366,6 +10186,10 @@ def call_model_decision(
     # Build compact candidate list with strategy context
     cand_lines = []
     for c in compact_candidates:
+        if strategy_suite == STRATEGY_SOURCE_PRESET_TEXT:
+            facts = preset_candidate_facts(c)
+            cand_lines.append("  " + json.dumps(facts, ensure_ascii=False, sort_keys=True))
+            continue
         strat = c.get("best_strategy", "")
         strat_label = strategy_labels.get(strat, strat)
         zettaranc_flow_detail = ""
@@ -7394,27 +10218,29 @@ def call_model_decision(
                 f"动态仓位上限:{c.get('max_position_pct_by_risk','-')}% "
                 f"隔夜美股:{c.get('overnight_us_tone_label','-')}/"
                 f"{c.get('overnight_us_sector') or '无行业映射'} "
-                f"消息面:{c.get('news_tone_label','未检查')} "
+                f"消息面:{candidate_news_tone_for_decision(c)} "
                 f"外部确认调整:{c.get('external_context_adjustment','-')} "
             )
         elif is_niuone_strategy(strat):
+            candidate_priority = niuone_portfolio_priority(c, strat)["score"]
             tide_detail = (
                 f"市场:{c.get('market_regime','-')}/{c.get('market_score','-')} "
                 f"题材:{c.get('signal_theme') or c.get('industry') or c.get('sector') or '-'} "
                 f"行业:{c.get('industry') or c.get('sector') or '-'} "
                 f"归因:{c.get('signal_theme_attribution_score','-')}/"
                 f"{c.get('signal_theme_attribution_weight','-')} "
-                f"主线:{c.get('mainline_state','-')}/{c.get('mainline_score','-')} "
-                f"模式:{c.get('mainline_mode','none')} 核心:{c.get('mainline_primary') or '-'}"
+                f"主线:{mainline_state_label(c.get('mainline_state'))}/{c.get('mainline_score','-')} "
+                f"模式:{mainline_mode_label(c.get('mainline_mode'))} 核心:{c.get('mainline_primary') or '-'}"
                 f"/{c.get('mainline_secondary') or '-'} "
                 f"强股:{c.get('strong_stock_count','-')} 有效强股:{c.get('effective_strong_count','-')} "
-                f"龙头集中度:{c.get('leader_concentration','-')} 个股角色:{c.get('stock_role','-')} "
+                f"龙头集中度:{c.get('leader_concentration','-')} 个股角色:{stock_role_label(c.get('stock_role'))} "
                 f"个股强度:{c.get('stock_strong_score','-')} 主线排名:{c.get('stock_sector_rank','-')} "
                 f"止损:{c.get('stop_price','-')}({c.get('stop_distance_pct','-')}%) "
                 f"有效损失:{c.get('effective_loss_distance_pct','-')}% "
                 f"单笔预算:{c.get('per_trade_risk_budget_pct','-')}% "
                 f"动态仓位上限:{c.get('max_position_pct_by_risk','-')}% "
-                f"消息面:{c.get('news_tone_label','未检查')} "
+                f"组合优先级:{candidate_priority} "
+                f"消息面:{candidate_news_tone_for_decision(c)} "
             )
         cand_lines.append(
             f"  {c.get('code')} {c.get('name')} 现价{c.get('price')} "
@@ -7451,7 +10277,7 @@ def call_model_decision(
             tide_detail = (
                 f" 题材:{c.get('signal_theme') or c.get('industry') or c.get('sector') or '-'}"
                 f" 行业:{c.get('industry') or c.get('sector') or '-'}"
-                f" 主线:{c.get('mainline_state','-')}/{c.get('mainline_score','-')}"
+                f" 主线:{mainline_state_label(c.get('mainline_state'))}/{c.get('mainline_score','-')}"
             )
         held_candidate_lines.append(
             f"  {code} {c.get('name') or pos.get('name')} 当前仓位{pos.get('position_pct')}% "
@@ -7469,8 +10295,46 @@ def call_model_decision(
         market_strategy_ctx,
         news_context,
     )
+    if news_precheck_error:
+        precheck_audit = decision_intelligence_ctx.setdefault(
+            "news_precheck",
+            {},
+        )
+        if isinstance(precheck_audit, dict):
+            precheck_audit.update({
+                "available": False,
+                "text": "",
+                "error": news_precheck_error,
+                "decision_weight": 0,
+            })
     decision_intelligence_prompt = format_decision_intelligence_context_for_prompt(decision_intelligence_ctx)
     trade_discipline_text = current_trade_discipline_text(position_limit_desc, adaptive)
+    preset_output_lines: list[str] = []
+    preset_interpretation_schema = ""
+    if strategy_suite == STRATEGY_SOURCE_PRESET_TEXT:
+        preset_output_lines.extend([
+            "- 必须把当前文字原文解释为可审计的 selection_rules、entry_rules、exit_rules、position_rules、time_rules、ambiguities 六组字符串数组；未写明的卖出、仓位或时间纪律必须采用保守规则补齐，不能省略字段。",
+            "- BUY只能选择上方中性行情事实池中真实存在的代码；reason必须写明命中的文字规则、关键行情事实、仓位依据和失效条件。",
+            "- 对已有预设文字策略持仓加仓时，必须使用该持仓买入时冻结的完整结构化规则，并原样返回相同的六组规则；不得重新解释或混用当前其他版本。",
+        ])
+        preset_interpretation_schema = '''  "strategy_interpretation":{
+    "selection_rules":["选股规则"],
+    "entry_rules":["买入触发"],
+    "exit_rules":["卖出/止损止盈"],
+    "position_rules":["仓位规则"],
+    "time_rules":["时间纪律"],
+    "ambiguities":[]
+  },
+'''
+    if private_preset_position_contexts:
+        preset_output_lines.append(
+            "- 对预设文字历史持仓SELL时，reason必须写明该持仓策略指纹及命中的买入时冻结退出规则；无法匹配冻结规则则HOLD。"
+        )
+    preset_output_requirements = (
+        "预设文字策略额外输出要求：\n" + "\n".join(preset_output_lines)
+        if preset_output_lines
+        else ""
+    )
     prompt = f"""你是A股模拟账户交易决策器。账户初始资金100万，只做A股模拟交易，不是真实下单。
 必须遵守：
 {trade_discipline_text}
@@ -7487,6 +10351,7 @@ def call_model_decision(
 隔离要求：本轮BUY只能依据当前新开仓策略及其候选，不得引用、混合或补充其他未启用策略。SELL必须逐只读取已有持仓的strategy_mark并执行上方对应的原策略退出纪律；不得因为当前激活策略变化而改写历史持仓归因。即使候选为空、盘面禁止开仓或日内亏损预算触发，也必须继续判断已有持仓的SELL/HOLD。
 
 ⚠️ 有风险标记的候选股，请结合其近期消息面（利空/减持/监管）综合判断，不要只看技术面。
+消息面缺失约束：预检失败、超时、未检查、待判断或不可用统一按中性且决策权重为0；不得因此降低候选评分、优先级或仓位，不得作为不开仓、HOLD或SELL的理由。仅已完成且有效的利好/利空/中性结果可参与判断。
 
 当前是否允许交易：{trade_allowed}，原因：{trade_reason}
 大盘环境：{market_env.get('detail', '未知')}
@@ -7503,7 +10368,7 @@ def call_model_decision(
 
 {news_context}
 
-本次多战法候选股（每只标注最优战法+评分）：
+本次候选股（预设文字策略为中性行情事实池；内置策略标注最优战法+评分）：
 {candidates_section}
 
 当前持仓与候选池重合（加仓/减仓/继续观察的重点）：
@@ -7512,14 +10377,24 @@ def call_model_decision(
 加仓语义与纪律：
 - 对当前账户JSON里已有持仓输出 BUY，表示加仓/补仓；shares 是本次新增股数，不是目标总股数。
 - 加仓只用于顺势确认或强势回踩重新达标；亏损扩大、跌破原止损、今日新买T+1锁仓、盘面谨慎/防守时，不得为了摊低成本而加仓。
-- 牛牛试仓/启动持仓首次加仓仅限浮盈{NIUONE_MARKUP_UPGRADE_MIN_PNL_PCT:g}%～{NIUONE_MARKUP_UPGRADE_MAX_PNL_PCT:g}%、生命周期主升且个股保持强势领涨：启动跨日延续先向{NIUONE_MARKUP_EARLY_UPGRADE_POSITION_CAP_PCT:g}%上限加仓，主线完全确认后向{NIUONE_MARKUP_UPGRADE_POSITION_CAP_PCT:g}%上限加仓。确认领涨仓随后可重复执行波段再平衡：有效回落或横盘先减仓1/3，只有重新转强价被收复、生命周期回到主升且个股恢复强势领涨才补回风险上限；补回后必须等待下一次独立回撤，不设终身加仓次数上限。每笔仍取风险预算和阶段/单票上限的较小值，shares 只填写当前仓位到目标仓位的差额；高潮、未转强分歧、退幕不得加仓。
+- 牛牛同一股票、同一战法再次出现BUY时，只有本次评分严格高于该持仓历史所有实际买入评分才获得“评分递增”加仓资格；相等、下降或缺少前后评分一律HOLD。试仓仍不得当日重复买入且不得向亏损仓摊低成本；成熟路径还须处于主升、个股保持强势领涨且浮盈在{NIUONE_MARKUP_UPGRADE_MIN_PNL_PCT:g}%～{NIUONE_MARKUP_UPGRADE_MAX_PNL_PCT:g}%延续窗口。阶段升级和已完成减仓后的波段回补仍按各自确认条件执行。
+- 牛牛试仓/启动持仓阶段升级时，启动跨日延续先向{NIUONE_MARKUP_EARLY_UPGRADE_POSITION_CAP_PCT:g}%上限加仓，主线完全确认后向{NIUONE_MARKUP_UPGRADE_POSITION_CAP_PCT:g}%上限加仓。确认领涨仓随后可重复执行波段再平衡：有效回落或横盘先减仓1/3，只有重新转强价被收复、生命周期回到主升且个股恢复强势领涨才补回风险上限；补回后必须等待下一次独立回撤，不设终身加仓次数上限。每笔仍取风险预算和阶段/单票上限的较小值，shares 只填写当前仓位到目标仓位的差额；高潮、未转强分歧、退幕不得加仓。
 - 加仓理由必须写明：原入场战法、当前盈亏/仓位、加仓后仓位占比、失效/止损条件，以及为何优于新开仓或继续HOLD。
+
+牛牛组合容量与换仓纪律：
+- 牛牛新开仓不设上午/下午、单轮或单日数量限制，但账户最多同时持有{NIUONE_MAX_OPEN_POSITIONS}只；单笔、组合、主题风险预算、总仓和T+1继续硬执行。
+- 未满{NIUONE_MAX_OPEN_POSITIONS}只时，符合条件且风险预算允许的候选可直接BUY；候选超过剩余槽位时按组合优先级从高到低选择。
+- 满仓时必须比较当前账户JSON中每只牛牛持仓的niuone_priority与新候选组合优先级。只有新候选至少高出{prompt_replacement_margin:g}分且最低优先级持仓全部可卖，才输出整仓SELL与新股BUY；SELL的intent写REPLACE、replacement_target_code写新股代码，BUY的intent写REPLACE、replacement_source_code写被卖持仓代码。差值不足、T+1不可卖、证据不足时HOLD，不为提高资金利用率强行换仓。
+- 换仓reason必须同时写明新旧股票代码、两者优先级、比较依据和交易成本/失效风险；系统会再次校验并强制按先SELL后BUY执行。
+
+{preset_output_requirements}
 
 严格返回JSON，不要markdown，不要解释，格式：
 {{
   "summary":"一句中文结论（含战法偏好+总体判断）",
+{preset_interpretation_schema}
   "actions":[
-    {{"action":"BUY|SELL|HOLD","code":"600000","name":"股票名","shares":100,"target_position_pct":3.5,"reason":"中文理由（含战法名和仓位依据）"}}
+    {{"action":"BUY|SELL|HOLD","code":"600000","name":"股票名","shares":100,"target_position_pct":3.5,"intent":"OPEN|ADD|EXIT|REPLACE","replacement_source_code":"仅换仓BUY填写","replacement_target_code":"仅换仓SELL填写","reason":"中文理由（含战法名和仓位依据）"}}
   ]
 }}
 如果不适合交易，返回 actions 为空或 HOLD。
@@ -7529,19 +10404,49 @@ def call_model_decision(
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": DECISION_MAX_TOKENS,
     }
+    response_format = decision_json_response_format(MODEL)
+    if response_format:
+        payload["response_format"] = response_format
+    if DECISION_REASONING_EFFORT:
+        payload["reasoning_effort"] = DECISION_REASONING_EFFORT
 
     result = request_chat_json_object(
         base_url,
         api_key,
         payload,
         MODEL,
-        max_parse_attempts=3,
+        max_parse_attempts=DECISION_JSON_MAX_PARSE_ATTEMPTS,
         timeout=DECISION_REQUEST_TIMEOUT,
     )
     result["model"] = MODEL
     result["provider"] = PROVIDER_DISPLAY_NAME
     result["market_guidance"] = compact_market_strategy_context(market_strategy_ctx)
     result["decision_intelligence"] = decision_intelligence_ctx
+    localize_decision_display_fields(result)
+    audit_generated_at = now_ts()
+    if strategy_suite == STRATEGY_SOURCE_PRESET_TEXT:
+        interpretation = normalize_preset_strategy_interpretation(
+            result.get("strategy_interpretation")
+        )
+        if interpretation is not None:
+            result["strategy_interpretation"] = interpretation
+        snapshot = build_preset_strategy_snapshot(
+            preset_strategy_text,
+            captured_at=audit_generated_at,
+        )
+        result["preset_strategy_audit"] = build_preset_decision_audit(
+            snapshot=snapshot,
+            candidates=compact_candidates,
+            interpretation=result.get("strategy_interpretation") or {},
+            prompt=prompt,
+            generated_at=audit_generated_at,
+        )
+    if private_preset_position_contexts:
+        result["preset_exit_audit"] = build_preset_exit_audit(
+            private_preset_position_contexts,
+            prompt=prompt,
+            generated_at=audit_generated_at,
+        )
     return result
 
 
@@ -7612,11 +10517,16 @@ def _fallback_refine_overlimit_buys(
         return (-score, risk_count, dist)
 
     ranked_actions = sorted(buy_actions, key=fallback_rank)
+    limited_codes = _action_code_set(buy_actions)
     kept_codes = _action_code_set(ranked_actions[:max(0, max_new_buys)])
     dropped = []
     for action in decision.get("actions") or []:
         code = normalize_code(action.get("code") or "")
-        if str(action.get("action") or "").upper() == "BUY" and code and code not in kept_codes:
+        if (
+            str(action.get("action") or "").upper() == "BUY"
+            and code in limited_codes
+            and code not in kept_codes
+        ):
             action["action"] = "HOLD"
             action["reason"] = f"二次取舍降级为HOLD：{reason}"
             dropped.append({
@@ -7634,6 +10544,7 @@ def _fallback_refine_overlimit_buys(
     decision["buy_refinement"] = refinement
     if dropped:
         decision["summary"] = f"{decision.get('summary') or '模型决策'}；二次取舍保留{len(kept_codes)}笔，放弃{len(dropped)}笔"
+    localize_decision_display_fields(decision)
     return refinement
 
 
@@ -7647,6 +10558,33 @@ def refine_overlimit_buy_actions(
     market_strategy_ctx = market_strategy_ctx or current_market_strategy_context()
     max_new_buys = max(0, int(market_strategy_ctx.get("max_new_buys_per_decision", MAX_NEW_BUYS_PER_DECISION)))
     buy_actions = executable_buy_actions(decision, state)
+    candidate_by_code = {
+        normalize_code(item.get("code") or ""): item
+        for item in candidates
+        if isinstance(item, dict)
+    }
+    buy_actions = [
+        action
+        for action in buy_actions
+        if not is_niuone_strategy(
+            str(
+                candidate_by_code.get(
+                    normalize_code(action.get("code") or ""),
+                    {},
+                ).get("best_strategy")
+                or candidate_by_code.get(
+                    normalize_code(action.get("code") or ""),
+                    {},
+                ).get("strategy_id")
+                or ""
+            )
+        )
+    ]
+    if not buy_actions:
+        # NiuOne capacity is governed by the configured account count ceiling
+        # and deterministic replacement ranking. Market-summary counts,
+        # including a zero-count pause, do not consume or suppress its slots.
+        return None
     if max_new_buys <= 0:
         if buy_actions:
             return _fallback_refine_overlimit_buys(decision, buy_actions, 0, "本轮盘面指引不允许新开仓", candidates)
@@ -7688,7 +10626,16 @@ def refine_overlimit_buy_actions(
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": min(DECISION_MAX_TOKENS, 2500),
         }
-        content = request_chat_content(base_url, api_key, payload, MODEL, max_retries=2, timeout=DECISION_REQUEST_TIMEOUT)
+        if DECISION_REASONING_EFFORT:
+            payload["reasoning_effort"] = DECISION_REASONING_EFFORT
+        content = request_chat_content(
+            base_url,
+            api_key,
+            payload,
+            MODEL,
+            max_retries=2,
+            timeout=DECISION_REQUEST_TIMEOUT,
+        )
         result = extract_json(content)
         if not isinstance(result, dict):
             raise RuntimeError("model did not return object")
@@ -7728,6 +10675,7 @@ def refine_overlimit_buy_actions(
             f"{decision.get('summary') or '模型决策'}；二次取舍保留{len(keep_codes)}笔，"
             f"放弃{len(dropped)}笔：{refinement['summary'] or '按盘面上限择优'}"
         )
+        localize_decision_display_fields(decision)
         return refinement
     except Exception as exc:
         return _fallback_refine_overlimit_buys(
@@ -7739,6 +10687,335 @@ def refine_overlimit_buy_actions(
         )
 
 
+def prepare_niuone_portfolio_actions(
+    decision: dict[str, Any],
+    state: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    *,
+    execution_date: str | None = None,
+) -> list[dict[str, Any]]:
+    """Enforce configured NiuOne capacity and strict priority upgrades."""
+    feedback_policy = current_exit_feedback_policy(state)
+    feedback_parameters = effective_exit_feedback_parameters(feedback_policy)
+    required_replacement_margin = float(
+        feedback_parameters["replacement_priority_margin"]
+    )
+    positions = state.get("positions") or {}
+    candidate_by_code = {
+        normalize_code(item.get("code") or ""): item
+        for item in candidates
+        if isinstance(item, dict) and normalize_code(item.get("code") or "")
+    }
+    actions = [
+        action
+        for action in (decision.get("actions") or [])
+        if isinstance(action, dict)
+    ]
+    new_niuone_buys: list[tuple[dict[str, Any], dict[str, Any], str]] = []
+    for action in actions:
+        if str(action.get("action") or "").upper() != "BUY":
+            continue
+        code = normalize_code(action.get("code") or "")
+        candidate = candidate_by_code.get(code) or {}
+        strategy_id = str(
+            candidate.get("best_strategy")
+            or candidate.get("buy_strategy")
+            or candidate.get("strategy_id")
+            or ""
+        ).strip()
+        if (
+            code
+            and is_niuone_strategy(strategy_id)
+            and position_qty(positions.get(code) or {}) <= 0
+        ):
+            new_niuone_buys.append((action, candidate, strategy_id))
+    if not new_niuone_buys:
+        return actions
+
+    resolved_date = execution_date or today_key()
+    explicit_replacement_sells: dict[str, dict[str, Any]] = {}
+    organic_full_sell_codes: set[str] = set()
+    retained_actions: list[dict[str, Any]] = []
+    for action in actions:
+        if str(action.get("action") or "").upper() != "SELL":
+            retained_actions.append(action)
+            continue
+        code = normalize_code(action.get("code") or "")
+        position = positions.get(code) or {}
+        quantity = position_qty(position)
+        shares = parse_model_action_shares(action) or 0
+        replacement_intent = bool(
+            str(action.get("intent") or "").upper() == "REPLACE"
+            or normalize_code(action.get("replacement_target_code") or "")
+        )
+        if replacement_intent:
+            explicit_replacement_sells[code] = action
+            continue
+        retained_actions.append(action)
+        if (
+            quantity > 0
+            and shares >= quantity
+            and available_to_sell(position, resolved_date) >= quantity
+        ):
+            organic_full_sell_codes.add(code)
+
+    free_slots = max(
+        0,
+        NIUONE_MAX_OPEN_POSITIONS
+        - open_position_count(positions)
+        + len(organic_full_sell_codes),
+    )
+    ranked_buys = sorted(
+        new_niuone_buys,
+        key=lambda item: (
+            -float(niuone_portfolio_priority(item[1], item[2])["score"]),
+            normalize_code(item[0].get("code") or ""),
+        ),
+    )
+    overflow_buys = ranked_buys[free_slots:]
+    eligible_holdings: list[tuple[str, dict[str, Any], str]] = []
+    for raw_code, position in positions.items():
+        code = normalize_code(raw_code)
+        if code in organic_full_sell_codes:
+            continue
+        quantity = position_qty(position)
+        strategy_id = position_entry_strategy(position)
+        if (
+            code
+            and quantity > 0
+            and is_niuone_strategy(strategy_id)
+            and available_to_sell(position, resolved_date) >= quantity
+        ):
+            eligible_holdings.append((code, position, strategy_id))
+    eligible_holdings.sort(
+        key=lambda item: (
+            float(niuone_portfolio_priority(item[1], item[2])["score"]),
+            item[0],
+        )
+    )
+
+    replacement_sells: list[dict[str, Any]] = []
+    replacement_plan: list[dict[str, Any]] = []
+    for buy_action, candidate, incoming_strategy in overflow_buys:
+        incoming_code = normalize_code(buy_action.get("code") or "")
+        incoming_priority = niuone_portfolio_priority(
+            candidate,
+            incoming_strategy,
+        )
+        if not eligible_holdings:
+            buy_action["action"] = "HOLD"
+            buy_action["intent"] = "HOLD_CAPACITY"
+            buy_action["reason"] = (
+                f"牛牛组合已满{NIUONE_MAX_OPEN_POSITIONS}只，且没有可按T+1整仓卖出的"
+                "牛牛持仓，本轮不换仓"
+            )
+            add_execution_block(
+                decision,
+                incoming_code,
+                buy_action["reason"],
+                category="position_capacity",
+            )
+            continue
+        holding_code, holding, holding_strategy = eligible_holdings[0]
+        holding_priority = niuone_portfolio_priority(
+            holding,
+            holding_strategy,
+        )
+        replacement_priority_margin = round(
+            float(incoming_priority["score"])
+            - float(holding_priority["score"]),
+            4,
+        )
+        if not niuone_priority_is_higher(
+            candidate,
+            holding,
+            incoming_strategy=incoming_strategy,
+            holding_strategy=holding_strategy,
+            minimum_margin=required_replacement_margin,
+        ):
+            buy_action["action"] = "HOLD"
+            buy_action["intent"] = "HOLD_PRIORITY"
+            buy_action["reason"] = (
+                f"牛牛候选{incoming_code}优先级{incoming_priority['score']}仅高出"
+                f"最低持仓{holding_code} {replacement_priority_margin:g}分，未达到"
+                f"换仓滞回门槛{required_replacement_margin:g}分，不换仓"
+            )
+            add_execution_block(
+                decision,
+                incoming_code,
+                buy_action["reason"],
+                category="portfolio_priority",
+            )
+            continue
+
+        eligible_holdings.pop(0)
+        sell_action = explicit_replacement_sells.pop(holding_code, None) or {
+            "action": "SELL",
+            "code": holding_code,
+            "name": holding.get("name") or "",
+        }
+        sell_action.update({
+            "action": "SELL",
+            "shares": position_qty(holding),
+            "intent": "REPLACE",
+            "replacement_target_code": incoming_code,
+            "niuone_priority_before": holding_priority,
+            "niuone_priority_after": incoming_priority,
+            "replacement_priority_margin": replacement_priority_margin,
+            "replacement_priority_margin_required": required_replacement_margin,
+            "exit_feedback_policy_version": int(feedback_policy.get("version") or 0),
+            "reason": (
+                f"牛牛组合换仓：新候选{incoming_code}优先级"
+                f"{incoming_priority['score']}高于持仓{holding_code}优先级"
+                f"{holding_priority['score']}共{replacement_priority_margin:g}分，"
+                "整仓卖出后买入具有足够优势的标的"
+            ),
+        })
+        buy_action.update({
+            "intent": "REPLACE",
+            "replacement_source_code": holding_code,
+            "niuone_priority_before": holding_priority,
+            "niuone_priority_after": incoming_priority,
+            "replacement_priority_margin": replacement_priority_margin,
+            "replacement_priority_margin_required": required_replacement_margin,
+            "exit_feedback_policy_version": int(feedback_policy.get("version") or 0),
+        })
+        replacement_sells.append(sell_action)
+        replacement_plan.append({
+            "sell_code": holding_code,
+            "buy_code": incoming_code,
+            "holding_priority": holding_priority,
+            "incoming_priority": incoming_priority,
+            "priority_margin": replacement_priority_margin,
+            "priority_margin_required": required_replacement_margin,
+            "exit_feedback_policy_version": int(feedback_policy.get("version") or 0),
+        })
+
+    # Replacement SELLs emitted by the model but not selected by the audited
+    # comparison are discarded; they must never create an unpaired exit.
+    decision["actions"] = [
+        *replacement_sells,
+        *[
+            action
+            for action in retained_actions
+            if str(action.get("action") or "").upper() == "SELL"
+        ],
+        *[
+            action
+            for action in retained_actions
+            if str(action.get("action") or "").upper() != "SELL"
+        ],
+    ]
+    decision["niuone_replacement_plan"] = replacement_plan
+    if replacement_plan:
+        decision["summary"] = (
+            f"{decision.get('summary') or '牛牛组合决策'}；按优先级滞回门槛先卖后买换仓"
+            f"{len(replacement_plan)}组"
+        )
+    return decision["actions"]
+
+
+def annotate_niuone_full_book_candidates(
+    decision: dict[str, Any],
+    state: Mapping[str, Any],
+    candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Persist visible evidence when a full NiuOne book sees new buyable names."""
+    positions = state.get("positions") or {}
+    position_count = open_position_count(positions)
+    if position_count < NIUONE_MAX_OPEN_POSITIONS:
+        return []
+
+    actions_by_code = {
+        normalize_code(action.get("code") or ""): action
+        for action in (decision.get("actions") or [])
+        if isinstance(action, dict) and normalize_code(action.get("code") or "")
+    }
+    replacement_buy_codes = {
+        normalize_code(plan.get("buy_code") or "")
+        for plan in (decision.get("niuone_replacement_plan") or [])
+        if isinstance(plan, dict) and normalize_code(plan.get("buy_code") or "")
+    }
+    records: list[dict[str, Any]] = []
+    seen_codes: set[str] = set()
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        code = normalize_code(candidate.get("code") or "")
+        strategy_id = str(
+            candidate.get("best_strategy")
+            or candidate.get("buy_strategy")
+            or candidate.get("strategy_id")
+            or ""
+        ).strip()
+        if (
+            not code
+            or code in seen_codes
+            or not is_niuone_strategy(strategy_id)
+            or not candidate_is_buyable(candidate)
+            or position_qty(positions.get(code) or {}) > 0
+        ):
+            continue
+        seen_codes.add(code)
+        action = actions_by_code.get(code) or {}
+        action_name = str(action.get("action") or "").upper()
+        intent = str(action.get("intent") or "").upper()
+        if code in replacement_buy_codes or intent == "REPLACE":
+            outcome = "replacement_planned"
+            outcome_label = "计划换仓"
+        elif action_name == "HOLD":
+            outcome = "not_bought"
+            outcome_label = "未买入"
+        elif action_name == "BUY":
+            outcome = "buy_requested"
+            outcome_label = "已申请买入"
+        else:
+            outcome = "candidate_recorded"
+            outcome_label = "仅记录候选"
+        score = candidate.get("best_decision_score")
+        if score is None:
+            score = candidate.get("best_score", candidate.get("score"))
+        records.append({
+            "code": code,
+            "name": str(candidate.get("name") or "").strip(),
+            "strategy_id": strategy_id,
+            "score": score,
+            "outcome": outcome,
+            "outcome_label": outcome_label,
+            "intent": intent,
+            "reason": str(action.get("reason") or "").strip(),
+        })
+
+    if not records:
+        return []
+    labels = [
+        f"{record['code']}{(' ' + record['name']) if record['name'] else ''}"
+        f"（{record['outcome_label']}）"
+        for record in records
+    ]
+    decision["niuone_capacity_observation"] = {
+        "status": "full",
+        "open_position_count": position_count,
+        "max_open_positions": NIUONE_MAX_OPEN_POSITIONS,
+        "candidate_count": len(records),
+        "candidates": records,
+        "summary": (
+            f"牛牛持仓已达{position_count}/{NIUONE_MAX_OPEN_POSITIONS}只，"
+            f"发现可买入新候选{len(records)}只：{'、'.join(labels)}"
+        ),
+    }
+    return records
+
+
+def _block_expired_decision(decision: dict[str, Any], now: datetime) -> bool:
+    if not decision_is_expired(decision, now):
+        return False
+    decision["execution_blocked_reason"] = "决策已过期，等待新一轮行情与决策"
+    if not any(item.get("category") == "decision_expired" for item in decision.get("execution_blocks", [])):
+        add_execution_block(decision, "", decision["execution_blocked_reason"], category="decision_expired")
+    return True
+
+
 def execute_actions(
     state: dict[str, Any],
     decision: dict[str, Any],
@@ -7746,8 +11023,21 @@ def execute_actions(
     trade_allowed: bool,
     trade_reason: str,
     market_strategy_ctx: dict[str, Any] | None = None,
+    evaluated_at: datetime | None = None,
+    *,
+    _skip_replacement_preflight: bool = False,
 ) -> list[dict[str, Any]]:
     executed = []
+    execution_started = time.monotonic()
+
+    def execution_now() -> datetime:
+        return (
+            evaluated_at + timedelta(seconds=time.monotonic() - execution_started)
+            if evaluated_at is not None else datetime.now()
+        )
+
+    if _block_expired_decision(decision, execution_now()):
+        return executed
     cand_by_code = {normalize_code(c.get("code", "")): c for c in candidates}
     positions = state.setdefault("positions", {})
     cash = float(state.get("cash") or 0)
@@ -7760,21 +11050,118 @@ def execute_actions(
     decision.setdefault("execution_blocks", [])
     effective_max_open_positions = int(market_strategy_ctx.get("max_open_positions", MAX_OPEN_POSITIONS))
     effective_max_new_buys = int(market_strategy_ctx.get("max_new_buys_per_decision", MAX_NEW_BUYS_PER_DECISION))
-    niuone_opened_today = niuone_opened_position_codes_on_date(state)
     allow_market_guidance_buys = bool(market_strategy_ctx.get("allow_new_buys", True))
     daily_loss_budget_exceeded, daily_loss_budget_pnl = check_daily_loss_budget(state)
+    execution_date = evaluated_at.strftime("%Y-%m-%d") if evaluated_at else today_key()
     if not trade_allowed:
+        annotate_niuone_full_book_candidates(decision, state, candidates)
         return executed
-    for action in (decision.get("actions") or [])[:5]:
-        current_allowed, current_reason = is_a_share_execution_time()
+    prepared_actions = prepare_niuone_portfolio_actions(
+        decision,
+        state,
+        candidates,
+        execution_date=execution_date,
+    )
+    replacement_plan = list(decision.get("niuone_replacement_plan") or [])
+    if replacement_plan and not _skip_replacement_preflight:
+        replacement_codes = {
+            normalize_code(plan.get(key) or "")
+            for plan in replacement_plan
+            if isinstance(plan, dict)
+            for key in ("sell_code", "buy_code")
+        }
+        dry_decision = {
+            "summary": "牛牛换仓成交前完整预检",
+            "actions": copy.deepcopy([
+                action
+                for action in prepared_actions
+                if normalize_code(action.get("code") or "")
+                in replacement_codes
+            ]),
+        }
+        if "decision_expires_at" in decision:
+            dry_decision["decision_expires_at"] = decision["decision_expires_at"]
+        dry_executed = execute_actions(
+            copy.deepcopy(state),
+            dry_decision,
+            candidates,
+            trade_allowed,
+            trade_reason,
+            market_strategy_ctx,
+            evaluated_at,
+            _skip_replacement_preflight=True,
+        )
+        dry_fills = {
+            (
+                str(item.get("action") or "").upper(),
+                normalize_code(item.get("code") or ""),
+            )
+            for item in dry_executed
+        }
+        valid_plan: list[dict[str, Any]] = []
+        for plan in replacement_plan:
+            sell_code = normalize_code(plan.get("sell_code") or "")
+            buy_code = normalize_code(plan.get("buy_code") or "")
+            if {
+                ("SELL", sell_code),
+                ("BUY", buy_code),
+            }.issubset(dry_fills):
+                valid_plan.append(plan)
+                continue
+            prepared_actions[:] = [
+                action
+                for action in prepared_actions
+                if not (
+                    str(action.get("action") or "").upper() == "SELL"
+                    and normalize_code(action.get("code") or "") == sell_code
+                    and str(action.get("intent") or "").upper() == "REPLACE"
+                )
+            ]
+            for action in prepared_actions:
+                if (
+                    str(action.get("action") or "").upper() == "BUY"
+                    and normalize_code(action.get("code") or "") == buy_code
+                ):
+                    action["action"] = "HOLD"
+                    action["intent"] = "HOLD_REPLACEMENT_PREFLIGHT"
+                    action["reason"] = (
+                        f"牛牛换仓预检未能同时确认卖出{sell_code}和买入"
+                        f"{buy_code}均可成交，保留原持仓"
+                    )
+            add_execution_block(
+                decision,
+                buy_code,
+                f"牛牛换仓完整成交预检失败，未卖出{sell_code}",
+                category="replacement_preflight",
+            )
+        decision["niuone_replacement_plan"] = valid_plan
+    annotate_niuone_full_book_candidates(decision, state, candidates)
+    action_limit = (
+        2 * NIUONE_MAX_OPEN_POSITIONS
+        if any(
+            str(action.get("intent") or "").upper() == "REPLACE"
+            for action in prepared_actions
+        )
+        else 5
+    )
+    for action in prepared_actions[:action_limit]:
+        if _block_expired_decision(decision, execution_now()):
+            break
+        current_allowed, current_reason = is_a_share_execution_time(evaluated_at)
         if not current_allowed:
             decision["execution_blocked_reason"] = f"执行前复核失败：{current_reason}"
             break
         act = str(action.get("action") or "HOLD").upper()
         code = normalize_code(action.get("code") or "")
+        if act == "HOLD" and code:
+            held = positions.get(code) or {}
+            if held.get("soft_exit_pending_signal") == "model_soft_exit":
+                _clear_staged_soft_exit_pending(held)
         if not code or act == "HOLD":
             continue
         q = execution_quote(code)
+        if _block_expired_decision(decision, execution_now()):
+            break
         price = q.get("price") if isinstance(q.get("price"), (int, float)) else None
         if not price or price <= 0:
             continue
@@ -7801,6 +11188,8 @@ def execute_actions(
             )
             continue
         if act == "BUY":
+            prompt_entry_result: dict[str, Any] | None = None
+            prompt_strategy_version: dict[str, Any] | None = None
             if daily_loss_budget_exceeded:
                 add_execution_block(
                     decision,
@@ -7817,7 +11206,93 @@ def execute_actions(
                     category="candidate_eligibility",
                 )
                 continue
-            if not allow_market_guidance_buys:
+            existing_pos = positions.get(code)
+            old_qty = position_qty(existing_pos or {})
+            if decision.get("holding_cycle_only") is True and old_qty <= 0:
+                add_execution_block(
+                    decision,
+                    code,
+                    "持仓快周期只允许对当前仍持有的股票加仓，不允许首次建仓或卖出后回补",
+                    category="candidate_eligibility",
+                )
+                continue
+            candidate_strategy_id = str(
+                candidate.get("best_strategy")
+                or candidate.get("buy_strategy")
+                or candidate.get("strategy_id")
+                or ""
+            )
+            reentry_blocker, reentry_audit = post_exit_reentry_audit(
+                state,
+                code,
+                candidate,
+                price=float(price),
+                today=execution_date,
+            )
+            if reentry_audit is not None:
+                action["post_exit_reentry_audit"] = reentry_audit
+            if old_qty <= 0 and reentry_blocker:
+                add_execution_block(
+                    decision,
+                    code,
+                    reentry_blocker,
+                    category="post_exit_reentry",
+                )
+                continue
+            preset_strategy_buy = (
+                candidate_strategy_id == STRATEGY_SOURCE_PRESET_TEXT
+                or isinstance(decision.get("preset_strategy_audit"), Mapping)
+            )
+            versioned_prompt_buy = bool(
+                str(candidate.get("prompt_strategy_version_id") or "")
+            )
+            if preset_strategy_buy:
+                if current_strategy_suite() != STRATEGY_SOURCE_PRESET_TEXT:
+                    add_execution_block(
+                        decision,
+                        code,
+                        "当前激活策略不是预设文字策略，旧文字策略BUY已失效",
+                        category="strategy_policy",
+                    )
+                    continue
+                if versioned_prompt_buy:
+                    (
+                        prompt_entry_result,
+                        prompt_strategy_version,
+                        preset_audit_error,
+                    ) = evaluate_prompt_entry_before_buy(
+                        candidate,
+                        code=code,
+                        name=str(name),
+                        quote=q,
+                        position=positions.get(code),
+                        account_cash=cash,
+                        evaluated_at=evaluated_at,
+                    )
+                else:
+                    preset_audit_error = validate_preset_buy_audit(
+                        decision.get("preset_strategy_audit"),
+                        code=code,
+                        candidates=candidates,
+                        current_text=current_preset_strategy_text(),
+                    )
+                if preset_audit_error:
+                    add_execution_block(
+                        decision,
+                        code,
+                        preset_audit_error,
+                        category="strategy_policy",
+                    )
+                    continue
+            buy_strategy = (
+                STRATEGY_SOURCE_PRESET_TEXT
+                if preset_strategy_buy
+                else classify_buy_strategy(reason, candidate)
+            )
+            if (
+                not allow_market_guidance_buys
+                and not is_niuone_strategy(buy_strategy)
+            ):
                 add_execution_block(
                     decision,
                     code,
@@ -7825,7 +11300,6 @@ def execute_actions(
                     category="market_guidance",
                 )
                 continue
-            buy_strategy = classify_buy_strategy(reason, candidate)
             niuone_selection_context = (
                 niuone_candidate_selection_context(
                     candidate,
@@ -7844,6 +11318,25 @@ def execute_actions(
                     category="candidate_eligibility",
                 )
                 continue
+            entry_price_blocker = None
+            if buy_strategy == "niu_reversal_probe" and old_qty <= 0:
+                entry_price_blocker = niu_reversal_entry_price_blocker(
+                    price=price,
+                    previous_close=q.get("prev_close"),
+                )
+                if entry_price_blocker and "缺少有效" in entry_price_blocker:
+                    add_execution_block(
+                        decision,
+                        code,
+                        entry_price_blocker,
+                        category="entry_price_quality",
+                    )
+                    continue
+            if is_niuone_strategy(buy_strategy):
+                turnover_blocker = niuone_turnover_blocker(q.get("turnover"))
+                if turnover_blocker:
+                    add_execution_block(decision, code, turnover_blocker, category="stock_activity")
+                    continue
             if is_niuone_strategy(buy_strategy) and quote_is_at_limit_up(code, str(name), q):
                 add_execution_block(
                     decision,
@@ -7852,16 +11345,62 @@ def execute_actions(
                     category="market_mechanics",
                 )
                 continue
-            existing_pos = positions.get(code)
-            old_qty = position_qty(existing_pos or {})
             existing_entry_strategy = position_entry_strategy(existing_pos or {}) if old_qty > 0 else ""
+            if (
+                old_qty > 0
+                and existing_entry_strategy == STRATEGY_SOURCE_PRESET_TEXT
+                and not preset_strategy_buy
+            ):
+                add_execution_block(
+                    decision,
+                    code,
+                    "预设文字策略持仓只能按买入时冻结的同版本、同解释规则加仓",
+                    category="strategy_policy",
+                )
+                continue
+            if preset_strategy_buy and old_qty > 0:
+                same_version = (
+                    str((existing_pos or {}).get("prompt_strategy_version_id") or "")
+                    == str(candidate.get("prompt_strategy_version_id") or "")
+                    if versioned_prompt_buy
+                    else str(
+                        ((existing_pos or {}).get("preset_strategy_snapshot") or {}).get(
+                            "text_sha256"
+                        )
+                        or ""
+                    )
+                    == str(
+                        ((decision.get("preset_strategy_audit") or {}).get("snapshot") or {}).get(
+                            "text_sha256"
+                        )
+                        or ""
+                    )
+                    and str(
+                        (existing_pos or {}).get("preset_strategy_interpretation_sha256")
+                        or ""
+                    )
+                    == str(
+                        (decision.get("preset_strategy_audit") or {}).get(
+                            "interpretation_sha256"
+                        )
+                        or ""
+                    )
+                )
+                if existing_entry_strategy != STRATEGY_SOURCE_PRESET_TEXT or not same_version:
+                    add_execution_block(
+                        decision,
+                        code,
+                        "不得用不同版本或不同解释的文字策略加仓，也不得混入其他策略持仓",
+                        category="strategy_policy",
+                    )
+                    continue
             if (
                 old_qty > 0
                 and str(
                     (existing_pos or {}).get("initial_buy_strategy")
                     or existing_entry_strategy
                 ) == "niu_reversal_probe"
-                and int(((existing_pos or {}).get("buy_date_lots") or {}).get(today_key(), 0) or 0) > 0
+                and int(((existing_pos or {}).get("buy_date_lots") or {}).get(execution_date, 0) or 0) > 0
             ):
                 add_execution_block(
                     decision,
@@ -7874,6 +11413,23 @@ def execute_actions(
                 (existing_pos or {}).get("initial_buy_strategy")
                 or existing_entry_strategy
             )
+            niuone_same_strategy_add = bool(
+                old_qty > 0
+                and is_niuone_strategy(buy_strategy)
+                and existing_entry_strategy == buy_strategy
+            )
+            niuone_signal_score_audit = (
+                niuone_add_signal_score_audit(
+                    existing_pos,
+                    candidate,
+                )
+                if niuone_same_strategy_add
+                else {}
+            )
+            if niuone_signal_score_audit:
+                action["niuone_add_signal_score_audit"] = dict(
+                    niuone_signal_score_audit
+                )
             niuone_rebalance_reentry = bool(
                 old_qty > 0
                 and buy_strategy == "niu_leader"
@@ -7881,24 +11437,110 @@ def execute_actions(
                     "niuone_markup_rebalance_armed"
                 ) is True
             )
+            niuone_deterministic_scale_in = bool(
+                old_qty > 0
+                and action.get("niuone_deterministic_scale_in") is True
+                and any(
+                    isinstance(item, Mapping)
+                    and normalize_code(item.get("code") or "") == code
+                    for item in (
+                        decision.get("niuone_deterministic_scale_ins") or []
+                    )
+                )
+            )
             niuone_stage_add_attempt = bool(
                 old_qty > 0
                 and (
-                    niuone_upgrade_source in {
-                        "niu_reversal_probe",
-                        "niu_emerging",
-                    }
+                    (
+                        existing_entry_strategy != buy_strategy
+                        and niuone_upgrade_source in {
+                            "niu_reversal_probe",
+                            "niu_emerging",
+                        }
+                    )
                     or niuone_rebalance_reentry
+                    or niuone_deterministic_scale_in
                 )
                 and is_niuone_strategy(buy_strategy)
             )
             current_pnl_pct = (
                 (float(price) / float((existing_pos or {}).get("avg_cost")) - 1.0)
                 * 100.0
-                if niuone_stage_add_attempt
+                if old_qty > 0
                 and _safe_float((existing_pos or {}).get("avg_cost"), 0.0) > 0
                 else 0.0
             )
+            niuone_score_scale_add = False
+            niuone_score_scale_blocker = ""
+            if (
+                niuone_same_strategy_add
+                and not niuone_rebalance_reentry
+                and not niuone_deterministic_scale_in
+            ):
+                previous_score = niuone_signal_score_audit.get(
+                    "previous_score"
+                )
+                current_score = niuone_signal_score_audit.get(
+                    "current_score"
+                )
+                if previous_score is None:
+                    niuone_score_scale_blocker = (
+                        "牛牛同股加仓缺少上次实际买入评分，无法核验信号增强"
+                    )
+                elif current_score is None:
+                    niuone_score_scale_blocker = (
+                        "牛牛同股加仓缺少本次可审计评分"
+                    )
+                elif niuone_signal_score_audit.get("eligible") is not True:
+                    niuone_score_scale_blocker = (
+                        f"牛牛同股加仓要求评分严格创新高：本次{current_score:g}"
+                        f"，持仓期最高买入评分{previous_score:g}"
+                    )
+                else:
+                    lifecycle_stage = str(
+                        candidate.get("niuone_lifecycle_stage") or ""
+                    )
+                    if buy_strategy == "niu_reversal_probe":
+                        if lifecycle_stage != "brewing":
+                            niuone_score_scale_blocker = (
+                                "牛牛试仓评分递增加仓只允许主线酝酿阶段"
+                            )
+                        elif current_pnl_pct < -1e-9:
+                            niuone_score_scale_blocker = (
+                                "牛牛评分递增加仓不向亏损持仓摊低成本"
+                            )
+                        else:
+                            niuone_score_scale_add = True
+                    elif lifecycle_stage != "markup":
+                        niuone_score_scale_blocker = (
+                            "牛牛评分递增加仓只允许主升阶段，高潮/分歧/退幕不加仓"
+                        )
+                    elif (
+                        current_pnl_pct + 1e-9
+                        < NIUONE_MARKUP_UPGRADE_MIN_PNL_PCT
+                    ):
+                        niuone_score_scale_blocker = (
+                            "牛牛评分递增加仓要求原持仓浮盈至少"
+                            f"{NIUONE_MARKUP_UPGRADE_MIN_PNL_PCT:g}%"
+                        )
+                    elif (
+                        current_pnl_pct
+                        > NIUONE_MARKUP_UPGRADE_MAX_PNL_PCT + 1e-9
+                    ):
+                        niuone_score_scale_blocker = (
+                            "牛牛评分递增加仓仅限浮盈"
+                            f"≤{NIUONE_MARKUP_UPGRADE_MAX_PNL_PCT:g}%的延续窗口"
+                        )
+                    else:
+                        niuone_score_scale_add = True
+                if not niuone_score_scale_add:
+                    add_execution_block(
+                        decision,
+                        code,
+                        niuone_score_scale_blocker,
+                        category="signal_progression",
+                    )
+                    continue
             niuone_upgrade_blocker = (
                 niuone_markup_rebalance_reentry_blocker(
                     niuone_upgrade_source,
@@ -7919,6 +11561,7 @@ def execute_actions(
             if (
                 niuone_upgrade_blocker is None
                 and not niuone_rebalance_reentry
+                and not niuone_score_scale_add
                 and buy_strategy == "niu_emerging"
                 and (existing_pos or {}).get(
                     "niuone_markup_early_scale_in_done"
@@ -7928,6 +11571,7 @@ def execute_actions(
             elif (
                 niuone_upgrade_blocker is None
                 and not niuone_rebalance_reentry
+                and not niuone_score_scale_add
                 and buy_strategy == "niu_leader"
                 and (existing_pos or {}).get(
                     "niuone_markup_confirmed_scale_in_done"
@@ -7943,8 +11587,14 @@ def execute_actions(
                 )
                 continue
             niuone_markup_scale_add = bool(
-                niuone_stage_add_attempt
-                and niuone_upgrade_blocker is None
+                (
+                    niuone_stage_add_attempt
+                    and niuone_upgrade_blocker is None
+                )
+                or (
+                    niuone_score_scale_add
+                    and buy_strategy in {"niu_emerging", "niu_leader"}
+                )
             )
             niuone_upgrade_add = bool(
                 niuone_markup_scale_add
@@ -7965,7 +11615,7 @@ def execute_actions(
                 )
                 continue
             open_position_limit = (
-                min(effective_max_open_positions, NIUONE_MAX_OPEN_POSITIONS)
+                NIUONE_MAX_OPEN_POSITIONS
                 if is_niuone_strategy(buy_strategy)
                 else effective_max_open_positions
             )
@@ -7984,27 +11634,11 @@ def execute_actions(
                     category="position_capacity",
                 )
                 continue
-            if old_qty <= 0 and is_niuone_strategy(buy_strategy):
-                action["niuone_daily_new_position_count_before"] = len(
-                    niuone_opened_today
-                )
-                action["niuone_daily_new_position_limit"] = (
-                    NIUONE_MAX_NEW_POSITIONS_PER_TRADING_DAY
-                )
-                if (
-                    len(niuone_opened_today)
-                    >= NIUONE_MAX_NEW_POSITIONS_PER_TRADING_DAY
-                ):
-                    add_execution_block(
-                        decision,
-                        code,
-                        "牛牛战法当日新开仓已达"
-                        f"{NIUONE_MAX_NEW_POSITIONS_PER_TRADING_DAY}只上限"
-                        "（跨决策轮次累计）",
-                        category="position_capacity",
-                    )
-                    continue
-            if old_qty <= 0 and new_buys >= effective_max_new_buys:
+            if (
+                old_qty <= 0
+                and not is_niuone_strategy(buy_strategy)
+                and new_buys >= effective_max_new_buys
+            ):
                 add_execution_block(
                     decision,
                     code,
@@ -8018,6 +11652,28 @@ def execute_actions(
             current_market_value = portfolio_market_value(positions)
             if existing_pos:
                 current_market_value = max(0.0, current_market_value - position_market_value(existing_pos) + current_position_value)
+            if versioned_prompt_buy:
+                quantity_policy = (
+                    (prompt_entry_result or {}).get("action_intent") or {}
+                ).get("quantity_policy") or {}
+                resolved_size = resolve_prompt_order_shares(
+                    quantity_policy,
+                    price=float(price),
+                    total_equity=total_equity,
+                    current_position_value=current_position_value,
+                    existing_quantity=old_qty,
+                )
+                if resolved_size.get("error"):
+                    add_execution_block(
+                        decision,
+                        code,
+                        str(resolved_size["error"]),
+                        category="strategy_policy",
+                    )
+                    continue
+                action["requested_shares_before_prompt_policy"] = shares
+                shares = int(resolved_size["shares"])
+                action["shares"] = shares
             requested_gross = shares * float(price)
             order_position_pct = position_pct_of_equity(requested_gross, total_equity)
             position_after_trade_value = current_position_value + requested_gross
@@ -8031,6 +11687,42 @@ def execute_actions(
             tide_position_open_risk_pct = 0.0
             tide_dynamic_position_cap_pct = 0.0
             tide_risk_budget: dict[str, float] = {}
+            prompt_required_cash_pct = max(
+                MIN_CASH_RESERVE_PCT,
+                float(
+                    market_strategy_ctx.get(
+                        "min_cash_reserve_pct",
+                        MIN_CASH_RESERVE_PCT,
+                    )
+                ),
+            )
+            prompt_total_limit_pct = min(
+                MAX_TOTAL_POSITION_PCT,
+                float(
+                    market_strategy_ctx.get(
+                        "max_total_position_pct",
+                        MAX_TOTAL_POSITION_PCT,
+                    )
+                ),
+                100.0 - prompt_required_cash_pct,
+            )
+            if versioned_prompt_buy:
+                if position_after_trade_pct > MAX_SINGLE_POSITION_PCT + 1e-9:
+                    add_execution_block(
+                        decision,
+                        code,
+                        f"文字策略买入后单票仓位{position_after_trade_pct:.2f}%超过系统硬上限{MAX_SINGLE_POSITION_PCT:g}%",
+                        category="risk_ceiling",
+                    )
+                    continue
+                if total_position_after_trade_pct > prompt_total_limit_pct + 1e-9:
+                    add_execution_block(
+                        decision,
+                        code,
+                        f"文字策略买入后总仓位{total_position_after_trade_pct:.2f}%超过系统硬上限{prompt_total_limit_pct:g}%",
+                        category="risk_ceiling",
+                    )
+                    continue
             niuone_execution_reference_price = 0.0
             niuone_execution_gap_pct: float | None = None
             niuone_entry_subroute = ""
@@ -8126,11 +11818,15 @@ def execute_actions(
                         category="market_mechanics",
                     )
                     continue
-                if buy_strategy == "niu_reversal_probe" and old_qty > 0:
+                if (
+                    buy_strategy == "niu_reversal_probe"
+                    and old_qty > 0
+                    and not niuone_score_scale_add
+                ):
                     add_execution_block(
                         decision,
                         code,
-                        "牛牛试仓只允许一次初始建仓，须满足后续阶段条件再加仓",
+                        "牛牛试仓须出现严格更高评分的后续买入信号才可加仓",
                         category="lifecycle_rule",
                     )
                     continue
@@ -8147,7 +11843,7 @@ def execute_actions(
                     )
                     continue
                 if buy_strategy == "tide_recovery" and old_qty > 0:
-                    today_lots = int(((existing_pos or {}).get("buy_date_lots") or {}).get(today_key(), 0) or 0)
+                    today_lots = int(((existing_pos or {}).get("buy_date_lots") or {}).get(execution_date, 0) or 0)
                     if today_lots > 0:
                         add_execution_block(decision, code, "冰点修复观察仓当日禁止加仓，须次日确认")
                         continue
@@ -8243,7 +11939,11 @@ def execute_actions(
                         position_entry_strategy(pos_item),
                     ) == industry
                 ]
-                if old_qty <= 0 and len(same_industry_positions) >= 2:
+                if (
+                    old_qty <= 0
+                    and not niuone_buy
+                    and len(same_industry_positions) >= 2
+                ):
                     add_execution_block(
                         decision,
                         code,
@@ -8525,6 +12225,20 @@ def execute_actions(
                     category="risk_ceiling",
                 )
                 continue
+            if versioned_prompt_buy:
+                equity_after_fees = max(0.0, total_equity - float(fees["total_fee"]))
+                cash_after_trade_pct = position_pct_of_equity(
+                    cash - total_cost,
+                    equity_after_fees,
+                )
+                if float(cash_after_trade_pct or 0) + 1e-9 < prompt_required_cash_pct:
+                    add_execution_block(
+                        decision,
+                        code,
+                        f"文字策略买入后现金{float(cash_after_trade_pct or 0):.2f}%低于系统硬下限{prompt_required_cash_pct:g}%（含交易费用）",
+                        category="risk_ceiling",
+                    )
+                    continue
             if is_zettaranc_strategy(buy_strategy) or is_dynamic_risk_strategy(buy_strategy):
                 equity_after_fees = max(0.0, total_equity - float(fees["total_fee"]))
                 cash_after_trade = cash - total_cost
@@ -8545,7 +12259,55 @@ def execute_actions(
                         category="risk_ceiling",
                     )
                     continue
+            if buy_strategy == "niu_reversal_probe" and old_qty <= 0:
+                if not _skip_replacement_preflight and str(action.get("intent") or "").upper() != "REPLACE":
+                    from trading.probe_chase import make_probe_chase_observation
+
+                    observation = make_probe_chase_observation(
+                        code, q, candidate,
+                        observed_at=(evaluated_at or datetime.now()).strftime("%Y-%m-%d %H:%M:%S"),
+                    )
+                    if observation is not None:
+                        decision.setdefault("probe_chase_observations", []).append(observation)
+                if entry_price_blocker:
+                    add_execution_block(decision, code, entry_price_blocker, category="entry_price_quality")
+                    continue
+            prompt_position_binding: dict[str, Any] | None = None
+            if versioned_prompt_buy and old_qty <= 0:
+                try:
+                    prompt_position_binding = PromptStrategyStore().bind_position(
+                        code=code,
+                        strategy_version_id=str(
+                            (prompt_strategy_version or {}).get("version_id") or ""
+                        ),
+                        entry_evaluation_id=str(
+                            (prompt_entry_result or {}).get("evaluation_id") or ""
+                        ),
+                    )
+                except Exception as exc:
+                    add_execution_block(
+                        decision,
+                        code,
+                        f"文字策略持仓版本绑定失败（{type(exc).__name__}）",
+                        category="strategy_policy",
+                    )
+                    continue
+            if _block_expired_decision(decision, execution_now()):
+                break
+            buy_trade_time = now_ts()
             pos = positions.setdefault(code, {"code": code, "name": name, "qty": 0, "avg_cost": 0.0, "buy_date_lots": {}, "last_price": price})
+            if old_qty <= 0:
+                pos[POSITION_LIFECYCLE_ID_FIELD] = _new_position_lifecycle_id(
+                    code,
+                    buy_trade_time,
+                    str(state.get("created_at") or ""),
+                )
+                pos["position_opened_at"] = buy_trade_time
+                pos.pop(AUTO_EXIT_COMPLETED_KEYS_FIELD, None)
+                for field in AUTO_EXIT_MONOTONIC_BOOL_FIELDS:
+                    pos.pop(field, None)
+                for field in AUTO_EXIT_LAST_EVENT_FIELDS:
+                    pos.pop(field, None)
             old_cost = old_qty * float(pos.get("avg_cost") or 0)
             new_qty = old_qty + qty
             pos["qty"] = new_qty
@@ -8554,6 +12316,65 @@ def execute_actions(
             pos["avg_cost"] = round((old_cost + total_cost) / new_qty, 4)
             pos["name"] = name
             pos["last_price"] = price
+            if buy_strategy == STRATEGY_SOURCE_PRESET_TEXT:
+                if versioned_prompt_buy:
+                    if old_qty <= 0:
+                        pos["prompt_strategy_version_id"] = str(
+                            (prompt_strategy_version or {}).get("version_id") or ""
+                        )
+                        pos["prompt_strategy_plan_sha256"] = str(
+                            (prompt_strategy_version or {}).get("plan_sha256") or ""
+                        )
+                        pos["prompt_strategy_entry_evaluation_id"] = str(
+                            (prompt_entry_result or {}).get("evaluation_id") or ""
+                        )
+                        pos["prompt_strategy_entry_audit_sha256"] = str(
+                            ((prompt_entry_result or {}).get("audit") or {}).get(
+                                "audit_sha256"
+                            )
+                            or ""
+                        )
+                        pos["prompt_strategy_bound_at"] = now_ts()
+                        pos["prompt_strategy_binding_id"] = str(
+                            (prompt_position_binding or {}).get("binding_id") or ""
+                        )
+                    pos["prompt_strategy_last_entry_evaluation"] = _json_safe_copy(
+                        (prompt_entry_result or {}).get("evaluation") or {}
+                    )
+                else:
+                    preset_audit = decision.get("preset_strategy_audit") or {}
+                    if old_qty <= 0:
+                        pos["preset_strategy_snapshot"] = _json_safe_copy(
+                            preset_audit.get("snapshot") or {}
+                        )
+                        pos["preset_strategy_interpretation"] = _json_safe_copy(
+                            preset_audit.get("interpretation") or {}
+                        )
+                        pos["preset_strategy_prompt_protocol"] = str(
+                            preset_audit.get("prompt_protocol") or ""
+                        )
+                        pos["preset_strategy_prompt_sha256"] = str(
+                            preset_audit.get("prompt_sha256") or ""
+                        )
+                        pos["preset_strategy_interpretation_sha256"] = str(
+                            preset_audit.get("interpretation_sha256") or ""
+                        )
+                        candidate_pool = preset_audit.get("candidate_pool") or {}
+                        pos["preset_strategy_candidate_pool_sha256"] = str(
+                            candidate_pool.get("facts_sha256") or ""
+                        )
+                        pos["preset_strategy_candidate_pool_count"] = int(
+                            candidate_pool.get("count") or 0
+                        )
+                        pos["preset_strategy_entry_audited_at"] = str(
+                            preset_audit.get("generated_at") or now_ts()
+                        )
+                industry = str(
+                    candidate.get("industry") or candidate.get("sector") or ""
+                ).strip()
+                if industry:
+                    pos["industry"] = industry
+                    pos["sector"] = industry
             if is_zettaranc_strategy(buy_strategy):
                 industry = str(candidate.get("industry") or candidate.get("sector") or "").strip()
                 if industry:
@@ -8628,7 +12449,20 @@ def execute_actions(
                     signal_theme = niuone_candidate_theme(candidate)
                     if old_qty <= 0:
                         pos["entry_theme"] = signal_theme
+                        pos["entry_turnover_pct"] = q.get("turnover")
                         pos["active_theme"] = signal_theme
+                        pos["entry_stock_activity_score"] = candidate.get(
+                            "stock_activity_score"
+                        )
+                        pos["entry_stock_market_amount_percentile"] = candidate.get(
+                            "stock_market_amount_percentile"
+                        )
+                        pos["entry_stock_theme_amount_percentile"] = candidate.get(
+                            "stock_theme_amount_percentile"
+                        )
+                        pos["entry_stock_activity_confirmed"] = bool(
+                            candidate.get("stock_activity_confirmed")
+                        )
                         pos["entry_theme_basis"] = str(
                             candidate.get("theme_basis") or ""
                         )
@@ -8868,6 +12702,69 @@ def execute_actions(
                 entry_mark_strategy = buy_strategy
                 entry_mark_component = ""
                 entry_mark_source = "BUY_ADD"
+            if is_niuone_strategy(buy_strategy):
+                filled_signal_score, filled_signal_score_source = (
+                    niuone_buy_signal_score(candidate)
+                )
+                if filled_signal_score is not None:
+                    previous_highest_score = _safe_float(
+                        pos.get("highest_buy_signal_score"),
+                        _safe_float(
+                            pos.get("last_buy_signal_score"),
+                            _safe_float(pos.get("entry_signal_score"), -1.0),
+                        ),
+                    )
+                    highest_score = (
+                        max(previous_highest_score, filled_signal_score)
+                        if previous_highest_score >= 0
+                        else filled_signal_score
+                    )
+                    pos["last_buy_signal_score"] = filled_signal_score
+                    pos["highest_buy_signal_score"] = round(
+                        highest_score,
+                        4,
+                    )
+                    pos["niuone_buy_signal_count"] = (
+                        max(
+                            int(pos.get("niuone_buy_signal_count") or 0),
+                            1 if old_qty > 0 else 0,
+                        ) + 1
+                    )
+                    score_history = list(
+                        pos.get("niuone_buy_signal_score_history") or []
+                    )
+                    score_history.append({
+                        "filled_at": now_ts(),
+                        "execution_date": execution_date,
+                        "strategy_id": buy_strategy,
+                        "score": filled_signal_score,
+                        "score_source": filled_signal_score_source,
+                        "shares": qty,
+                        "route": (
+                            "score_progression"
+                            if niuone_score_scale_add
+                            else "deterministic_stage_scale_in"
+                            if niuone_deterministic_scale_in
+                            else "markup_rebalance"
+                            if niuone_rebalance_reentry
+                            else "stage_upgrade"
+                            if niuone_upgrade_add
+                            else "open"
+                            if old_qty <= 0
+                            else "add"
+                        ),
+                    })
+                    pos["niuone_buy_signal_score_history"] = (
+                        score_history[-20:]
+                    )
+                    action["niuone_buy_signal_score"] = filled_signal_score
+                    action["niuone_buy_signal_score_source"] = (
+                        filled_signal_score_source
+                    )
+                    action["niuone_highest_buy_signal_score"] = round(
+                        highest_score,
+                        4,
+                    )
             if niuone_markup_scale_add:
                 early_markup_scale_in = buy_strategy == "niu_emerging"
                 if early_markup_scale_in:
@@ -8920,9 +12817,9 @@ def execute_actions(
                         "niuone_markup_rebalance_stall_count": 0,
                         "niuone_markup_rebalance_observation_count": 0,
                         "niuone_markup_rebalance_last_observation": (
-                            today_key()
+                            execution_date
                         ),
-                        "niuone_markup_rebalance_last_add_date": today_key(),
+                        "niuone_markup_rebalance_last_add_date": execution_date,
                         "niuone_markup_rebalance_armed": False,
                         "niuone_markup_rebalance_reduced": False,
                         "niuone_markup_rebalance_reentry_price": None,
@@ -8943,6 +12840,52 @@ def execute_actions(
                 component_strategy=entry_mark_component,
             )
             action["strategy_mark"] = entry_mark
+            if buy_strategy == STRATEGY_SOURCE_PRESET_TEXT:
+                if versioned_prompt_buy:
+                    action["prompt_strategy_version_id"] = str(
+                        pos.get("prompt_strategy_version_id") or ""
+                    )
+                    action["prompt_strategy_plan_sha256"] = str(
+                        pos.get("prompt_strategy_plan_sha256") or ""
+                    )
+                    action["prompt_strategy_entry_evaluation_id"] = str(
+                        (prompt_entry_result or {}).get("evaluation_id") or ""
+                    )
+                    action["prompt_strategy_entry_audit"] = _json_safe_copy(
+                        (prompt_entry_result or {}).get("audit") or {}
+                    )
+                else:
+                    action_preset_audit = (
+                        decision.get("preset_strategy_audit")
+                        if isinstance(decision.get("preset_strategy_audit"), Mapping)
+                        else {}
+                    )
+                    action_candidate_pool = (
+                        action_preset_audit.get("candidate_pool")
+                        if isinstance(action_preset_audit.get("candidate_pool"), Mapping)
+                        else {}
+                    )
+                    action["preset_strategy_snapshot"] = _json_safe_copy(
+                        pos.get("preset_strategy_snapshot") or {}
+                    )
+                    action["preset_strategy_interpretation"] = _json_safe_copy(
+                        pos.get("preset_strategy_interpretation") or {}
+                    )
+                    action["preset_strategy_prompt_protocol"] = str(
+                        action_preset_audit.get("prompt_protocol") or ""
+                    )
+                    action["preset_strategy_prompt_sha256"] = str(
+                        action_preset_audit.get("prompt_sha256") or ""
+                    )
+                    action["preset_strategy_interpretation_sha256"] = str(
+                        pos.get("preset_strategy_interpretation_sha256") or ""
+                    )
+                    action["preset_strategy_candidate_pool_sha256"] = str(
+                        action_candidate_pool.get("facts_sha256") or ""
+                    )
+                    action["preset_strategy_candidate_pool_count"] = int(
+                        action_candidate_pool.get("count") or 0
+                    )
             action["order_position_pct"] = order_position_pct
             action["position_after_trade_pct"] = position_after_trade_pct
             action["total_position_after_trade_pct"] = total_position_after_trade_pct
@@ -8963,14 +12906,15 @@ def execute_actions(
             prior_max_pnl = float(pos.get("max_pnl_pct") or current_pnl_pct)
             pos["max_pnl_pct"] = round(max(prior_max_pnl, current_pnl_pct), 2)
             lots = pos.setdefault("buy_date_lots", {})
-            lots[today_key()] = int(lots.get(today_key(), 0)) + qty
+            lots[execution_date] = int(lots.get(execution_date, 0)) + qty
             cash -= total_cost
             if old_qty <= 0:
                 new_buys += 1
-                if is_niuone_strategy(buy_strategy):
-                    niuone_opened_today.add(code)
+                watchlist = state.get("post_exit_reentry_watch")
+                if isinstance(watchlist, dict):
+                    watchlist.pop(code, None)
             executed_trade = {
-                "time": now_ts(), "action": "BUY", "code": code, "name": name,
+                "time": buy_trade_time, "action": "BUY", "code": code, "name": name,
                 "shares": qty, "price": round(price, 3), "amount": round(gross, 2),
                 "commission": fees["commission"], "transfer_fee": fees["transfer_fee"],
                 "stamp_duty": fees["stamp_duty"], "fee": fees["total_fee"],
@@ -8980,6 +12924,9 @@ def execute_actions(
                 "position_before_qty": old_qty,
                 "position_after_qty": old_qty + qty,
                 "position_opened": old_qty <= 0,
+                "position_lifecycle_id": str(
+                    pos.get(POSITION_LIFECYCLE_ID_FIELD) or ""
+                ),
                 "order_position_pct": order_position_pct,
                 "position_after_trade_pct": position_after_trade_pct,
                 "total_position_after_trade_pct": total_position_after_trade_pct,
@@ -8987,6 +12934,7 @@ def execute_actions(
                 "buy_strategy": buy_strategy,
                 "strategy_mark": entry_mark,
             }
+            executed_trade.update(exit_feedback_trade_audit(state))
             for key in (
                 "model_requested_shares",
                 "maximum_permitted_shares",
@@ -8994,6 +12942,18 @@ def execute_actions(
                 "risk_ceiling_utilization_pct",
                 "risk_ceiling_binding_constraints",
                 "risk_ceiling_auto_reduced",
+                "intent",
+                "replacement_source_code",
+                "niuone_priority_before",
+                "niuone_priority_after",
+                "replacement_priority_margin",
+                "replacement_priority_margin_required",
+                "niuone_add_signal_score_audit",
+                "niuone_deterministic_scale_in",
+                "niuone_buy_signal_score",
+                "niuone_buy_signal_score_source",
+                "niuone_highest_buy_signal_score",
+                "post_exit_reentry_audit",
             ):
                 if key in action:
                     executed_trade[key] = _json_safe_copy(action[key])
@@ -9003,16 +12963,72 @@ def execute_actions(
                 executed_trade["niuone_entry_context"] = dict(
                     niuone_entry_context
                 )
+            if buy_strategy == STRATEGY_SOURCE_PRESET_TEXT:
+                prompt_trade_fields = (
+                    (
+                        "prompt_strategy_version_id",
+                        "prompt_strategy_plan_sha256",
+                        "prompt_strategy_entry_evaluation_id",
+                        "prompt_strategy_entry_audit",
+                    )
+                    if versioned_prompt_buy
+                    else (
+                        "preset_strategy_snapshot",
+                        "preset_strategy_interpretation",
+                        "preset_strategy_prompt_protocol",
+                        "preset_strategy_prompt_sha256",
+                        "preset_strategy_interpretation_sha256",
+                        "preset_strategy_candidate_pool_sha256",
+                        "preset_strategy_candidate_pool_count",
+                    )
+                )
+                for key in prompt_trade_fields:
+                    executed_trade[key] = _json_safe_copy(action.get(key))
             executed.append(executed_trade)
         elif act == "SELL":
             pos = positions.get(code)
             if not pos:
                 continue
+            sell_position_lifecycle_id, _sell_cycle_trades = (
+                _ensure_position_lifecycle_id(state, code, pos)
+            )
             entry_strategy = str(
                 position_entry_strategy(pos)
                 or latest_buy_strategy_for_code(state, code)
                 or classify_buy_strategy(str(pos.get("entry_reason") or ""))
             )
+            if entry_strategy == STRATEGY_SOURCE_PRESET_TEXT:
+                preset_sell_error = validate_preset_sell_audit(
+                    decision.get("preset_exit_audit"),
+                    code=code,
+                    position_snapshot=pos.get("preset_strategy_snapshot"),
+                    position_interpretation=pos.get("preset_strategy_interpretation"),
+                    position_interpretation_sha256=str(
+                        pos.get("preset_strategy_interpretation_sha256") or ""
+                    ),
+                )
+                if preset_sell_error:
+                    add_execution_block(
+                        decision,
+                        code,
+                        preset_sell_error,
+                        category="strategy_policy",
+                    )
+                    continue
+                action["preset_strategy_text_sha256"] = str(
+                    (pos.get("preset_strategy_snapshot") or {}).get("text_sha256")
+                    or ""
+                )
+                action["preset_strategy_exit_prompt_sha256"] = str(
+                    (decision.get("preset_exit_audit") or {}).get("prompt_sha256")
+                    or ""
+                )
+                action["preset_strategy_exit_prompt_protocol"] = str(
+                    (decision.get("preset_exit_audit") or {}).get(
+                        "prompt_protocol"
+                    )
+                    or ""
+                )
             sell_niuone_entry_context = (
                 niuone_entry_context_from_position(pos)
                 if is_niuone_strategy(entry_strategy)
@@ -9032,20 +13048,102 @@ def execute_actions(
                 continue
             avg_cost = float(pos.get("avg_cost") or 0)
             available_qty = available_to_sell(pos)
+            model_requested_sell_shares = shares
+            replacement_intent = str(action.get("intent") or "").upper() == "REPLACE"
+            hard_exit_confirmed = False
+            if is_niuone_strategy(entry_strategy) and not replacement_intent:
+                hard_evidence = _niuone_position_hard_exit_evidence(pos, float(price))
+                action["niuone_hard_exit_evidence"] = hard_evidence
+                action["model_original_sell_reason"] = reason
+                # Discard any model-provided execution labels before arbitration.
+                for key in ("source_signal", "exit_rule", "soft_exit_stage"):
+                    action.pop(key, None)
+                hard_exit_confirmed = bool(hard_evidence["confirmed"])
+                if hard_exit_confirmed:
+                    action["source_signal"] = hard_evidence["signal"]
+                    action["exit_rule"] = classify_exit_rule("", hard_evidence["signal"])
+                    reason = str(hard_evidence["reason"])
+                    action["reason"] = reason
+            model_soft_exit = bool(
+                is_niuone_strategy(entry_strategy)
+                and available_qty > 0
+                and not replacement_intent
+                and not hard_exit_confirmed
+            )
+            if model_soft_exit:
+                feedback_policy = current_exit_feedback_policy(state)
+                feedback_parameters = effective_exit_feedback_parameters(feedback_policy)
+                pos["exit_feedback_policy_version"] = int(
+                    feedback_policy.get("version") or 0
+                )
+                pos["exit_feedback_soft_exit_confirmations"] = int(
+                    feedback_parameters["soft_exit_confirmations"]
+                )
+                pos["exit_feedback_soft_exit_reduce_ratio"] = float(
+                    feedback_parameters["soft_exit_reduce_ratio"]
+                )
+                staged = _resolve_staged_soft_exit(
+                    pos,
+                    _sell_signal(reason, "model_soft_exit"),
+                    session_key=execution_date,
+                )
+                if staged is None:
+                    add_execution_block(
+                        decision,
+                        code,
+                        "模型非结构性SELL仍在评分否决/跨日确认期，本轮保留持仓",
+                        category="staged_soft_exit",
+                    )
+                    continue
+                action.update({
+                    key: _json_safe_copy(staged[key])
+                    for key in (
+                        "soft_exit_stage",
+                        "soft_exit_confirmation_count",
+                        "soft_exit_confirmations_required",
+                        "source_signal",
+                        "exit_rule",
+                    )
+                    if key in staged
+                })
+                action["soft_exit_reduce_ratio"] = feedback_parameters["soft_exit_reduce_ratio"]
+                reason = str(staged.get("reason") or reason)
+                action["reason"] = reason
+                if staged.get("soft_exit_stage") == "exit":
+                    shares = available_qty
+                else:
+                    target_qty = int(
+                        available_qty * float(staged.get("sell_ratio") or 0.5)
+                    ) // 100 * 100
+                    if target_qty <= 0:
+                        pos["soft_exit_reduction_deferred"] = True
+                        pos["soft_exit_status"] = "board_lot_runner_hold"
+                        add_execution_block(
+                            decision,
+                            code,
+                            "软退出首次减仓不足一手，等待下一交易日确认",
+                            category="staged_soft_exit",
+                        )
+                        continue
+                    shares = min(shares, target_qty)
+                action["shares"] = shares
             if is_niuone_strategy(entry_strategy):
-                model_requested_sell_shares = shares
                 sell_quantity_auto_reduced = bool(
                     available_qty > 0
                     and available_qty % 100 == 0
                     and model_requested_sell_shares > available_qty
                 )
-                if sell_quantity_auto_reduced:
+                if sell_quantity_auto_reduced and not model_soft_exit:
                     shares = available_qty
                     action["shares"] = shares
                 action["sell_execution_evidence_schema_version"] = (
                     FORWARD_SELL_EXECUTION_EVIDENCE_SCHEMA_VERSION
                 )
-                action["sell_execution_source"] = "model_action"
+                action["sell_execution_source"] = (
+                    "priority_replacement"
+                    if str(action.get("intent") or "").upper() == "REPLACE"
+                    else "model_action"
+                )
                 action["model_requested_sell_shares"] = (
                     model_requested_sell_shares
                 )
@@ -9083,7 +13181,7 @@ def execute_actions(
                 if day_pnl is not None and qty > 0
                 else None
             )
-            exit_rule = classify_exit_rule(reason)
+            exit_rule = str(action.get("exit_rule") or "").strip() or classify_exit_rule(reason)
             entry_mark = compact_position_strategy_mark(pos, entry_strategy)
             exit_mark = apply_exit_strategy_mark(pos, entry_strategy, exit_rule, reason, source="SELL")
             action["strategy_mark"] = entry_mark
@@ -9101,21 +13199,40 @@ def execute_actions(
                 if is_niuone_strategy(entry_strategy)
                 else {}
             )
+            if _block_expired_decision(decision, execution_now()):
+                break
+            position_before_qty = position_qty(pos)
             pos["qty"] = position_qty(pos) - qty
             pos.pop("shares", None)
+            if action.get("soft_exit_stage") == "reduce":
+                pos["soft_exit_reduced"] = True
+                pos["soft_exit_status"] = "runner"
             pos["last_price"] = price
             # consume non-today lots FIFO-ish
             remaining = qty
             lots = pos.get("buy_date_lots") or {}
             for date in sorted(list(lots.keys())):
-                if date == today_key() or remaining <= 0:
+                if date == execution_date or remaining <= 0:
                     continue
                 use = min(int(lots.get(date) or 0), remaining)
                 lots[date] = int(lots.get(date) or 0) - use
                 remaining -= use
                 if lots[date] <= 0:
                     lots.pop(date, None)
-            if pos["qty"] <= 0:
+            position_closed = pos["qty"] <= 0
+            post_exit_watch_created = False
+            if position_closed and action.get("soft_exit_stage") == "exit":
+                _create_post_exit_reentry_watch(
+                    state,
+                    code=code,
+                    position=pos,
+                    exit_date=execution_date,
+                    exit_price=float(price),
+                    buy_strategy=entry_strategy,
+                    exit_signal=str(action.get("source_signal") or "model_soft_exit"),
+                )
+                post_exit_watch_created = True
+            if position_closed:
                 positions.pop(code, None)
             cash += net_proceeds
             executed_trade = {
@@ -9129,6 +13246,7 @@ def execute_actions(
                 "pnl": round(realized_pnl, 2),
                 "pnl_pct": round(realized_pnl_pct, 2),
                 "price_source": price_source,
+                "day_reference_price": day_reference_price if day_reference_price > 0 else None,
                 "day_pnl": round(day_pnl, 2) if day_pnl is not None else None,
                 "day_pnl_pct": round(day_pnl_pct, 2)
                 if day_pnl_pct is not None else None,
@@ -9138,19 +13256,36 @@ def execute_actions(
                 "position_before_trade_pct": position_before_trade_pct,
                 "position_after_trade_pct": position_after_trade_pct,
                 "total_position_after_trade_pct": total_position_after_trade_pct,
-                "position_before_qty": position_qty(pos) + qty,
+                "position_before_qty": position_before_qty,
                 "position_after_qty": max(0, position_qty(pos)),
-                "position_fully_closed": position_qty(pos) <= 0,
+                "position_fully_closed": position_closed,
+                "position_lifecycle_id": sell_position_lifecycle_id,
                 "trade_reason": current_reason, "reason": reason,
                 "buy_strategy": entry_strategy, "exit_rule": exit_rule,
+                "exit_signal": str(action.get("source_signal") or ""),
                 "strategy_mark": entry_mark, "exit_strategy_mark": exit_mark,
+                "post_exit_reentry_watch_created": post_exit_watch_created,
             }
+            executed_trade.update(exit_feedback_trade_audit(state))
             for key in (
+                "niuone_hard_exit_evidence",
+                "model_original_sell_reason",
                 "sell_execution_evidence_schema_version",
                 "sell_execution_source",
                 "model_requested_sell_shares",
                 "available_sell_shares",
                 "sell_quantity_auto_reduced",
+                "intent",
+                "replacement_target_code",
+                "niuone_priority_before",
+                "niuone_priority_after",
+                "replacement_priority_margin",
+                "replacement_priority_margin_required",
+                "soft_exit_stage",
+                "soft_exit_reduce_ratio",
+                "soft_exit_confirmation_count",
+                "soft_exit_confirmations_required",
+                "source_signal",
             ):
                 if key in action:
                     executed_trade[key] = _json_safe_copy(action[key])
@@ -9161,6 +13296,16 @@ def execute_actions(
             if sell_niuone_lifecycle_evidence:
                 executed_trade["niuone_lifecycle_evidence"] = dict(
                     sell_niuone_lifecycle_evidence
+                )
+            if entry_strategy == STRATEGY_SOURCE_PRESET_TEXT:
+                executed_trade["preset_strategy_text_sha256"] = str(
+                    action.get("preset_strategy_text_sha256") or ""
+                )
+                executed_trade["preset_strategy_exit_prompt_sha256"] = str(
+                    action.get("preset_strategy_exit_prompt_sha256") or ""
+                )
+                executed_trade["preset_strategy_exit_prompt_protocol"] = str(
+                    action.get("preset_strategy_exit_prompt_protocol") or ""
                 )
             executed.append(executed_trade)
     state["cash"] = round(cash, 2)
@@ -9221,11 +13366,40 @@ def _decision_has_candidate_evidence(log_entry: Mapping[str, Any]) -> bool:
 
 
 def _sync_positions_to_db(state: dict[str, Any]):
-    """将当前持仓快照同步写入 SQLite。"""
+    """将最新规范持仓快照同步写入 SQLite。"""
     try:
         from niuniu_db import snapshot_positions as _sp
-        _sp(state.get("positions", {}))
+
+        # A different writer may commit after this caller's save_state() and
+        # before its projection begins. Re-read while holding the same account
+        # lock so a delayed projection cannot replace SQLite with stale holdings.
+        with state_file_write_lock():
+            canonical_state = load_state() if STATE_FILE.exists() else state
+            _sp(canonical_state.get("positions", {}))
     except Exception: pass
+
+
+def _sync_committed_account_projections(
+    state: dict[str, Any],
+    *,
+    trades: list[dict[str, Any]] | None = None,
+    decisions: list[dict[str, Any]] | None = None,
+) -> dict[str, bool]:
+    """Project only account events whose canonical state commit has succeeded."""
+    trade_rows = [item for item in (trades or []) if isinstance(item, dict)]
+    decision_rows = [item for item in (decisions or []) if isinstance(item, dict)]
+    decision_results = [_sync_decision_to_db(item) for item in decision_rows]
+    decision_persisted = all(result is True for result in decision_results)
+    trades_persisted = _sync_trades_to_db(trade_rows)
+    if trade_rows and trades_persisted:
+        _sync_positions_to_db(state)
+    return {
+        "trades_persisted": trades_persisted,
+        "decision_persisted": decision_persisted,
+        "durable_evidence_persisted": (
+            trades_persisted and decision_persisted
+        ),
+    }
 
 
 def record_decision_log_entry(log_entry: dict[str, Any], *, mark_b1_done: bool = False) -> None:
@@ -9239,15 +13413,15 @@ def record_decision_log_entry(log_entry: dict[str, Any], *, mark_b1_done: bool =
         state["last_error"] = log_entry["decision"]["error"]
     if mark_b1_done and generated_at:
         state["last_b1_generated_at"] = generated_at
-    _sync_decision_to_db(log_entry)
     save_state(state)
+    _sync_decision_to_db(log_entry)
 
 
 def _fallback_action_reason(action: dict[str, Any], candidate: dict[str, Any] | None, act: str, name: str) -> str:
     """Build a non-empty trade reason when the model omits one."""
     explicit = str(action.get("reason") or "").strip()
     if explicit:
-        return explicit
+        return localize_strategy_text(explicit)
     if act == "BUY" and candidate:
         strategy = candidate.get("score_basis") or candidate.get("best_strategy") or "候选战法"
         score = candidate.get("best_score", candidate.get("score"))
@@ -9298,6 +13472,169 @@ def decision_has_executable_actions(decision: dict[str, Any]) -> bool:
     return False
 
 
+def append_niuone_deterministic_scale_in_actions(
+    decision: dict[str, Any],
+    state: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    market_strategy_ctx: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Add locally-qualified NiuOne Markup scale-ins to a model decision.
+
+    The model may still request an exit or its own BUY, but HOLD/omission no
+    longer prevents the frozen 10%/20% lifecycle tiers from being exercised.
+    The executor rechecks every lifecycle, risk, exposure, cash, and lot-size
+    boundary and may reduce or reject the generated order.
+    """
+    if current_strategy_suite() != "niuone":
+        return []
+    market_ctx = (
+        market_strategy_ctx
+        if isinstance(market_strategy_ctx, Mapping)
+        else {}
+    )
+    if market_ctx.get("daily_loss_budget_exceeded") is True:
+        return []
+    positions = state.get("positions") or {}
+    if not isinstance(positions, dict):
+        return []
+    actions = decision.setdefault("actions", [])
+    if not isinstance(actions, list):
+        actions = []
+        decision["actions"] = actions
+
+    # Model output is untrusted for this privileged bypass. Only actions
+    # generated below may carry the deterministic lifecycle marker.
+    decision.pop("niuone_deterministic_scale_ins", None)
+    for action in actions:
+        if isinstance(action, dict):
+            action.pop("niuone_deterministic_scale_in", None)
+
+    explicit_by_code: dict[str, set[str]] = {}
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        code = normalize_code(action.get("code") or "")
+        if code:
+            explicit_by_code.setdefault(code, set()).add(
+                str(action.get("action") or "HOLD").upper()
+            )
+
+    total_equity = portfolio_total_equity_for_limits(
+        _safe_float(state.get("cash"), 0.0),
+        positions,
+    )
+    generated: list[dict[str, Any]] = []
+    if total_equity <= 0:
+        return generated
+
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        code = normalize_code(candidate.get("code") or "")
+        pos = positions.get(code)
+        if not code or not isinstance(pos, dict) or position_qty(pos) <= 0:
+            continue
+        explicit_actions = explicit_by_code.get(code, set())
+        if "SELL" in explicit_actions or "BUY" in explicit_actions:
+            continue
+        if candidate_buy_blockers(candidate):
+            continue
+
+        source_strategy = str(
+            pos.get("initial_buy_strategy")
+            or position_entry_strategy(pos)
+        )
+        incoming_strategy = str(
+            candidate.get("best_strategy")
+            or candidate.get("strategy_id")
+            or ""
+        )
+        if source_strategy not in {"niu_reversal_probe", "niu_emerging"}:
+            continue
+        if incoming_strategy not in {"niu_emerging", "niu_leader"}:
+            continue
+        done_field = (
+            "niuone_markup_early_scale_in_done"
+            if incoming_strategy == "niu_emerging"
+            else "niuone_markup_confirmed_scale_in_done"
+        )
+        if pos.get(done_field) is True:
+            continue
+
+        signal_price = _safe_float(
+            candidate.get("price")
+            or candidate.get("recent_close")
+            or candidate.get("close")
+            or pos.get("last_price")
+            or pos.get("avg_cost"),
+            0.0,
+        )
+        avg_cost = _safe_float(pos.get("avg_cost"), 0.0)
+        if signal_price <= 0 or avg_cost <= 0:
+            continue
+        current_pnl_pct = (signal_price / avg_cost - 1.0) * 100.0
+        if niuone_markup_upgrade_blocker(
+            source_strategy,
+            candidate,
+            current_pnl_pct=current_pnl_pct,
+        ):
+            continue
+
+        target_cap_pct = (
+            NIUONE_MARKUP_EARLY_UPGRADE_POSITION_CAP_PCT
+            if incoming_strategy == "niu_emerging"
+            else NIUONE_MARKUP_UPGRADE_POSITION_CAP_PCT
+        )
+        current_value = position_qty(pos) * signal_price
+        target_value = total_equity * target_cap_pct / 100.0
+        requested_shares = int(
+            max(0.0, target_value - current_value) // (signal_price * 100)
+        ) * 100
+        if requested_shares <= 0:
+            continue
+
+        # A strict local lifecycle rule may replace HOLD, but never an explicit
+        # model BUY or SELL for the same security.
+        actions[:] = [
+            action
+            for action in actions
+            if not (
+                isinstance(action, dict)
+                and normalize_code(action.get("code") or "") == code
+                and str(action.get("action") or "HOLD").upper() == "HOLD"
+            )
+        ]
+        tier_label = "主升早期" if incoming_strategy == "niu_emerging" else "确认主升"
+        generated_action = {
+            "action": "BUY",
+            "code": code,
+            "name": candidate.get("name") or pos.get("name") or code,
+            "shares": requested_shares,
+            "target_position_pct": target_cap_pct,
+            "intent": "ADD",
+            "niuone_deterministic_scale_in": True,
+            "reason": (
+                f"牛牛本地分级加仓：{tier_label}条件满足，向"
+                f"{target_cap_pct:g}%阶段上限加仓；执行层继续按单票、"
+                "主题、组合、总仓、现金和T+1边界裁单"
+            ),
+        }
+        actions.append(generated_action)
+        generated.append(generated_action)
+        explicit_by_code.setdefault(code, set()).add("BUY")
+
+    if generated:
+        decision["niuone_deterministic_scale_ins"] = [
+            {
+                "code": action["code"],
+                "target_position_pct": action["target_position_pct"],
+                "shares": action["shares"],
+            }
+            for action in generated
+        ]
+    return generated
+
+
 def _json_safe_copy(value: Any) -> Any:
     try:
         return json.loads(json.dumps(value, ensure_ascii=False))
@@ -9332,8 +13669,12 @@ def queue_deferred_decision(
         "reason": reason,
         "strategy_suite": current_strategy_suite(),
         "decision": _json_safe_copy(decision),
-        "candidates": _json_safe_copy(candidates[:20]),
-        "candidate_evidence_schema_version": 1,
+        "candidates": _json_safe_copy(
+            candidates[:100]
+            if isinstance(decision.get("preset_strategy_audit"), Mapping)
+            else candidates[:20]
+        ),
+        "candidate_evidence_schema_version": 2,
         "execution_evidence_schema_version": (
             FORWARD_EXECUTION_EVIDENCE_SCHEMA_VERSION
         ),
@@ -9353,6 +13694,7 @@ def queue_deferred_decision(
 def execute_due_pending_decisions(now: datetime | None = None) -> dict[str, Any]:
     """Execute queued model decisions once the next A-share executable window opens."""
     now = now or datetime.now()
+    pending_started = time.monotonic()
     trade_allowed, trade_reason = is_a_share_execution_time(now)
     if not trade_allowed:
         return {"executed": [], "attempted": 0, "reason": trade_reason}
@@ -9362,15 +13704,21 @@ def execute_due_pending_decisions(now: datetime | None = None) -> dict[str, Any]
         return {"executed": [], "attempted": 0}
 
     all_executed: list[dict[str, Any]] = []
+    committed_decisions: list[dict[str, Any]] = []
     attempted = 0
     changed = False
     for entry in pending:
         if not isinstance(entry, dict) or entry.get("status") != "pending":
             continue
+        current = now + timedelta(seconds=time.monotonic() - pending_started)
         due_dt = parse_ts(entry.get("due_at") or "")
-        if due_dt and now < due_dt:
+        if due_dt and current < due_dt:
             continue
-        if due_dt and now.date() > due_dt.date():
+        queued_decision = entry.get("decision") or {}
+        if "decision_expires_at" not in queued_decision:
+            queued_decision["decision_expires_at"] = decision_expiry(due_dt) if due_dt else "invalid"
+            entry["decision"] = queued_decision
+        if _block_expired_decision(queued_decision, current):
             entry["status"] = "expired"
             entry["expired_at"] = now_ts()
             changed = True
@@ -9404,14 +13752,22 @@ def execute_due_pending_decisions(now: datetime | None = None) -> dict[str, Any]
                 else []
             )
             decision["summary"] += "；策略已切换，旧策略买入候选已移除"
-        market_strategy_ctx = select_current_market_strategy_context(state, now)
-        refine_overlimit_buy_actions(
-            decision,
-            state,
-            candidates if isinstance(candidates, list) else [],
-            enrich_portfolio(state),
-            market_strategy_ctx,
-        )
+        market_strategy_ctx = select_current_market_strategy_context(state, current)
+        refinement_started = time.monotonic()
+        try:
+            remaining = (datetime.fromisoformat(decision["decision_expires_at"]) - current).total_seconds()
+            with model_request_budget(min(DECISION_REQUEST_TIMEOUT, remaining)):
+                refine_overlimit_buy_actions(
+                    decision,
+                    state,
+                    candidates if isinstance(candidates, list) else [],
+                    enrich_portfolio(state),
+                    market_strategy_ctx,
+                )
+        except (ModelAdmissionError, ModelRequestExpired) as exc:
+            decision["error"] = f"{type(exc).__name__}: {exc}"
+            # Keep the proposal for audit, but do not execute an unreviewed order.
+            add_execution_block(decision, "", str(exc), category="model_unavailable")
         decision["_niuone_execution_context"] = {
             "entry_signal_generated_at": entry.get("b1_generated_at") or "",
             "entry_schedule_slot": entry.get("schedule_slot") or "",
@@ -9419,15 +13775,19 @@ def execute_due_pending_decisions(now: datetime | None = None) -> dict[str, Any]
             "entry_schedule_triggered_at": entry.get("schedule_triggered_at") or "",
             "entry_execution_mode": "deferred",
         }
-        executed = execute_actions(
+        execution_now = current + timedelta(seconds=time.monotonic() - refinement_started)
+        expired = _block_expired_decision(decision, execution_now)
+        executed = [] if expired or decision.get("error") else execute_actions(
             state,
             decision,
             candidates if isinstance(candidates, list) else [],
             True,
             f"延迟成交触发：原计划{entry.get('schedule_slot') or '-'}，{trade_reason}",
             market_strategy_ctx,
+            evaluated_at=execution_now,
         )
-        entry["status"] = "executed"
+        entry["status"] = "expired" if expired else "failed" if decision.get("error") else "executed"
+        entry["decision"] = _json_safe_copy(decision)
         entry["executed_at"] = now_ts()
         entry["executed_count"] = len(executed)
         changed = True
@@ -9455,22 +13815,41 @@ def execute_due_pending_decisions(now: datetime | None = None) -> dict[str, Any]
         state.setdefault("decision_log", []).append(log_entry)
         del state["decision_log"][:-50]
         state["last_decision_at"] = log_entry["time"]
-        _sync_decision_to_db(log_entry)
+        committed_decisions.append(log_entry)
 
     if changed:
-        if all_executed:
-            _sync_trades_to_db(all_executed)
-            _sync_positions_to_db(state)
         record_equity(state)
         save_state(state)
+        persistence_status = _sync_committed_account_projections(
+            state,
+            trades=all_executed,
+            decisions=committed_decisions,
+        )
+        all_executed = _accounted_trade_executions(all_executed)
         if all_executed:
             _notify_trade_executions_safely(all_executed)
-    return {"executed": all_executed, "attempted": attempted}
+    else:
+        persistence_status = _default_persistence_status()
+    return {
+        "executed": all_executed,
+        "attempted": attempted,
+        **persistence_status,
+    }
 
 
 def run_decision_after_b1(b1_payload: dict[str, Any], force: bool = False) -> dict[str, Any]:
     state = load_state()
+    auto_exit_refresh_baseline = _auto_exit_refresh_baseline(state)
     generated_at = b1_payload.get("generated_at") or now_ts()
+    decision_cycle_kind = str(
+        b1_payload.get("decision_cycle_kind") or ""
+    ).strip()
+    holding_cycle_only = b1_payload.get("holding_cycle_only") is True
+    holding_cycle_codes = {
+        normalize_code(code)
+        for code in (b1_payload.get("holding_cycle_codes") or [])
+        if normalize_code(code)
+    }
     schedule_slot = b1_payload.get("schedule_slot") or ""
     schedule_run_kind = b1_payload.get("schedule_run_kind") or ""
     schedule_triggered_at = b1_payload.get("schedule_triggered_at") or ""
@@ -9486,9 +13865,16 @@ def run_decision_after_b1(b1_payload: dict[str, Any], force: bool = False) -> di
     sync_niuone_position_context(state, b1_payload)
     sync_zettaranc_position_context(state, b1_payload)
     state.pop(AUTO_EXIT_PERSISTENCE_STATUS_KEY, None)
-    position_exit_executed = run_position_exit_checks_before_decision(
-        state,
-        datetime.now(),
+    state[AUTO_EXIT_REFRESH_BASELINE_KEY] = auto_exit_refresh_baseline
+    try:
+        position_exit_executed = run_position_exit_checks_before_decision(
+            state,
+            datetime.now(),
+        )
+    finally:
+        state.pop(AUTO_EXIT_REFRESH_BASELINE_KEY, None)
+    position_exit_executed = _accounted_trade_executions(
+        position_exit_executed
     )
     position_exit_persistence = _pop_auto_exit_persistence_status(state)
     if already_decided:
@@ -9497,13 +13883,13 @@ def run_decision_after_b1(b1_payload: dict[str, Any], force: bool = False) -> di
             str(generated_at),
             str(schedule_slot),
         )
+        record_equity(state)
+        save_state(state)
         decision_persisted = bool(
             prior_decision
             and _decision_has_candidate_evidence(prior_decision)
             and _sync_decision_to_db(prior_decision)
         )
-        record_equity(state)
-        save_state(state)
         if position_exit_executed:
             _notify_trade_executions_safely(position_exit_executed)
         return {
@@ -9552,6 +13938,7 @@ def run_decision_after_b1(b1_payload: dict[str, Any], force: bool = False) -> di
 
     compact_market_ctx = compact_market_strategy_context(market_strategy_ctx)
     state["market_decision_context"] = compact_market_ctx
+    frozen_prompt_version = active_frozen_prompt_strategy()
 
     # 自适应参数
     adaptive = get_adaptive_params()
@@ -9567,6 +13954,50 @@ def run_decision_after_b1(b1_payload: dict[str, Any], force: bool = False) -> di
             and candidate_is_buyable(c)
         )
     ]
+    if holding_cycle_only:
+        open_holding_codes = {
+            normalize_code(code)
+            for code, position in (state.get("positions") or {}).items()
+            if isinstance(position, dict) and position_qty(position) > 0
+        }
+        allowed_holding_codes = open_holding_codes & holding_cycle_codes
+        candidates = [
+            candidate
+            for candidate in candidates
+            if normalize_code(candidate.get("code") or "")
+            in allowed_holding_codes
+        ]
+    if frozen_prompt_version is not None:
+        frozen_version_id = str(frozen_prompt_version.get("version_id") or "")
+        prompt_exit_codes = {
+            normalize_code(item.get("code") or "")
+            for item in position_exit_executed
+            if isinstance(item, Mapping)
+            and str(item.get("action") or "").upper() == "SELL"
+            and str(item.get("prompt_strategy_version_id") or "")
+        }
+        conflict_policy = str(
+            ((frozen_prompt_version.get("execution_plan") or {}).get("strategy") or {}).get(
+                "conflict_policy"
+            )
+            or "exit_first"
+        )
+        candidates = [
+            candidate
+            for candidate in candidates
+            if str(candidate.get("prompt_strategy_version_id") or "")
+            == frozen_version_id
+            and not (
+                conflict_policy == "exit_first"
+                and normalize_code(candidate.get("code") or "") in prompt_exit_codes
+            )
+        ]
+    if (
+        current_strategy_suite() == STRATEGY_SOURCE_PRESET_TEXT
+        and frozen_prompt_version is None
+        and not current_preset_strategy_text()
+    ):
+        candidates = []
     candidate_evidence = build_practice_candidate_evidence(
         observed_candidates,
         candidates,
@@ -9583,10 +14014,67 @@ def run_decision_after_b1(b1_payload: dict[str, Any], force: bool = False) -> di
     if market_sent["sentiment"] == "cold" and trade_allowed:
         sentiment_note = f"⚠️市场情绪偏冷({market_sent['detail']})，建议仓位减半或不建仓"
     portfolio = enrich_portfolio(state)
+    portfolio["_preset_position_policy_context"] = preset_position_policy_context(state)
     has_open_positions = any(
         isinstance(pos, dict) and position_qty(pos) > 0
         for pos in (state.get("positions") or {}).values()
     )
+
+    def make_decision(reason: str) -> dict[str, Any]:
+        # Only intentional session deferral changes the execution anchor.
+        # Model generation/refinement still shares one elapsed-time budget.
+        anchor = parse_ts(deferred_due_at or str(generated_at))
+        if not deferred_due_at and anchor is not None and anchor > datetime.now() + timedelta(seconds=5):
+            raise ModelRequestExpired("decision_input_clock_invalid")
+        expiry = decision_expiry(anchor) if anchor is not None else "invalid"
+        freshness = {"decision_expires_at": expiry}
+        if decision_is_expired(freshness, datetime.now()):
+            raise ModelRequestExpired("decision_input_expired")
+        remaining = (datetime.fromisoformat(expiry) - datetime.now()).total_seconds()
+        with model_request_budget(min(DECISION_REQUEST_TIMEOUT, remaining)):
+            resolved_decision = generate_decision(reason)
+            resolved_decision.update(freshness)
+            if not _block_expired_decision(resolved_decision, datetime.now()) and frozen_prompt_version is None:
+                refine_overlimit_buy_actions(resolved_decision, state, candidates, portfolio, market_strategy_ctx)
+        return resolved_decision
+
+    def generate_decision(reason: str) -> dict[str, Any]:
+        if frozen_prompt_version is not None:
+            resolved_decision = build_local_prompt_decision(
+                candidates,
+                state,
+                frozen_prompt_version,
+                market_strategy_ctx,
+            )
+            resolved_decision["market_guidance"] = compact_market_ctx
+            resolved_decision["decision_intelligence"] = safe_decision_intelligence_context(
+                portfolio,
+                candidates,
+                market_strategy_ctx,
+                "",
+            )
+            resolved_decision["decision_reason"] = reason
+        else:
+            resolved_decision = call_model_decision(
+                candidates,
+                portfolio,
+                True,
+                reason,
+                market_strategy_ctx,
+            )
+        append_niuone_deterministic_scale_in_actions(
+            resolved_decision,
+            state,
+            candidates,
+            market_strategy_ctx,
+        )
+        if holding_cycle_only:
+            resolved_decision["holding_cycle_only"] = True
+            resolved_decision["decision_cycle_kind"] = (
+                decision_cycle_kind or "holding_fast"
+            )
+        return resolved_decision
+
     try:
         if not has_open_positions and (not candidates or buy_budget_exceeded):
             summary = (
@@ -9610,8 +14098,7 @@ def run_decision_after_b1(b1_payload: dict[str, Any], force: bool = False) -> di
                 f"计划{schedule_slot[-5:]}选股属于上午连续竞价时段；当前{trade_reason}。"
                 f"请正常生成买卖策略，系统会在{deferred_due_at[-8:-3]}开盘后复核并成交。"
             )
-            decision = call_model_decision(candidates, portfolio, True, model_trade_reason, market_strategy_ctx)
-            refine_overlimit_buy_actions(decision, state, candidates, portfolio, market_strategy_ctx)
+            decision = make_decision(model_trade_reason)
             execution_allowed, execution_reason = is_a_share_execution_time()
             if execution_allowed:
                 trade_allowed = True
@@ -9664,8 +14151,7 @@ def run_decision_after_b1(b1_payload: dict[str, Any], force: bool = False) -> di
             }
             executed = []
         else:
-            decision = call_model_decision(candidates, portfolio, trade_allowed, trade_reason, market_strategy_ctx)
-            refine_overlimit_buy_actions(decision, state, candidates, portfolio, market_strategy_ctx)
+            decision = make_decision(trade_reason)
             execution_allowed, execution_reason = is_a_share_execution_time()
             if not execution_allowed:
                 decision["decision_trade_reason"] = trade_reason
@@ -9689,7 +14175,11 @@ def run_decision_after_b1(b1_payload: dict[str, Any], force: bool = False) -> di
         state["last_error"] = ""
     except Exception as exc:
         decision = {
-            "summary": "模型决策失败，本轮不交易",
+            "summary": (
+                "本地文字策略决策失败，本轮不交易"
+                if frozen_prompt_version is not None
+                else "模型决策失败，本轮不交易"
+            ),
             "actions": [],
             "model": MODEL,
             "provider": PROVIDER_DISPLAY_NAME,
@@ -9704,6 +14194,11 @@ def run_decision_after_b1(b1_payload: dict[str, Any], force: bool = False) -> di
         }
         executed = []
         state["last_error"] = decision["error"]
+    if holding_cycle_only:
+        decision["holding_cycle_only"] = True
+        decision["decision_cycle_kind"] = decision_cycle_kind or "holding_fast"
+    if "niuone_capacity_observation" not in decision:
+        annotate_niuone_full_book_candidates(decision, state, candidates)
     state["last_b1_generated_at"] = generated_at
     state["last_decision_at"] = now_ts()
     log_entry = {
@@ -9714,7 +14209,7 @@ def run_decision_after_b1(b1_payload: dict[str, Any], force: bool = False) -> di
         "decision": decision,
         "executed": executed,
         "market_decision_context": compact_market_ctx,
-        "candidate_evidence_schema_version": 1,
+        "candidate_evidence_schema_version": 2,
         "execution_evidence_schema_version": (
             FORWARD_EXECUTION_EVIDENCE_SCHEMA_VERSION
         ),
@@ -9722,25 +14217,35 @@ def run_decision_after_b1(b1_payload: dict[str, Any], force: bool = False) -> di
     }
     if schedule_slot:
         log_entry["schedule_slot"] = schedule_slot
+    if schedule_run_kind:
         log_entry["schedule_run_kind"] = schedule_run_kind
+    if schedule_triggered_at:
         log_entry["schedule_triggered_at"] = schedule_triggered_at
+    if decision_cycle_kind:
+        log_entry["decision_cycle_kind"] = decision_cycle_kind
+    if holding_cycle_only:
+        log_entry["holding_cycle_only"] = True
     state.setdefault("decision_log", []).append(log_entry)
     del state["decision_log"][:-50]
-    decision_persisted = _sync_decision_to_db(log_entry)
     candidate_evidence_valid = _decision_has_candidate_evidence(log_entry)
-    model_trades_persisted = _sync_trades_to_db(executed)
-    if executed and model_trades_persisted:
-        _sync_positions_to_db(state)
     record_equity(state)
     save_state(state)
-    all_executed = [*position_exit_executed, *executed]
+    model_persistence = _sync_committed_account_projections(
+        state,
+        trades=executed,
+        decisions=[log_entry],
+    )
+    decision_persisted = model_persistence["decision_persisted"]
+    model_trades_persisted = model_persistence["trades_persisted"]
+    model_executed = _accounted_trade_executions(executed)
+    all_executed = [*position_exit_executed, *model_executed]
     if all_executed:
         _notify_trade_executions_safely(all_executed)
     return {
         "decision": decision,
         "executed": all_executed,
         "position_exit_executed": position_exit_executed,
-        "model_executed": executed,
+        "model_executed": model_executed,
         "decision_persisted": decision_persisted,
         "candidate_evidence_valid": candidate_evidence_valid,
         "trades_persisted": (
@@ -9779,16 +14284,18 @@ def build_trade_rule_note() -> str:
     return (
         f"100股整数倍、T+1；模拟成交仅允许09:30-11:30、13:00-15:00，"
         f"09:15-09:25只作开盘集合竞价观察/申报参考，09:25-09:30静默期不按参考价记成交。"
-        f"买入硬约束：最多{MAX_OPEN_POSITIONS}只持仓、单轮最多{MAX_NEW_BUYS_PER_DECISION}笔新仓、"
-        f"午盘前默认最多{MORNING_MAX_OPEN_POSITIONS}只；Z哥单票按战法硬限制且最高{MAX_SINGLE_POSITION_PCT:g}%，"
+        f"普通策略买入硬约束：最多{MAX_OPEN_POSITIONS}只持仓、单轮最多{MAX_NEW_BUYS_PER_DECISION}笔新仓、"
+        f"午盘前默认最多{MORNING_MAX_OPEN_POSITIONS}只；牛牛不受这些开仓数量限制，只保留最多{NIUONE_MAX_OPEN_POSITIONS}只及风险预算。Z哥单票按战法硬限制且最高{MAX_SINGLE_POSITION_PCT:g}%，"
         f"总仓位最高{MAX_TOTAL_POSITION_PCT:g}%并至少保留{MIN_CASH_RESERVE_PCT:g}%现金；其他人格仓位由模型结合盘面与风险决定。"
         f"板块潮汐另行按市场状态硬执行单笔/组合/行业动态风险预算、总仓45%/30%/15%、行业敞口12%/10%/6%；"
         f"单票8%/6%/4%仅为绝对天花板。"
-        f"牛牛战法按主线酝酿→主升→高潮→分歧→退幕识别，试仓只参与candidate/emerging早段，candidate强势股等待启动确认；主升围绕启动/领涨，高潮不追普遍新仓，分歧只观察核心股调整后转强或减仓，持续回落不触发买点，退幕只退出。"
-        f"当日跨决策轮次累计最多新开{NIUONE_MAX_NEW_POSITIONS_PER_TRADING_DAY}只、最多同时持有{NIUONE_MAX_OPEN_POSITIONS}只，并硬执行单笔/组合/主题风险预算；总仓70%/55%/35%、主题敞口55%/40%/25%，"
-        f"领涨/转强/启动/试仓单票绝对上限30%/25%/15%/6.25%，试仓单笔风险仅0.35%/0.30%/0.25%。"
+        f"牛牛战法按主线酝酿→主升→高潮→分歧→退幕识别，试仓只参与酝酿候选和启动早段，酝酿候选中的强势股等待启动确认；主升围绕启动/领涨，高潮不追普遍新仓，分歧只观察核心股调整后转强或减仓，持续回落不触发买点，退幕只退出。"
+        f"新开仓不设上午/下午、单轮或单日数量上限，盘面总结/评价不改变开仓数量，最多同时持有{NIUONE_MAX_OPEN_POSITIONS}只；满仓换仓默认至少需要{NIUONE_REPLACEMENT_PRIORITY_MARGIN:g}分优势，自动反馈启用时只可在3～5分审计网格内调整，并硬执行单笔/组合/主题风险预算；总仓70%/55%/35%、主题敞口55%/40%/25%，"
+        f"领涨/转强/启动/试仓单票绝对上限30%/25%/15%/10%，试仓单笔风险为0.35%/1.00%/0.25%。"
+        f"同股同战法再次BUY只在评分严格刷新持仓期实际买入最高分时加仓；试仓当日禁加、亏损不补，成熟路径仍须主升强领涨且浮盈2%～12%。"
         f"允许无明确主线；单只股票独强不得确认主线，日线V型结构则按独立试仓路径评估。"
-        f"系统底线风控：峰值回撤/ATR吊灯保护、持仓超25日退出；"
+        f"系统底线风控：结构止损、市场硬停止、峰值回撤/ATR吊灯保护、持仓超25日退出；普通未兑现、评分、板块转弱等软退出先减半，跨交易日确认后才清余仓，4-5分防卖飞评分首日否决；"
+        f"牛牛模型SELL只有执行现价跌破结构/成本保护线、主线失活或市场硬停止且主线转弱得到本地证据确认，才能按硬退出执行；理由中的止损/破位等词不授权清仓，缺少理由也进入软退出确认；明确HOLD重置模型软退出确认。"
         f"Z哥卖出风控：少妇B1至少观察{SHAOFU_MIN_HOLD_TRADING_DAYS}个交易日，开盘前30分钟仅执行硬退出，普通转弱经行业资金/预测量能连续确认后先减半；"
         f"模型SELL不直接成交。另保留防卖飞5分评分、B3次日不涨离场({B3_EXIT_HHMM}开盘检查)、B2两日不延续离场、超级B1未兑现离场({TIME_EXIT_HHMM}尾盘检查)、"
         f"卤煮半仓、S1/S2/S3逃顶、出货五式、BBI/白线两日破位、白线死叉黄线。"
@@ -9817,8 +14324,33 @@ def snapshot_closing_equity_once() -> dict[str, Any]:
     _refresh_position_bbi(state)
     rebuild_intraday_equity_curve(state, now=now)
     record_equity(state)
-    _sync_positions_to_db(state)
+    try:
+        from trading.post_exit_observations import refresh_post_exit_observations
+
+        feedback_config = exit_feedback_auto_tune_config()
+        state["post_exit_observation_summary"] = refresh_post_exit_observations(
+            now=now,
+            auto_tune_enabled=bool(feedback_config["enabled"]),
+            auto_tune_min_samples=int(feedback_config["min_samples"]),
+            auto_tune_min_months=int(feedback_config["min_months"]),
+            auto_tune_cooldown_samples=int(feedback_config["cooldown_samples"]),
+        )
+        state["exit_feedback_policy"] = dict(
+            state["post_exit_observation_summary"].get("feedback_policy") or {}
+        )
+    except Exception as exc:
+        state["post_exit_observation_summary"] = {
+            "error": type(exc).__name__,
+            "updated_at": now_ts(),
+        }
+    try:
+        from trading.probe_chase import refresh_probe_chase_outcomes
+
+        state["probe_chase_summary"] = refresh_probe_chase_outcomes(now=now)
+    except Exception as exc:
+        state["probe_chase_summary"] = {"status": "refresh_failed", "error_type": type(exc).__name__}
     save_state(state)
+    _sync_positions_to_db(state)
     today = now.strftime("%Y-%m-%d")
     closing_points = [
         point
@@ -9864,13 +14396,13 @@ def get_dashboard_payload() -> dict[str, Any]:
     refresh_today_sold_stocks(state)
     if not rebuild_intraday_equity_curve(state, now=now) and is_a_share_session_clock(now):
         record_equity(state)
-    _sync_positions_to_db(state)
     current_market_ctx = select_current_market_strategy_context(state, now)
     if current_market_ctx:
         state["market_decision_context"] = current_market_ctx
     save_state(state)
+    _sync_positions_to_db(state)
     
-    payload = enrich_portfolio(state)
+    payload = enrich_portfolio_with_realized_history(state)
     payload["equity_history"] = load_account_history(
         "equity_history",
         state.get("equity_history", []),
@@ -9895,7 +14427,7 @@ def get_dashboard_payload() -> dict[str, Any]:
     payload["trading_paused"] = state.get("trading_paused", False)
     payload["pause_reason"] = state.get("pause_reason", "")
     payload["pause_since"] = state.get("pause_since", "")
-    payload["strategy_performance"] = track_strategy_performance(state)
+    payload["strategy_performance"] = build_strategy_performance(state)
     payload["trade_rule_note"] = build_trade_rule_note()
     payload["fee_rule"] = {
         "commission_rate": COMMISSION_RATE,

@@ -25,9 +25,6 @@ def message_dedupe_key(msg_id: Any, category: Any, content: Any, external_id: An
     content_text = str(content or "")
     category_text = str(category or "")
     external_text = str(external_id or "")
-    if category_text == "us_ratings" and "买入评级" in content_text:
-        normalized = " ".join(content_text.split())[:220]
-        return f"us_ratings:{normalized}"
     if category_text == "x_monitor" and external_text:
         return f"x_monitor:{external_text}"
     return str(msg_id or "")

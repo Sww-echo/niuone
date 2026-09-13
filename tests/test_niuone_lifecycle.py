@@ -282,10 +282,15 @@ class NiuOneLifecycleTests(unittest.TestCase):
         self.assertEqual(classify_strategy_text("牛牛承接"), "niu_pullback")
         self.assertEqual(classify_strategy_text("牛牛回踩"), "niu_pullback")
         self.assertIn("酝酿、主升、高潮、分歧、退幕", STRATEGY_SUITES["niuone"]["desc"])
+        discipline = default_trade_discipline_text(niuone_enabled=True)
         self.assertIn(
             "主线酝酿→主升→高潮→分歧→退幕",
-            default_trade_discipline_text(niuone_enabled=True),
+            discipline,
         )
+        self.assertIn("牛牛新开仓数量不受盘面总结/评价", discipline)
+        self.assertIn("盘面评价产生的动态持仓数、单轮新仓数或暂停字段不改变", discipline)
+        self.assertNotIn("单次决策最多给2条新买入", discipline)
+        self.assertNotIn("每天最多2只", discipline)
 
 
 if __name__ == "__main__":

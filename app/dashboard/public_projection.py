@@ -12,9 +12,13 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 from app.dashboard.niuone_mainline import build_niuone_mainline_view
+from app.dashboard.today_candidates import (
+    TODAY_CANDIDATE_FIELDS,
+    TODAY_CANDIDATE_MAX_TRANSITION_POINTS,
+)
 
 
-PUBLIC_SCHEMA_VERSION = 8
+PUBLIC_SCHEMA_VERSION = 13
 
 ACCOUNT_FIELDS = (
     "initial_cash",
@@ -23,6 +27,8 @@ ACCOUNT_FIELDS = (
     "total_equity",
     "total_pnl",
     "total_pnl_pct",
+    "daily_pnl",
+    "daily_pnl_pct",
     "sector_tide_open_risk_pct",
 )
 POSITION_FIELDS = (
@@ -63,6 +69,9 @@ TRADE_FIELDS = (
     "fee",
     "pnl",
     "pnl_pct",
+    "cumulative_realized_pnl",
+    "realized_return_pct",
+    "realized_return_status",
     "is_full_exit",
     "position_after_trade_pct",
     "reason",
@@ -118,6 +127,12 @@ CANDIDATE_FIELDS = (
     "sector_status",
     "sector_score",
     "stock_sector_rank",
+    "stock_activity_data_available",
+    "stock_market_amount_percentile",
+    "stock_theme_amount_percentile",
+    "stock_volume_participation_percentile",
+    "stock_activity_score",
+    "stock_activity_confirmed",
     "reversal_basis",
     "daily_v_reversal",
     "daily_v_left_peak_date",
@@ -243,6 +258,35 @@ def _candidate_strategy_distribution(source: Any, *, limit: int = 30) -> dict[st
     return result
 
 
+def _today_candidate_rows(source: Any, *, limit: int = 1_200) -> list[dict[str, Any]]:
+    if not isinstance(source, list):
+        return []
+    result: list[dict[str, Any]] = []
+    fields = (
+        *TODAY_CANDIDATE_FIELDS,
+        "first_qualified_at",
+        "last_qualified_at",
+        "best_qualified_at",
+        "qualified_count",
+        "currently_qualified",
+    )
+    for item in source[:limit]:
+        row = _copy_fields(item, fields)
+        if isinstance(item, Mapping):
+            row["qualification_transitions"] = _copy_rows(
+                item.get("qualification_transitions"),
+                ("at", "qualified", "score", "strategy"),
+                limit=TODAY_CANDIDATE_MAX_TRANSITION_POINTS,
+            )
+        for key in ("hard_blockers", "risk_flags"):
+            values = item.get(key) if isinstance(item, Mapping) else None
+            if isinstance(values, list):
+                row[key] = [_public_scalar(value) for value in values[:12]]
+        if row:
+            result.append(row)
+    return result
+
+
 def _benchmark_rows(source: Any) -> list[dict[str, Any]]:
     if not isinstance(source, list):
         return []
@@ -260,6 +304,7 @@ def build_public_sections(
     practice: Mapping[str, Any] | None,
     *,
     candidates: Mapping[str, Any] | None = None,
+    today_candidates: Mapping[str, Any] | None = None,
     benchmarks: Mapping[str, Any] | None = None,
     messages: Mapping[str, Any] | None = None,
     market_summary: Mapping[str, Any] | None = None,
@@ -269,6 +314,7 @@ def build_public_sections(
 
     practice = practice if isinstance(practice, Mapping) else {}
     candidates = candidates if isinstance(candidates, Mapping) else {}
+    today_candidates = today_candidates if isinstance(today_candidates, Mapping) else {}
     benchmarks = benchmarks if isinstance(benchmarks, Mapping) else {}
     messages = messages if isinstance(messages, Mapping) else {}
     market_summary = market_summary if isinstance(market_summary, Mapping) else {}
@@ -319,6 +365,20 @@ def build_public_sections(
             candidates.get("strategy_distribution")
         ),
     }
+    today_candidate_items = today_candidates.get("items")
+    today_candidate_default_count = (
+        len(today_candidate_items) if isinstance(today_candidate_items, list) else 0
+    )
+    today_candidate_section = {
+        "schema_version": PUBLIC_SCHEMA_VERSION,
+        "current_date": _public_scalar(today_candidates.get("current_date") or ""),
+        "generated_at": _public_scalar(today_candidates.get("generated_at") or ""),
+        "scan_count": max(0, _public_int(today_candidates.get("scan_count"))),
+        "count": _public_int(today_candidates.get("count"), today_candidate_default_count),
+        "current_count": max(0, _public_int(today_candidates.get("current_count"))),
+        "items": _today_candidate_rows(today_candidate_items),
+        "strategy_meta": _candidate_strategy_meta(today_candidates.get("strategy_meta")),
+    }
     benchmark_section = {
         "schema_version": PUBLIC_SCHEMA_VERSION,
         "items": _benchmark_rows(benchmarks.get("items")),
@@ -344,6 +404,7 @@ def build_public_sections(
         "history": history,
         "activity": activity,
         "candidates": candidate_section,
+        "today_candidates": today_candidate_section,
         "benchmarks": benchmark_section,
         "messages": message_section,
         "market_summary": summary_section,

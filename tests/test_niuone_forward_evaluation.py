@@ -14,7 +14,8 @@ from unittest import mock
 
 from app.strategies.lifecycle import NIUONE_LIFECYCLE_STAGES
 from app.trading.niuone_forward import (
-    evaluate_niuone_forward,
+    DEFAULT_COHORT_START,
+    evaluate_niuone_forward as _evaluate_niuone_forward,
     load_niuone_forward_daily_equity_from_db,
     load_niuone_forward_decisions_from_db,
     load_niuone_forward_trades_from_db,
@@ -38,16 +39,29 @@ from app.trading.niuone_forward_service import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
+LEGACY_TEST_COHORT_START = "2026-08-04"
+
+
+def evaluate_niuone_forward(*args, **kwargs):
+    """Keep historical fixtures explicit while production starts a v33 cohort."""
+
+    kwargs.setdefault("cohort_start", LEGACY_TEST_COHORT_START)
+    return _evaluate_niuone_forward(*args, **kwargs)
 
 
 def complete_context(**overrides):
     context = {
+        "entry_turnover_pct": 4.0,
         "entry_niuone_lifecycle_stage": "brewing",
         "entry_niuone_lifecycle_label": "主线酝酿",
         "entry_niuone_lifecycle_order": 10,
         "entry_niuone_lifecycle_entry_policy": "probe_only",
         "entry_mainline_state": "candidate",
         "entry_signal_score": 9.1,
+        "entry_stock_activity_score": 84.25,
+        "entry_stock_market_amount_percentile": 90.0,
+        "entry_stock_theme_amount_percentile": 75.0,
+        "entry_stock_activity_confirmed": True,
         "entry_same_stage_candidate_rank": 1,
         "entry_execution_gap_pct": 0.5,
         "entry_daily_v_recovery_ratio": 1.5,
@@ -358,7 +372,7 @@ def complete_operating_states(
             }
             decision_rows.extend({
                 "_forward_payload_available": True,
-                "candidate_evidence_schema_version": 1,
+                "candidate_evidence_schema_version": 2,
                 "execution_evidence_schema_version": 2,
                 "candidate_evidence": [],
                 "schedule_slot": f"{day_key} {hhmm}",
@@ -380,6 +394,7 @@ def candidate_evidence(
     rank: int = 1,
 ) -> dict[str, object]:
     return {
+        "turnover": 4.0,
         "code": code,
         "strategy_id": strategy_id,
         "best_score": score,
@@ -389,6 +404,11 @@ def candidate_evidence(
             "not_selected_for_decision"
         ],
         "niuone_lifecycle_stage": stage,
+        "stock_activity_data_available": True,
+        "stock_market_amount_percentile": 90.0,
+        "stock_theme_amount_percentile": 75.0,
+        "stock_activity_score": 84.25,
+        "stock_activity_confirmed": True,
     }
 
 
@@ -401,15 +421,26 @@ def operating_settings(*times: str) -> dict[str, str]:
 
 class NiuOneForwardEvaluationTests(unittest.TestCase):
     def test_protocol_identity_covers_evidence_pipeline_and_effective_paths(self):
+        self.assertEqual(DEFAULT_COHORT_START, "2026-09-10")
         expected_sources = {
             "app/automation/cron.py",
             "app/automation/scheduler_service.py",
             "app/dashboard/server.py",
             "app/entrypoints/evaluate_niuone_forward.py",
+            "app/market_data/cn_stock_tools.py",
             "app/storage/practice_db.py",
+            "app/strategies/display.py",
+            "app/screening/holding_cycle.py",
             "app/trading/niuone_forward.py",
             "app/trading/niuone_forward_service.py",
+            "app/trading/post_exit_observations.py",
             "app/trading/practice_trader.py",
+            "app/trading/decision_freshness.py",
+            "app/core/model_api.py",
+            "app/core/model_request_guard.py",
+            "app/trading/lifecycles.py",
+            "app/strategies/performance.py",
+            "app/trading/probe_chase.py",
         }
         self.assertTrue(expected_sources.issubset(PROTOCOL_SOURCE_PATHS))
         self.assertTrue({
@@ -419,6 +450,12 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
             "DASHBOARD_NIUNIU_DB",
             "DASHBOARD_PORTFOLIO_STATE",
         }.issubset(PROTOCOL_RUNTIME_SETTING_DEFAULTS))
+        self.assertEqual(
+            PROTOCOL_RUNTIME_SETTING_DEFAULTS[
+                "DASHBOARD_EXIT_FEEDBACK_AUTO_TUNE_ENABLED"
+            ],
+            "1",
+        )
         self.assertEqual(
             set(PROTOCOL_DERIVED_RUNTIME_SETTING_NAMES),
             {
@@ -465,6 +502,7 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
             [],
             cohort_start="2026-08-03",
             as_of="2026-08-02",
+            maximum_open_niuone_positions=10,
         )["protocol"]
         identity = _build_protocol_identity(
             protocol,
@@ -480,7 +518,7 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
         )
         self.assertEqual(
             identity["protocol"]["sell_execution_evidence_schema_version"],
-            1,
+            2,
         )
         self.assertEqual(
             identity["protocol"]["required_executed_sell_sizing_fields"],
@@ -503,17 +541,55 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
         self.assertEqual(
             identity["protocol"]
             ["maximum_new_niuone_positions_per_trading_day"],
-            2,
+            None,
         )
         self.assertEqual(
             identity["protocol"]["daily_new_position_limit_rule"],
             protocol["daily_new_position_limit_rule"],
         )
         self.assertEqual(
+            identity["protocol"]["maximum_open_niuone_positions"],
+            10,
+        )
+        self.assertEqual(
+            identity["protocol"]["priority_replacement_rule"],
+            protocol["priority_replacement_rule"],
+        )
+        self.assertEqual(
+            identity["protocol"]["priority_replacement_minimum_margin"],
+            3.0,
+        )
+        self.assertEqual(
+            identity["protocol"]["staged_soft_exit_confirmations"],
+            2,
+        )
+        self.assertEqual(
+            identity["protocol"]["staged_soft_exit_reduce_ratio"],
+            0.5,
+        )
+        self.assertEqual(
+            identity["protocol"]["staged_soft_exit_score_veto_threshold"],
+            4,
+        )
+        self.assertEqual(
             identity["protocol"]
             ["niuone_reversal_minimum_recovery_ratio_inclusive"],
             0.60,
         )
+        self.assertEqual(
+            identity["protocol"]["niuone_reversal_entry_maximum_change_pct_exclusive"],
+            3.0,
+        )
+        self.assertIn("previous close", identity["protocol"]["niuone_reversal_entry_price_rule"])
+        for field, expected in (("niuone_minimum_entry_turnover_pct", 3.0),
+                                ("niuone_minimum_market_amount_percentile", 60),
+                                ("niuone_minimum_theme_amount_percentile", 50)):
+            self.assertEqual(identity["protocol"][field], expected)
+        self.assertIn("actual cumulative same-day", identity["protocol"]["niuone_all_stage_activity_rule"])
+        self.assertIn("verified_zero_to_zero", identity["protocol"]["complete_trade_definition"])
+        self.assertEqual(identity["protocol"]["probe_chase_experiment"]["version"], "probe-chase-forward-v1")
+
+
         self.assertEqual(
             identity["protocol"]
             ["niuone_reversal_maximum_recovery_ratio_exclusive"],
@@ -528,14 +604,34 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
             identity["protocol"]["niuone_reversal_minimum_state_streak"],
             3,
         )
-        self.assertEqual(
-            identity["protocol"]["niuone_reversal_daily_candidate_limit"],
-            2,
+        self.assertIsNone(
+            identity["protocol"]["niuone_reversal_daily_candidate_limit"]
+        )
+        self.assertIsNone(
+            identity["protocol"]["niuone_same_theme_position_count_limit"]
+        )
+        self.assertIn(
+            "no fixed same-sector or same-theme",
+            identity["protocol"]["niuone_same_theme_capacity_rule"],
         )
         self.assertEqual(
             identity["protocol"]
             ["niuone_reversal_absolute_position_cap_pct"],
-            6.25,
+            10.0,
+        )
+        self.assertEqual(
+            identity["protocol"]
+            ["niuone_reversal_rotation_per_trade_risk_pct"],
+            1.0,
+        )
+        self.assertEqual(
+            identity["protocol"]
+            ["niuone_reversal_rotation_max_theme_risk_pct"],
+            1.0,
+        )
+        self.assertIn(
+            "generated deterministically",
+            identity["protocol"]["niuone_markup_scale_in_decision_rule"],
         )
         self.assertEqual(
             identity["protocol"]["niuone_reversal_recovery_rule"],
@@ -859,8 +955,8 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
 
         self.assertEqual(first_code, 0)
         self.assertEqual(first_report["protocol_integrity"]["status"], "frozen")
-        self.assertEqual(first_report["protocol_integrity"]["source_file_count"], 21)
-        self.assertEqual(first_report["protocol_integrity"]["runtime_setting_count"], 56)
+        self.assertEqual(first_report["protocol_integrity"]["source_file_count"], 32)
+        self.assertEqual(first_report["protocol_integrity"]["runtime_setting_count"], 57)
         self.assertEqual(
             first_report["evidence_gate"]["status"],
             "operations_blocked",
@@ -983,6 +1079,28 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
             drift_report["protocol_integrity"]["changed_fields"],
         )
 
+    def test_decision_slot_counts_exclude_other_cohorts_and_explain_failed_attempts(self):
+        scheduler, b1, rows = complete_operating_states(
+            date(2026, 8, 3), date(2026, 8, 4), schedule_times=("09:25",),
+        )
+        report = evaluate_niuone_forward([], as_of="2026-08-03", cohort_start="2026-08-04")
+        _apply_operational_coverage(report, scheduler_state=scheduler, b1_state=b1,
+                                    runtime_settings=operating_settings("09:25"), decision_rows=rows)
+        self.assertEqual(report["operations"]["durable_practice_decision_slot_count"], 0)
+        self.assertEqual(report["operations"]["decision_slot_diagnostics"], [])
+        failed = [dict(row) for row in rows if row.get("schedule_slot") == "2026-08-04 09:25"]
+        self.assertTrue(failed)
+        for row in failed:
+            row["decision"] = {"actions": [], "error": "TimeoutError: private provider detail"}
+        report = evaluate_niuone_forward([], as_of="2026-08-04", cohort_start="2026-08-04")
+        _apply_operational_coverage(report, scheduler_state=scheduler, b1_state=b1,
+                                    runtime_settings=operating_settings("09:25"), decision_rows=failed)
+        detail = report["operations"]["decision_slot_diagnostics"][0]
+        self.assertEqual(detail["reason"], "model_decision_failed")
+        self.assertGreater(detail["error_type_counts"]["TimeoutError"], 0)
+        self.assertNotIn("private provider detail", json.dumps(report))
+        self.assertIn("practice_decision_ledger:09:25", report["operations"]["missing_requirement_counts"])
+
     def test_operational_coverage_requires_every_configured_cycle(self):
         rows = [
             trade(
@@ -1080,7 +1198,7 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
         rows = [
             {
                 "_forward_payload_available": True,
-                "candidate_evidence_schema_version": 1,
+                "candidate_evidence_schema_version": 2,
                 "execution_evidence_schema_version": 2,
                 "candidate_evidence": [],
                 "time": "2026-08-03 09:25:05",
@@ -1092,7 +1210,7 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
             },
             {
                 "_forward_payload_available": True,
-                "candidate_evidence_schema_version": 1,
+                "candidate_evidence_schema_version": 2,
                 "execution_evidence_schema_version": 2,
                 "candidate_evidence": [candidate_evidence("600000")],
                 "time": "2026-08-03 09:30:01",
@@ -1119,7 +1237,7 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
             },
             {
                 "_forward_payload_available": True,
-                "candidate_evidence_schema_version": 1,
+                "candidate_evidence_schema_version": 2,
                 "execution_evidence_schema_version": 2,
                 "candidate_evidence": [candidate_evidence(
                     "600001",
@@ -1298,7 +1416,7 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
     def test_eligible_candidate_with_mismatched_route_is_invalid_evidence(self):
         row = {
             "_forward_payload_available": True,
-            "candidate_evidence_schema_version": 1,
+            "candidate_evidence_schema_version": 2,
             "execution_evidence_schema_version": 2,
             "candidate_evidence": [candidate_evidence(
                 "600000",
@@ -1332,7 +1450,7 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
     def test_rejected_model_buy_retains_structured_sizing_evidence(self):
         row = {
             "_forward_payload_available": True,
-            "candidate_evidence_schema_version": 1,
+            "candidate_evidence_schema_version": 2,
             "execution_evidence_schema_version": 2,
             "candidate_evidence": [candidate_evidence("600000")],
             "time": "2026-08-03 10:00:05",
@@ -1466,11 +1584,19 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
         )
         sell.update({
             "_forward_payload_available": True,
-            "sell_execution_evidence_schema_version": 1,
+            "sell_execution_evidence_schema_version": 2,
             "sell_execution_source": "model_action",
             "model_requested_sell_shares": 1000,
             "available_sell_shares": 800,
             "sell_quantity_auto_reduced": True,
+            "price": 10.0,
+            "exit_signal": "niu_structure_stop",
+            "niuone_hard_exit_evidence": {
+                "schema_version": 1, "confirmed": True,
+                "signal": "niu_structure_stop", "current_price": 10.0,
+                "structural_stop": 10.5, "market_hard_stop": False,
+                "theme_score": 70.0, "theme_state": "mainline",
+            },
         })
         automatic_exit = trade(
             "2026-08-04 10:01:00",
@@ -1487,7 +1613,7 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
         )["opportunities"]
         audit = opportunities["sell_execution"]
 
-        self.assertEqual(audit["schema_version"], 1)
+        self.assertEqual(audit["schema_version"], 2)
         self.assertEqual(audit["model_sell_fill_count"], 1)
         self.assertEqual(audit["automatic_sell_fill_count"], 1)
         self.assertEqual(audit["auto_reduced_sell_fill_count"], 1)
@@ -2292,6 +2418,79 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
             },
         )
 
+    def test_holding_fast_entry_does_not_require_a_schedule_slot(self):
+        rows = [
+            trade(
+                "2026-08-04 10:05:00",
+                "BUY",
+                "holding-fast",
+                100,
+                1000,
+                before_qty=0,
+                after_qty=100,
+                context=complete_context(
+                    entry_schedule_slot="",
+                    entry_schedule_run_kind="holding_fast",
+                    entry_schedule_triggered_at="2026-08-04 10:05:00",
+                    entry_execution_mode="direct",
+                ),
+            ),
+            trade(
+                "2026-08-05 10:00:00",
+                "SELL",
+                "holding-fast",
+                100,
+                1010,
+                before_qty=100,
+                after_qty=0,
+            ),
+        ]
+
+        report = evaluate_niuone_forward(rows, as_of="2026-08-06")
+
+        self.assertNotIn(
+            "entry_schedule_slot",
+            report["coverage"]["missing_entry_attribution_fields"],
+        )
+        self.assertIn(
+            "holding_fast",
+            report["protocol"]["allowed_schedule_run_kinds"],
+        )
+
+    def test_probe_activity_and_turnover_are_required_forward_evidence(self):
+        for field, value in (("entry_turnover_pct", None), ("entry_turnover_pct", 2.999),
+                             ("entry_stock_activity_confirmed", False),
+                             ("entry_stock_market_amount_percentile", 59.9),
+                             ("entry_stock_theme_amount_percentile", 49.9)):
+            with self.subTest(field=field, value=value):
+                rows = [
+                    trade("2026-08-04 10:00:00", "BUY", "activity-probe", 100, 1000,
+                          before_qty=0, after_qty=100, context=complete_context(**{field: value})),
+                    trade("2026-08-05 10:00:00", "SELL", "activity-probe", 100, 1010,
+                          before_qty=100, after_qty=0),
+                ]
+                report = evaluate_niuone_forward(rows, as_of="2026-08-06")
+                self.assertIn(field, report["coverage"]["missing_entry_attribution_fields"])
+
+    def test_eligible_probe_cannot_claim_activity_with_low_or_missing_turnover(self):
+        for value in (None, 2.999, 3.0):
+            with self.subTest(turnover=value):
+                candidate = {**candidate_evidence("600000"), "turnover": value}
+                row = {
+                    "_forward_payload_available": True,
+                    "candidate_evidence_schema_version": 2,
+                    "execution_evidence_schema_version": 2,
+                    "candidate_evidence": [candidate],
+                    "time": "2026-08-04 10:00:05",
+                    "b1_generated_at": "2026-08-04 10:00:02",
+                    "schedule_slot": "2026-08-04 10:00",
+                    "schedule_run_kind": "scheduled",
+                    "decision": {"actions": []}, "executed": [],
+                }
+                report = evaluate_niuone_forward([], decision_rows=[row], as_of="2026-08-04")
+                fields = report["opportunities"]["invalid_opportunity_evidence_fields"]
+                self.assertEqual("candidate_evidence.turnover" in fields, value != 3.0)
+
     def test_missing_entry_industry_blocks_performance_attribution(self):
         rows = [
             trade(
@@ -2626,7 +2825,7 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
 
         self.assertEqual(report["overall"]["completed_trade_count"], 1)
         self.assertEqual(report["coverage"]["duplicate_trade_count"], 2)
-        self.assertEqual(report["protocol"]["version"], "niuone-strict-forward-v31")
+        self.assertEqual(report["protocol"]["version"], "niuone-strict-forward-v54")
         self.assertEqual(
             report["protocol"][
                 "niuone_markup_upgrade_absolute_position_cap_pct"
@@ -2669,7 +2868,7 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
             report["protocol"]
             ["niuone_markup_rebalance_lifetime_add_limit"]
         )
-        self.assertEqual(report["protocol"]["candidate_evidence_schema_version"], 1)
+        self.assertEqual(report["protocol"]["candidate_evidence_schema_version"], 2)
         self.assertEqual(report["protocol"]["execution_evidence_schema_version"], 2)
         self.assertEqual(
             report["protocol"]["required_executed_buy_sizing_fields"],
@@ -2688,7 +2887,7 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
         )
         self.assertEqual(
             report["protocol"]["sell_execution_evidence_schema_version"],
-            1,
+            2,
         )
         self.assertEqual(
             report["protocol"]["required_executed_sell_sizing_fields"],
@@ -2913,7 +3112,7 @@ class NiuOneForwardEvaluationTests(unittest.TestCase):
                 "schedule_slot": "2026-08-04 10:00",
                 "schedule_run_kind": "scheduled",
                 "trade_allowed": True,
-                "candidate_evidence_schema_version": 1,
+                "candidate_evidence_schema_version": 2,
                 "candidate_evidence": [{
                     "code": "600000",
                     "best_strategy": "niu_emerging",

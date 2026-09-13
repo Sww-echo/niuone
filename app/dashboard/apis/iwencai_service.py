@@ -17,17 +17,19 @@ if __package__ and __package__.startswith("app."):
         IwencaiError,
     )
     from ...market_data.news_precheck import (
+        IWENCAI_NEWS_SOURCE_VERSION,
         NewsPrecheckConfig,
+        cached_news_record_matches_source,
         fetch_candidate_news_records,
-        repair_cached_news_record,
     )
 else:
     from core.json_cache import read_json_cache, write_json_cache
     from market_data.iwencai_client import IwencaiClient, IwencaiConfig, IwencaiError
     from market_data.news_precheck import (
+        IWENCAI_NEWS_SOURCE_VERSION,
         NewsPrecheckConfig,
+        cached_news_record_matches_source,
         fetch_candidate_news_records,
-        repair_cached_news_record,
     )
 
 
@@ -107,9 +109,12 @@ def read_dragon_tiger_snapshot(
             for item in raw_items
         },
     )
-    result["seat_data_complete"] = bool(
-        payload.get("seat_data_complete") is True or (has_native_seats and payload.get("seat_query"))
-    )
+    if "seat_data_complete" in payload:
+        result["seat_data_complete"] = payload.get("seat_data_complete") is True
+    else:
+        result["seat_data_complete"] = bool(
+            has_native_seats and payload.get("seat_query")
+        )
     _update_seat_payload_summary(result, payload)
     result["returned_count"] = len(result["items"])
     result["unique_count"] = max(
@@ -403,7 +408,7 @@ def _dragon_tiger_news_config(
         config = NewsPrecheckConfig.from_mapping(values)
     except ValueError:
         return None, "news_precheck_incomplete"
-    return config, "" if config is not None else "news_precheck_not_configured"
+    return config, "" if config is not None else "news_precheck_disabled"
 
 
 def _requires_dragon_tiger_news_precheck(item: Mapping[str, Any]) -> bool:
@@ -526,6 +531,7 @@ def enrich_consecutive_dragon_tiger_news(
 
     result = dict(payload)
     values = os.environ if env is None else env
+    source_mode = "iwencai"
     started_at = _configured_dragon_tiger_start_time(result, values, now=now)
     items = [dict(item) for item in result.get("items") or [] if isinstance(item, Mapping)]
     candidates = [item for item in items if _requires_dragon_tiger_news_precheck(item)]
@@ -544,6 +550,53 @@ def enrich_consecutive_dragon_tiger_news(
 
     previous = previous_snapshot if isinstance(previous_snapshot, Mapping) else {}
     same_day = str(previous.get("date") or "") == str(result.get("date") or "")
+    config, config_error = _dragon_tiger_news_config(values)
+    if config is None and config_error == "news_precheck_disabled":
+        previous_records: dict[str, dict[str, Any]] = {}
+        if same_day:
+            for previous_item in previous.get("items") or []:
+                if not isinstance(previous_item, Mapping):
+                    continue
+                record = previous_item.get("news_precheck")
+                identity = _stock_identity(previous_item)
+                if identity and cached_news_record_matches_source(record, source_mode):
+                    previous_records[identity] = dict(record)
+        preserved_candidates: list[dict[str, Any]] = []
+        for item in candidates:
+            current_record = item.get("news_precheck")
+            if cached_news_record_matches_source(current_record, source_mode):
+                preserved_candidates.append(item)
+                continue
+            cached = previous_records.get(_stock_identity(item))
+            if cached:
+                cached["cached"] = True
+                item["news_precheck"] = cached
+                preserved_candidates.append(item)
+            else:
+                item.pop("news_precheck", None)
+        for field in (
+            "continuous_news_error",
+            "limit_up_news_error",
+            "continuous_news_model",
+            "limit_up_news_model",
+            "continuous_news_started_at",
+            "limit_up_news_started_at",
+            "continuous_news_completed_at",
+            "limit_up_news_completed_at",
+        ):
+            result.pop(field, None)
+        result["continuous_news_configured"] = False
+        result["limit_up_news_configured"] = False
+        result["continuous_news_source"] = source_mode
+        result["limit_up_news_source"] = source_mode
+        _update_dragon_tiger_news_tracking(
+            result,
+            preserved_candidates,
+            now=now,
+            started_at=started_at,
+        )
+        return result
+
     if same_day:
         for field in (
             "continuous_news_started_at",
@@ -554,31 +607,35 @@ def enrich_consecutive_dragon_tiger_news(
             if not result.get(field) and previous.get(field):
                 result[field] = previous.get(field)
     cached_by_identity: dict[str, dict[str, Any]] = {}
+    judgment_model = config.model if config is not None else ""
     if same_day:
         for previous_item in previous.get("items") or []:
             if not isinstance(previous_item, Mapping):
                 continue
             record = previous_item.get("news_precheck")
             identity = _stock_identity(previous_item)
-            if identity and isinstance(record, Mapping) and record.get("checked") is True:
+            if identity and cached_news_record_matches_source(
+                record, source_mode, judgment_model
+            ):
                 cached_by_identity[identity] = dict(record)
 
     pending: list[dict[str, Any]] = []
     for item in candidates:
         current_record = item.get("news_precheck")
-        if isinstance(current_record, Mapping) and current_record.get("checked") is True:
-            item["news_precheck"] = repair_cached_news_record(current_record)
+        if cached_news_record_matches_source(
+            current_record, source_mode, judgment_model
+        ):
+            item["news_precheck"] = dict(current_record)
             continue
         cached = cached_by_identity.get(_stock_identity(item))
         if cached:
-            cached = repair_cached_news_record(cached)
             cached["cached"] = True
             item["news_precheck"] = cached
         else:
             item["news_precheck"] = {
                 "checked": False,
                 "available": False,
-                "provider": "消息面预检模型",
+                "provider": "消息面预检",
                 "error": "pending_news_precheck",
             }
             pending.append(item)
@@ -595,6 +652,8 @@ def enrich_consecutive_dragon_tiger_news(
             result["continuous_news_model"] = previous.get("continuous_news_model")
         if result.get("continuous_news_model"):
             result["limit_up_news_model"] = result["continuous_news_model"]
+        result["continuous_news_source"] = source_mode
+        result["limit_up_news_source"] = source_mode
         if not result.get("continuous_news_started_at") and previous.get(
             "continuous_news_started_at"
         ):
@@ -616,7 +675,6 @@ def enrich_consecutive_dragon_tiger_news(
     result.pop("continuous_news_completed_at", None)
     result.pop("limit_up_news_completed_at", None)
 
-    config, config_error = _dragon_tiger_news_config(values)
     result["continuous_news_configured"] = config is not None
     result["limit_up_news_configured"] = config is not None
     if config is None:
@@ -626,7 +684,7 @@ def enrich_consecutive_dragon_tiger_news(
             item["news_precheck"] = {
                 "checked": False,
                 "available": False,
-                "provider": "消息面预检模型",
+                "provider": "消息面预检",
                 "error": config_error,
             }
     else:
@@ -634,6 +692,8 @@ def enrich_consecutive_dragon_tiger_news(
         result.pop("limit_up_news_error", None)
         result["continuous_news_model"] = config.model
         result["limit_up_news_model"] = config.model
+        result["continuous_news_source"] = config.source_mode
+        result["limit_up_news_source"] = config.source_mode
         pending.sort(
             key=lambda item: (
                 _streak_count(item.get("limit_up_streak")) or 0,
@@ -663,13 +723,15 @@ def enrich_consecutive_dragon_tiger_news(
             record = dict(records_by_identity.get(_stock_identity(item)) or {})
             if not record:
                 record = {
-                    "checked": True,
+                    "checked": False,
                     "available": False,
                     "error": "empty_news_precheck_response",
                 }
-            record.setdefault("checked", True)
+            record.setdefault("checked", False)
             record.setdefault("available", False)
-            record["provider"] = "消息面预检模型"
+            record["provider"] = config.provider_label
+            record["source_mode"] = config.source_mode
+            record.setdefault("source_version", IWENCAI_NEWS_SOURCE_VERSION)
             item["news_precheck"] = record
 
     _update_dragon_tiger_news_tracking(
@@ -1313,8 +1375,15 @@ def fetch_dragon_tiger(
     env: Mapping[str, str] | None = None,
     client: IwencaiClient | None = None,
     now: datetime | None = None,
+    on_core_payload: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    """Fetch one normalized daily dragon-tiger list without exposing free-form queries."""
+    """Fetch one normalized daily dragon-tiger list without exposing free-form queries.
+
+    ``on_core_payload`` runs synchronously after the stock list and sector data
+    are available, but before the slower seat-detail query starts.  Scheduled
+    jobs use it to durably publish the newest core list even if an outer process
+    deadline interrupts optional enrichment later in the run.
+    """
 
     normalized_date = normalize_trade_date(trade_date, now=now)
     normalized_page = normalize_page(page)
@@ -1385,20 +1454,6 @@ def fetch_dragon_tiger(
         if code and code not in sector_by_code:
             sector_by_code[code] = _sector_values(raw_item)
 
-    seat_error = ""
-    seat_trace_id = ""
-    seat_reported_count = 0
-    try:
-        seat_rows, seat_reported_count, seat_trace_id = _query_all_stock_rows(
-            active_client,
-            seat_query,
-            max_pages=MAX_SEAT_SOURCE_PAGES,
-        )
-    except IwencaiError as exc:
-        seat_error = exc.code
-        seat_rows = []
-    seats_by_code = _seats_by_code(seat_rows, normalized_date)
-
     normalized_items: list[dict[str, Any]] = []
     for raw_item in raw_items:
         sector, sector_path = sector_by_code.get(_stock_code(raw_item), ("", ""))
@@ -1411,7 +1466,7 @@ def fetch_dragon_tiger(
             )
         )
     all_items = deduplicate_dragon_tiger_items(normalized_items)
-    _attach_seats(all_items, seats_by_code)
+    _attach_seats(all_items, {})
     unique_count = len(all_items)
     offset = (normalized_page - 1) * normalized_limit
     items = all_items[offset : offset + normalized_limit]
@@ -1429,8 +1484,10 @@ def fetch_dragon_tiger(
         "generated_at": datetime.now(CN_TZ).isoformat(timespec="seconds"),
         "query": query,
         "sector_query": sector_query,
+        "sector_data_complete": not sector_error,
         "seat_query": seat_query,
-        "seat_data_complete": not seat_error,
+        "seat_data_complete": False,
+        "seat_enrichment_pending": True,
         # Compatibility aliases for existing API consumers.
         "institution_query": seat_query,
         "page": normalized_page,
@@ -1443,11 +1500,50 @@ def fetch_dragon_tiger(
         "has_more": has_more,
         "count_mismatch": unique_count != reported_count,
         "trace_id": trace_id,
+        "seat_available": False,
+        "seat_reported_count": 0,
+        "seat_raw_returned_count": 0,
+        "seat_stock_count": 0,
+        "seat_record_count": 0,
+        "seat_trace_id": "",
+        "institution_available": False,
+        "institution_reported_count": 0,
+        "institution_raw_returned_count": 0,
+        "institution_stock_count": 0,
+        "institution_record_count": 0,
+        "institution_trace_id": "",
+        "items": items,
+    }
+    if sector_error:
+        payload["sector_error"] = sector_error
+
+    if on_core_payload is not None and items:
+        on_core_payload(payload)
+
+    seat_error = ""
+    seat_trace_id = ""
+    seat_reported_count = 0
+    try:
+        seat_rows, seat_reported_count, seat_trace_id = _query_all_stock_rows(
+            active_client,
+            seat_query,
+            max_pages=MAX_SEAT_SOURCE_PAGES,
+        )
+    except IwencaiError as exc:
+        seat_error = exc.code
+        seat_rows = []
+    seats_by_code = _seats_by_code(seat_rows, normalized_date)
+    _attach_seats(all_items, seats_by_code)
+    payload.update({
+        "seat_data_complete": not seat_error,
+        "seat_enrichment_pending": False,
         "seat_available": not seat_error,
         "seat_reported_count": seat_reported_count,
         "seat_raw_returned_count": len(seat_rows),
         "seat_stock_count": sum(1 for item in all_items if item.get("seat_record_count")),
-        "seat_record_count": sum(int(item.get("seat_record_count") or 0) for item in all_items),
+        "seat_record_count": sum(
+            int(item.get("seat_record_count") or 0) for item in all_items
+        ),
         "seat_trace_id": seat_trace_id,
         "institution_available": not seat_error,
         "institution_reported_count": sum(
@@ -1463,10 +1559,8 @@ def fetch_dragon_tiger(
             int(item.get("institution_record_count") or 0) for item in all_items
         ),
         "institution_trace_id": seat_trace_id,
-        "items": items,
-    }
-    if sector_error:
-        payload["sector_error"] = sector_error
+        "items": all_items[offset : offset + normalized_limit],
+    })
     if seat_error:
         payload["seat_error"] = seat_error
         payload["institution_error"] = seat_error

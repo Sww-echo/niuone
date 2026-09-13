@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import json
 import re
 import urllib.parse
 from dataclasses import dataclass, field
@@ -23,7 +24,11 @@ from .models import (
     NotificationDeliveryError,
     JsonTransport,
     Clock,
+    _escape_markdown,
 )
+
+
+_FEISHU_MAX_PAYLOAD_BYTES = 28 * 1024
 
 
 def _reject_controls(value: str, field_name: str) -> str:
@@ -127,6 +132,156 @@ def _require_mapping_response(response: Mapping[str, Any] | Any) -> Mapping[str,
     return response
 
 
+def _feishu_card_elements(notification: Notification) -> list[dict[str, Any]]:
+    """Render structured notification sections with Feishu-native layout."""
+
+    if not notification.card_sections:
+        return []
+    elements: list[dict[str, Any]] = []
+    rendered_sections = 0
+    for section in notification.card_sections:
+        if not isinstance(section, Mapping):
+            continue
+        title = str(section.get("title") or "").strip()
+        raw_fields = section.get("fields")
+        if not title or not isinstance(raw_fields, (list, tuple)):
+            continue
+        action = str(section.get("action") or "").strip().upper()
+        name = str(section.get("name") or "").strip()
+        code = str(section.get("code") or "").strip()
+        sequence = str(section.get("sequence") or "").strip()
+        if action in {"BUY", "SELL"} and name and code:
+            direction = "买入" if action == "BUY" else "卖出"
+            direction = _escape_markdown(str(section.get("action_label") or direction))
+            if section.get("emphasize_action") is True:
+                direction = f"**{direction}**"
+            direction_color = "red" if action == "BUY" else "green"
+            sequence_prefix = f"{_escape_markdown(sequence)}. " if sequence else ""
+            heading_content = (
+                f"**{sequence_prefix}{_escape_markdown(name)}"
+                f"（{_escape_markdown(code)}）**　"
+                f"<font color='{direction_color}'>{direction}</font>"
+            )
+        else:
+            heading_content = f"**{_escape_markdown(title)}**"
+
+        short_fields: list[dict[str, Any]] = []
+        detail_lines: list[str] = []
+        for raw_field in raw_fields:
+            if not isinstance(raw_field, Mapping):
+                continue
+            label = str(raw_field.get("label") or "").strip()
+            value = str(raw_field.get("value") or "").strip()
+            if not label or not value:
+                continue
+            escaped_label = _escape_markdown(label)
+            escaped_value = _escape_markdown(value)
+            field_color = str(raw_field.get("color") or "").strip()
+            if bool(raw_field.get("short")):
+                field_content = f"**{escaped_label}**\n{escaped_value}"
+                if field_color in {"red", "green"}:
+                    field_content = f"<font color='{field_color}'>{field_content}</font>"
+                short_fields.append({
+                    "is_short": True,
+                    "text": {
+                        "tag": "lark_md",
+                        "content": field_content,
+                    },
+                })
+            else:
+                detail_content = f"**{escaped_label}**　{escaped_value}"
+                if field_color in {"red", "green"}:
+                    detail_content = f"<font color='{field_color}'>{detail_content}</font>"
+                detail_lines.append(detail_content)
+        if not short_fields and not detail_lines:
+            continue
+        if rendered_sections:
+            elements.append({"tag": "hr"})
+        elements.append({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": heading_content,
+            },
+        })
+        if short_fields:
+            elements.append({"tag": "div", "fields": short_fields})
+        if detail_lines:
+            elements.append({
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": "\n".join(detail_lines),
+                },
+            })
+        rendered_sections += 1
+    return elements if rendered_sections else []
+
+
+def _feishu_interactive_payload(
+    notification: Notification,
+    elements: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "msg_type": "interactive",
+        "card": {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "template": "blue",
+                "title": {
+                    "tag": "plain_text",
+                    "content": str(notification.title or "").strip(),
+                },
+            },
+            "elements": elements,
+        },
+    }
+
+
+def _feishu_payload_size(payload: Mapping[str, Any]) -> int:
+    return len(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    )
+
+
+def _feishu_structured_payloads(
+    notification: Notification,
+    elements: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Pack complete trade sections into bounded Feishu cards."""
+
+    section_groups: list[list[dict[str, Any]]] = []
+    current_group: list[dict[str, Any]] = []
+    for element in elements:
+        if element.get("tag") == "hr":
+            if current_group:
+                section_groups.append(current_group)
+                current_group = []
+            continue
+        current_group.append(element)
+    if current_group:
+        section_groups.append(current_group)
+
+    payloads: list[dict[str, Any]] = []
+    packed_elements: list[dict[str, Any]] = []
+    for group in section_groups:
+        candidate_elements = packed_elements + (
+            [{"tag": "hr"}] if packed_elements else []
+        ) + group
+        candidate_payload = _feishu_interactive_payload(notification, candidate_elements)
+        if packed_elements and _feishu_payload_size(candidate_payload) > _FEISHU_MAX_PAYLOAD_BYTES:
+            payloads.append(_feishu_interactive_payload(notification, packed_elements))
+            packed_elements = list(group)
+            continue
+        packed_elements = candidate_elements
+
+    if packed_elements:
+        payloads.append(_feishu_interactive_payload(notification, packed_elements))
+    if any(_feishu_payload_size(payload) > _FEISHU_MAX_PAYLOAD_BYTES for payload in payloads):
+        raise NotificationDeliveryError("Feishu card section exceeds the safe payload limit")
+    return payloads
+
+
 @dataclass(frozen=True)
 class FeishuChannel:
     webhook_url: str
@@ -141,24 +296,39 @@ class FeishuChannel:
         transport: JsonTransport,
         clock: Clock,
     ) -> None:
-        payload: dict[str, Any] = {
-            "msg_type": "text",
-            "content": {"text": notification.plain_text()},
-        }
+        rich_text = notification.markdown_text(include_title=False)
+        card_elements = _feishu_card_elements(notification)
+        if card_elements:
+            payloads = _feishu_structured_payloads(notification, card_elements)
+        elif rich_text:
+            payloads = [
+                _feishu_interactive_payload(
+                    notification,
+                    [{"tag": "markdown", "content": rich_text}],
+                )
+            ]
+        else:
+            payloads = [{
+                "msg_type": "text",
+                "content": {"text": notification.plain_text()},
+            }]
+        signing_fields: dict[str, str] = {}
         if self.signing_secret:
             timestamp = str(int(clock()))
             string_to_sign = f"{timestamp}\n{self.signing_secret}".encode("utf-8")
             digest = hmac.new(string_to_sign, digestmod=hashlib.sha256).digest()
-            payload.update({
+            signing_fields = {
                 "timestamp": timestamp,
                 "sign": base64.b64encode(digest).decode("ascii"),
-            })
-        response = _require_mapping_response(transport(self.webhook_url, payload, timeout))
-        code = response.get("code") if "code" in response else response.get("StatusCode")
-        if not _zero_code(code):
-            raise NotificationDeliveryError(
-                f"provider rejected request (code={_safe_provider_code(code)})"
-            )
+            }
+        for payload in payloads:
+            payload.update(signing_fields)
+            response = _require_mapping_response(transport(self.webhook_url, payload, timeout))
+            code = response.get("code") if "code" in response else response.get("StatusCode")
+            if not _zero_code(code):
+                raise NotificationDeliveryError(
+                    f"provider rejected request (code={_safe_provider_code(code)})"
+                )
 
 
 @dataclass(frozen=True)
@@ -191,11 +361,22 @@ class DingTalkChannel:
         transport: JsonTransport,
         clock: Clock,
     ) -> None:
-        payload = {
-            "msgtype": "text",
-            "text": {"content": notification.plain_text()},
-            "at": {"isAtAll": False},
-        }
+        rich_text = notification.markdown_text()
+        if rich_text:
+            payload = {
+                "msgtype": "markdown",
+                "markdown": {
+                    "title": str(notification.title or "").strip(),
+                    "text": rich_text,
+                },
+                "at": {"isAtAll": False},
+            }
+        else:
+            payload = {
+                "msgtype": "text",
+                "text": {"content": notification.plain_text()},
+                "at": {"isAtAll": False},
+            }
         response = _require_mapping_response(transport(self._signed_url(clock), payload, timeout))
         code = response.get("errcode")
         if not _zero_code(code):
@@ -218,10 +399,17 @@ class WeComChannel:
         clock: Clock,
     ) -> None:
         del clock
-        payload = {
-            "msgtype": "text",
-            "text": {"content": notification.plain_text()},
-        }
+        rich_text = notification.markdown_text()
+        if rich_text:
+            payload = {
+                "msgtype": "markdown",
+                "markdown": {"content": rich_text},
+            }
+        else:
+            payload = {
+                "msgtype": "text",
+                "text": {"content": notification.plain_text()},
+            }
         response = _require_mapping_response(transport(self.webhook_url, payload, timeout))
         code = response.get("errcode")
         if not _zero_code(code):
@@ -249,11 +437,14 @@ class TelegramChannel:
         clock: Clock,
     ) -> None:
         del clock
+        rich_text = notification.html_text()
         payload = {
             "chat_id": self.chat_id,
-            "text": notification.plain_text(),
+            "text": rich_text or notification.plain_text(),
             "disable_web_page_preview": True,
         }
+        if rich_text:
+            payload["parse_mode"] = "HTML"
         response = _require_mapping_response(transport(self.endpoint, payload, timeout))
         if response.get("ok") is not True:
             raise NotificationDeliveryError("provider rejected request")
