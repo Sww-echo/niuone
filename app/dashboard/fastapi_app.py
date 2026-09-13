@@ -153,11 +153,15 @@ def create_app(
     technical_analyze_service: Callable[..., dict[str, Any]] | None = None,
     technical_minute_analyze_service: Callable[..., dict[str, Any]] | None = None,
     technical_scan_manager: Any | None = None,
+    watchlist_job_manager: Any | None = None,
 ) -> FastAPI:
     """Create the production single-port ASGI application."""
 
     legacy = _legacy_module(legacy_module)
     dist_dir = Path(web_dist_dir or DEFAULT_WEB_DIST_DIR).expanduser()
+    from app.dashboard.watchlist_jobs import WatchlistJobManager
+
+    watchlist_jobs = watchlist_job_manager or WatchlistJobManager()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -196,6 +200,7 @@ def create_app(
         try:
             yield
         finally:
+            watchlist_jobs.shutdown()
             if projection_service is not None:
                 projection_service.stop()
 
@@ -438,6 +443,7 @@ def create_app(
             enforce_api_limits=enforce_native_api_limits,
             require_admin_action=admin_access.require_action,
             json_response=_canonical_json_response,
+            job_manager=watchlist_jobs,
         )
     )
     technical_router_kwargs: dict[str, Any] = {

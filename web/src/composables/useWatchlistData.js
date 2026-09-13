@@ -1,4 +1,5 @@
 import { reactive } from 'vue'
+import { isJobActive } from '../utils/watchlistDisplay.js'
 
 const REQUEST_TIMEOUT_MS = 60 * 1000
 const ALLOWED_DAYS = [5, 7, 15, 60]
@@ -8,7 +9,12 @@ const state = reactive({
   loaded: false,
   busy: false,
   error: '',
+  loadError: '',
   status: '',
+  actionFailures: [],
+  job: null,
+  jobError: '',
+  boardFilterKey: '',
   days: 5,
   groupId: '',
   q: '',
@@ -20,6 +26,8 @@ const state = reactive({
     sections: [],
     stocks: [],
     total: 0,
+    total_all: 0,
+    ungrouped_count: 0,
     summary: {
       filled_count: 0,
       pending_count: 0,
@@ -33,6 +41,10 @@ const state = reactive({
 })
 
 let loadSequence = 0
+let observers = 0
+let pollTimer = 0
+let pollSequence = 0
+let pollFailures = 0
 const controllers = new Map()
 
 function controllerFor(key) {
@@ -87,7 +99,9 @@ async function api(url, {
     }
     return payload
   } catch (error) {
-    if (timedOut) throw new Error('自选股请求超时')
+    if (timedOut) throw new Error(action
+      ? '请求超时，服务端可能仍在处理，请查看任务状态后再操作'
+      : '读取自选股超时，请重试')
     throw error
   } finally {
     window.clearTimeout(timeout)
@@ -108,54 +122,117 @@ function applyBoard(board) {
     sections: board.sections || [],
     stocks: board.stocks || [],
     total: Number(board.total) || 0,
+    total_all: Number(board.total_all) || 0,
+    ungrouped_count: Number(board.ungrouped_count) || 0,
+    default_buy_date: board.default_buy_date || '',
     summary: board.summary || state.board.summary,
     generated_at: board.generated_at || '',
   }
   if (board.days) state.days = Number(board.days)
 }
 
+function currentFilterKey() {
+  return JSON.stringify([state.days, state.groupId, state.q])
+}
+
 async function loadBoard({ background = false } = {}) {
   const sequence = ++loadSequence
-  if (!background && !state.loaded) state.loading = true
-  state.error = ''
+  const filterKey = currentFilterKey()
+  state.loading = !background || state.boardFilterKey !== filterKey
+  state.loadError = ''
   try {
-    const params = new URLSearchParams({
-      days: String(state.days || 5),
-      q: state.q || '',
-    })
-    if (state.groupId) params.set('group_id', String(state.groupId))
+    const params = new URLSearchParams({ days: String(state.days), q: state.q })
+    if (state.groupId) params.set('group_id', state.groupId)
     const board = await api(`/api/watchlist/board?${params}`, { key: 'watchlist-board' })
     if (sequence !== loadSequence) return false
     applyBoard(board)
-    state.loading = false
+    state.boardFilterKey = filterKey
     state.loaded = true
-    state.status = board.generated_at
-      ? `已更新 ${String(board.generated_at).replace('T', ' ').slice(0, 19)}`
-      : '就绪'
     window.dispatchEvent(new CustomEvent('niuone:last-updated', {
       detail: { value: String(board.generated_at || '').slice(11, 19) || '--' },
     }))
     return true
   } catch (error) {
-    if (sequence !== loadSequence) return false
-    state.error = error instanceof Error ? error.message : String(error)
-    state.loading = false
-    if (!state.loaded) state.status = '加载失败'
+    if (sequence !== loadSequence || error?.name === 'AbortError') return false
+    state.loadError = error instanceof Error ? error.message : String(error)
     return false
+  } finally {
+    if (sequence === loadSequence) state.loading = false
   }
 }
 
-async function runAction(label, fn) {
+function acceptJob(job) {
+  const previous = state.job
+  state.job = job || null
+  state.jobError = ''
+  return job && (previous?.id !== job.id || previous?.processed !== job.processed
+    || previous?.status !== job.status)
+}
+
+function scheduleJobPoll(delay) {
+  window.clearTimeout(pollTimer)
+  if (observers > 0) pollTimer = window.setTimeout(pollJob, delay)
+}
+
+async function pollJob() {
+  const sequence = ++pollSequence
+  try {
+    const result = await api('/api/watchlist/jobs/latest', {
+      key: 'watchlist-job', timeoutMs: 15000,
+    })
+    if (sequence !== pollSequence || observers === 0) return
+    const changed = acceptJob(result.job)
+    pollFailures = 0
+    if (changed && (result.job.processed > 0 || !isJobActive(result.job))) {
+      await loadBoard({ background: true })
+    }
+  } catch (error) {
+    if (sequence !== pollSequence || observers === 0) return
+    state.jobError = '暂时无法读取任务进度，将自动重试；后台任务可能仍在进行。'
+    pollFailures += 1
+  } finally {
+    if (sequence === pollSequence && observers > 0) {
+      scheduleJobPoll(pollFailures ? Math.min(15000, 2000 * 2 ** pollFailures)
+        : isJobActive(state.job) ? 2000 : 15000)
+    }
+  }
+}
+
+function startJobPolling() {
+  observers += 1
+  if (observers === 1) return pollJob()
+}
+
+function stopJobPolling() {
+  observers = Math.max(0, observers - 1)
+  if (observers) return
+  window.clearTimeout(pollTimer)
+  pollSequence += 1
+  loadSequence += 1
+  controllers.get('watchlist-job')?.abort()
+  controllers.get('watchlist-board')?.abort()
+  state.loading = false
+}
+
+async function runAction(label, fn, { reload = true } = {}) {
   if (state.busy) return { ok: false, error: 'busy' }
   state.busy = true
   state.status = label
   state.error = ''
+  state.actionFailures = []
   try {
     const result = await fn()
-    if (result?.board) applyBoard(result.board)
-    else if (result?.groups) state.board.groups = result.groups
-    else await loadBoard({ background: true })
+    state.actionFailures = Array.isArray(result?.failed) ? result.failed : []
+    if (result?.job) {
+      pollSequence += 1
+      controllers.get('watchlist-job')?.abort()
+      acceptJob(result.job)
+    }
+    // Mutation responses may contain a board with default filters. Always read
+    // the user's current selection, including changes made during the action.
+    if (reload) await loadBoard({ background: true })
     state.status = result?.message || '完成'
+    if (state.loadError) state.status += '，列表刷新失败，请重试刷新'
     return { ok: true, result }
   } catch (error) {
     if (isAdminRequired(error)) {
@@ -163,10 +240,11 @@ async function runAction(label, fn) {
       return { ok: false, needAdmin: true, error }
     }
     state.error = error instanceof Error ? error.message : String(error)
-    state.status = '失败'
+    state.status = '操作未完成'
     return { ok: false, error }
   } finally {
     state.busy = false
+    scheduleJobPoll(0)
   }
 }
 
@@ -221,7 +299,8 @@ function addStocks(payload) {
     timeoutMs: 120 * 1000,
   }).then(result => ({
     ...result,
-    message: `已处理 ${(result.added || []).length} 只股票`,
+    message: `已新增 ${(result.added || []).length} 只 · 已有 ${(result.skipped_existing || []).length} 只已跳过`
+      + ((result.failed || []).length ? ` · ${(result.failed || []).length} 只待补齐，详见失败项` : ''),
   })))
 }
 
@@ -242,38 +321,36 @@ function deleteStock(code) {
   }).then(result => ({ ...result, message: `已删除 ${code}` })))
 }
 
-function updateToday() {
-  return runAction('更新今日行情…', () => api('/api/watchlist/quotes/update-today', {
-    method: 'POST',
-    action: true,
-    body: {},
-    key: 'watchlist-update-today',
-    timeoutMs: 120 * 1000,
-  }).then(result => ({
-    ...result,
-    message: result.skipped
-      ? `非交易日，已跳过写入`
-      : `已更新 ${result.updated || 0} 只`,
-  })))
+function submitJob(kind, fields = {}) {
+  if (isJobActive(state.job)) return Promise.resolve({ ok: false, error: '任务进行中' })
+  return runAction('提交行情任务…', () => api('/api/watchlist/jobs', {
+    method: 'POST', action: true, body: { kind, ...fields }, key: 'watchlist-start-job',
+  }).then(result => ({ ...result, message: '已提交后台处理，可继续筛选和浏览' })), { reload: false })
 }
 
-function backfill({ days = 60, missingOnly = true } = {}) {
-  return runAction('回补历史行情…', () => api('/api/watchlist/quotes/backfill', {
-    method: 'POST',
-    action: true,
-    body: { days, missing_only: missingOnly },
-    key: 'watchlist-backfill',
-    timeoutMs: 180 * 1000,
-  }).then(result => ({
-    ...result,
-    message: `已回补 ${result.stocks || 0} 只 / 写入 ${result.quotes || 0} 条`,
-  })))
+function updateToday() {
+  return submitJob('update-today')
+}
+
+function backfill({ days = 60, missingOnly = true, codes } = {}) {
+  return submitJob('backfill', { days, missing_only: missingOnly, ...(codes ? { codes } : {}) })
+}
+
+function retryJob() {
+  if (!state.job?.id || isJobActive(state.job)) return Promise.resolve({ ok: false })
+  return runAction('重试未完成股票…', () => api(`/api/watchlist/jobs/${state.job.id}/retry`, {
+    method: 'POST', action: true, body: {}, key: 'watchlist-retry-job',
+  }).then(result => ({ ...result, message: '已提交重试，成功项会保留' })), { reload: false })
 }
 
 export function useWatchlistData() {
   return {
     state,
     loadBoard,
+    currentFilterKey,
+    startJobPolling,
+    stopJobPolling,
+    retryJob,
     setDays,
     setGroupId,
     setQuery,

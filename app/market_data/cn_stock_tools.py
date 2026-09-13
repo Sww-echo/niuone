@@ -8,6 +8,7 @@ import time
 import urllib.parse
 import urllib.request
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 try:
     from app.market_data.tencent_kline_cache import fetch_a_share_daily_klines
@@ -83,7 +84,7 @@ def get_quote(symbol):
     try:
         data = http_get_json(EASTMONEY_QUOTE, {
             "secid": sym["secid"],
-            "fields": "f43,f57,f58,f60,f169,f170,f171,f168,f46,f44,f45,f47,f48,f50"
+            "fields": "f43,f57,f58,f60,f169,f170,f171,f168,f46,f44,f45,f47,f48,f50,f124"
         }).get("data")
         if not data:
             raise RuntimeError("未获取到行情数据")
@@ -119,7 +120,8 @@ def get_quote(symbol):
             "turnover_yuan": amount(data.get("f48")),
             "turnover": _turnover_pct(data.get("f168"), divisor=100.0),
             "volume_ratio": data.get("f50"),
-            "source": "Eastmoney push2 quote"
+            "source": "Eastmoney push2 quote",
+            "quote_time": normalize_quote_time(data.get("f124")),
         }
     except Exception:
         req = urllib.request.Request(TENCENT_QUOTE + sym["display"], headers={"User-Agent": UA, "Referer": "https://gu.qq.com/"})
@@ -152,8 +154,28 @@ def get_quote(symbol):
             "turnover_yuan": float(parts[37]) * 10000,
             "turnover": _turnover_pct(parts[38]) if len(parts) > 38 else None,
             "volume_ratio": None,
-            "source": "Tencent qt quote fallback"
+            "source": "Tencent qt quote fallback",
+            "quote_time": normalize_quote_time(parts[30]),
         }
+
+
+def normalize_quote_time(value):
+    """Preserve provider observation time in Shanghai; never substitute now."""
+    if value in (None, "", "-") or isinstance(value, bool):
+        return ""
+    text = str(value).strip()
+    try:
+        tz = ZoneInfo("Asia/Shanghai")
+        if len(text) == 14 and text.isdigit():
+            stamp = datetime.strptime(text, "%Y%m%d%H%M%S").replace(tzinfo=tz)
+        else:
+            seconds = float(text)
+            if not math.isfinite(seconds) or seconds <= 0:
+                return ""
+            stamp = datetime.fromtimestamp(seconds, tz=tz)
+        return stamp.isoformat(timespec="seconds")
+    except (ValueError, OverflowError, OSError):
+        return ""
 
 
 def get_klines(symbol, count=120):

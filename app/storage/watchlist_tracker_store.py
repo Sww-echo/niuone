@@ -8,7 +8,9 @@ Tables:
 from __future__ import annotations
 
 import os
+import json
 import sqlite3
+import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -107,6 +109,8 @@ def init_db(con: sqlite3.Connection) -> None:
             change_percent REAL,
             volume REAL,
             source TEXT NOT NULL DEFAULT '',
+            quote_time TEXT NOT NULL DEFAULT '',
+            is_final INTEGER NOT NULL DEFAULT 1,
             updated_at TEXT NOT NULL,
             UNIQUE(code, trade_date),
             FOREIGN KEY(code) REFERENCES watchlist_stocks(code) ON DELETE CASCADE
@@ -119,8 +123,21 @@ def init_db(con: sqlite3.Connection) -> None:
             ON watchlist_daily_quotes(trade_date DESC);
         CREATE INDEX IF NOT EXISTS idx_watchlist_quotes_code_date
             ON watchlist_daily_quotes(code, trade_date DESC);
+        CREATE TABLE IF NOT EXISTS watchlist_jobs (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            id TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL,
+            payload TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_watchlist_job_active
+            ON watchlist_jobs((1)) WHERE status IN ('queued', 'running');
         """
     )
+    columns = {row[1] for row in con.execute("PRAGMA table_info(watchlist_daily_quotes)")}
+    if "quote_time" not in columns:
+        con.execute("ALTER TABLE watchlist_daily_quotes ADD COLUMN quote_time TEXT NOT NULL DEFAULT ''")
+    if "is_final" not in columns:
+        con.execute("ALTER TABLE watchlist_daily_quotes ADD COLUMN is_final INTEGER NOT NULL DEFAULT 1")
     con.commit()
 
 
@@ -128,6 +145,32 @@ def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
     return {key: row[key] for key in row.keys()}
+
+
+def save_job(con: sqlite3.Connection, job: dict[str, Any]) -> None:
+    con.execute(
+        """INSERT INTO watchlist_jobs(id, status, payload) VALUES (?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET status = excluded.status, payload = excluded.payload""",
+        (job["id"], job["status"], json.dumps(job, ensure_ascii=False, allow_nan=False)),
+    )
+    con.execute(
+        """DELETE FROM watchlist_jobs WHERE status NOT IN ('queued', 'running')
+        AND seq NOT IN (SELECT seq FROM watchlist_jobs ORDER BY seq DESC LIMIT 20)"""
+    )
+    con.commit()
+
+
+def get_job(con: sqlite3.Connection, job_id: str | None = None) -> dict[str, Any] | None:
+    if job_id is None:
+        row = con.execute("SELECT payload FROM watchlist_jobs ORDER BY seq DESC LIMIT 1").fetchone()
+    else:
+        row = con.execute("SELECT payload FROM watchlist_jobs WHERE id = ?", (job_id,)).fetchone()
+    return json.loads(row["payload"]) if row else None
+
+
+def unfinished_jobs(con: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = con.execute("SELECT payload FROM watchlist_jobs WHERE status IN ('queued', 'running')")
+    return [json.loads(row["payload"]) for row in rows]
 
 
 def list_groups(con: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -228,7 +271,7 @@ def delete_group(con: sqlite3.Connection, group_id: int) -> None:
 def list_stocks(
     con: sqlite3.Connection,
     *,
-    group_id: int | None = None,
+    group_id: int | str | None = None,
     q: str = "",
     active_only: bool = True,
 ) -> list[dict[str, Any]]:
@@ -236,7 +279,9 @@ def list_stocks(
     args: list[Any] = []
     if active_only:
         where.append("s.active = 1")
-    if group_id is not None:
+    if group_id == "ungrouped":
+        where.append("s.group_id IS NULL")
+    elif group_id is not None:
         where.append("s.group_id = ?")
         args.append(int(group_id))
     query = str(q or "").strip()
@@ -268,6 +313,29 @@ def get_stock(con: sqlite3.Connection, code: str) -> dict[str, Any] | None:
         (str(code),),
     ).fetchone()
     return row_to_dict(row)
+
+
+def insert_stock_if_missing(
+    con: sqlite3.Connection,
+    *,
+    code: str,
+    market: str,
+    group_id: int | None,
+    note: str,
+    buy_date: str,
+    target_amount: float,
+) -> bool:
+    """Atomically add a new observation without changing an existing one."""
+    timestamp = _now_iso()
+    cur = con.execute(
+        """INSERT INTO watchlist_stocks
+        (code, market, group_id, note, buy_date, target_amount, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(code) DO NOTHING""",
+        (code, market, group_id, note, buy_date, target_amount, timestamp, timestamp),
+    )
+    con.commit()
+    return cur.rowcount == 1
 
 
 def upsert_stock(
@@ -406,6 +474,22 @@ def delete_stock(con: sqlite3.Connection, code: str) -> None:
     con.commit()
 
 
+def fill_stock_if_unchanged(
+    con: sqlite3.Connection, stock: dict[str, Any], *,
+    buy_price: float | None, buy_shares: int, buy_amount: float,
+) -> dict[str, Any] | None:
+    """Do not let a delayed quote overwrite an intervening buy-date/amount edit."""
+    con.execute(
+        """UPDATE watchlist_stocks SET buy_price = ?, buy_shares = ?, buy_amount = ?, updated_at = ?
+        WHERE code = ? AND buy_date = ? AND target_amount = ?
+        AND buy_price IS ? AND buy_shares = ? AND buy_amount = ?""",
+        (buy_price, buy_shares, buy_amount, _now_iso(), stock["code"], stock["buy_date"],
+         stock["target_amount"], stock["buy_price"], stock["buy_shares"], stock["buy_amount"]),
+    )
+    con.commit()
+    return get_stock(con, stock["code"])
+
+
 def upsert_quote(
     con: sqlite3.Connection,
     quote: dict[str, Any],
@@ -427,25 +511,16 @@ def upsert_quote(
         quote.get("change_percent"),
         quote.get("volume"),
         str(quote.get("source") or ""),
+        str(quote.get("quote_time") or ""),
+        1 if quote.get("is_final", True) else 0,
         _now_iso(),
     )
-    if missing_only:
-        cur = con.execute(
-            """
-            INSERT OR IGNORE INTO watchlist_daily_quotes(
-                code, trade_date, open_price, close_price, high_price, low_price,
-                change_amount, change_percent, volume, source, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            values,
-        )
-        return cur.rowcount > 0
-    con.execute(
+    cur = con.execute(
         """
         INSERT INTO watchlist_daily_quotes(
             code, trade_date, open_price, close_price, high_price, low_price,
-            change_amount, change_percent, volume, source, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            change_amount, change_percent, volume, source, quote_time, is_final, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(code, trade_date) DO UPDATE SET
             open_price = excluded.open_price,
             close_price = excluded.close_price,
@@ -455,11 +530,18 @@ def upsert_quote(
             change_percent = excluded.change_percent,
             volume = excluded.volume,
             source = excluded.source,
+            quote_time = excluded.quote_time,
+            is_final = excluded.is_final,
             updated_at = excluded.updated_at
+        WHERE watchlist_daily_quotes.close_price IS NULL
+           OR watchlist_daily_quotes.close_price <= 0
+           OR watchlist_daily_quotes.close_price > ?
+           OR (watchlist_daily_quotes.is_final = 0 AND excluded.is_final = 1)
+           OR (? = 0 AND (watchlist_daily_quotes.is_final = 0 OR excluded.is_final = 1))
         """,
-        values,
+        (*values, sys.float_info.max, int(missing_only)),
     )
-    return True
+    return cur.rowcount > 0
 
 
 def upsert_quotes(
@@ -491,6 +573,43 @@ def recent_trade_dates(con: sqlite3.Connection, days: int) -> list[str]:
     return dates
 
 
+def all_quote_dates(con: sqlite3.Connection) -> list[str]:
+    return [str(row[0]) for row in con.execute(
+        "SELECT DISTINCT trade_date FROM watchlist_daily_quotes ORDER BY trade_date"
+    )]
+
+
+def latest_quotes_for_codes(
+    con: sqlite3.Connection,
+    codes: list[str],
+    valid_dates: list[str],
+) -> dict[str, dict[str, Any]]:
+    """Load one valid-price quote per code independently of the display window."""
+    if not codes or not valid_dates:
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for offset in range(0, len(codes), 400):
+        batch = codes[offset:offset + 400]
+        codes_sql = ",".join("?" for _ in batch)
+        for date_offset in range(0, len(valid_dates), 400):
+            date_batch = valid_dates[date_offset:date_offset + 400]
+            dates_sql = ",".join("?" for _ in date_batch)
+            rows = con.execute(
+                f"""SELECT q.* FROM watchlist_daily_quotes q JOIN (
+                    SELECT code, MAX(trade_date) AS trade_date FROM watchlist_daily_quotes
+                    WHERE code IN ({codes_sql}) AND trade_date IN ({dates_sql})
+                      AND close_price > 0 AND close_price <= ?
+                    GROUP BY code
+                ) latest ON q.code = latest.code AND q.trade_date = latest.trade_date""",
+                (*batch, *date_batch, sys.float_info.max),
+            )
+            for row in rows:
+                code = str(row["code"])
+                if code not in result or row["trade_date"] > result[code]["trade_date"]:
+                    result[code] = row_to_dict(row) or {}
+    return result
+
+
 def quotes_for_codes(
     con: sqlite3.Connection,
     codes: list[str],
@@ -499,19 +618,19 @@ def quotes_for_codes(
     if not codes or not trade_dates:
         return {}
     placeholders_dates = ",".join("?" for _ in trade_dates)
-    placeholders_codes = ",".join("?" for _ in codes)
-    rows = con.execute(
-        f"""
-        SELECT * FROM watchlist_daily_quotes
-        WHERE trade_date IN ({placeholders_dates})
-          AND code IN ({placeholders_codes})
-        """,
-        (*trade_dates, *codes),
-    ).fetchall()
-    return {
-        (str(row["code"]), str(row["trade_date"])): (row_to_dict(row) or {})
-        for row in rows
-    }
+    result = {}
+    for offset in range(0, len(codes), 400):
+        batch = codes[offset:offset + 400]
+        placeholders_codes = ",".join("?" for _ in batch)
+        rows = con.execute(
+            f"""SELECT * FROM watchlist_daily_quotes
+            WHERE trade_date IN ({placeholders_dates}) AND code IN ({placeholders_codes})""",
+            (*trade_dates, *batch),
+        )
+        result.update({
+            (str(row["code"]), str(row["trade_date"])): (row_to_dict(row) or {}) for row in rows
+        })
+    return result
 
 
 def quote_on_date(

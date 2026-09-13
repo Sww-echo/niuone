@@ -35,6 +35,7 @@ Private runtime directory:
 | `.local-data/runtime/push_history.db` | Message history |
 | `.local-data/runtime/news/realtime_news_latest.json` | Bounded rolling NewsNow history and non-sensitive source status; successful refreshes merge by ID under total/important limits, while upstream failures use it only as a read-only fallback and never replace real trading records |
 | `.local-data/runtime/niuniu.db` | Practice trades, account data, complete observed opportunity sets, five-stage holding paths/exit stages, and durable decision evidence |
+| `.local-data/runtime/watchlist_tracker.db` | Private watchlist groups, simulated fills, quotes with provider time/finality, and progress and failures for the latest 20 quote jobs |
 | `.local-data/runtime/cron/output/niuone_forward_evaluation.json` | NiuOne strict-forward aggregates, five-stage opportunity/sizing funnel, holding paths/stage transitions/exit stages, rejection categories, trade-level and entry-date-by-industry cluster-robust win-rate intervals, daily portfolio return/drawdown, performance gate, coverage diagnostics, and shadow groups |
 | `.local-data/runtime/cron/state/niuone_forward_protocol.json` | Frozen code/non-secret runtime-configuration fingerprint and code-free starting-account boundary for the NiuOne strict-forward cohort |
 | `.local-data/runtime/cron/state/niuone_cron_scheduler.json` | Bounded Cron run keys and daily task outcomes used by strict-forward evaluation |

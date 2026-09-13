@@ -346,6 +346,42 @@ When a strategy appears not to trigger, check in this order:
 
 See the [Strategy Research Guide](strategies/README_EN.md#34-sector-tide) for Sector Tide user rules, risk budgets, and the developer data contract.
 
+### 3.4 Watchlist Trends and Quote Jobs
+
+The watchlist retains its independent, approximately CNY 10,000, whole-share observation
+model without transaction fees. The 5/7/15/60-day setting only changes visible history columns.
+Costs and valuations for the current filter use all valid quote history. Filled positions without
+a quote remain in cost totals, while aggregate market value and P&L stay unavailable. Older
+valid quotes can value a position with an explicit date. Group chips always summarize the full group.
+
+Adding an existing code skips it and preserves its group, note, buy date and quantity. Only an
+explicit buy-date or budget change recalculates a saved fill; quote refreshes preserve it. The
+default buy date is the most recent completed Shanghai trading session. Quotes retain provider
+time, and the page separates the quote date from page refresh time. Missing values display `—`;
+real zeroes remain zero. Date validation reuses the local A-share calendar with the existing
+weekday fallback when unavailable; board reads never fetch a calendar. Legacy weekend and
+future-dated quotes are excluded from display and valuation without deleting them.
+
+New intraday quotes are provisional and cannot establish a closing-price fill. After the close,
+missing-only backfill also completes provisional bars and missing prices, preserving valid final
+history. Upgrades append quote-time/finality columns and a job table to the watchlist database;
+legacy daily bars without time metadata keep their existing daily-bar interpretation. Back up
+the private `watchlist_tracker.db` before deployment, or the configured `DASHBOARD_WATCHLIST_DB` path.
+
+Today-quote updates and backfills immediately return a job ID. A single Dashboard process runs
+one quote job at a time, retaining existing bounded provider timeouts and retries. The page shows
+progress, elapsed time, successes, skips and failures, and restores the latest job when reopened.
+The same private database retains the latest 20 jobs. A service restart marks unfinished work
+as interrupted; administrators can retry only failed and unfinished codes. Successful codes are
+not rescheduled by that retry, and removed or inactive stocks are skipped. Failure to read progress
+does not mean the server-side work was cancelled.
+
+API: `POST /api/watchlist/jobs` accepts `kind: update-today` or `kind: backfill` and returns 202.
+`GET /api/watchlist/jobs/latest` and `GET /api/watchlist/jobs/{id}` read status;
+`POST /api/watchlist/jobs/{id}/retry` retries unfinished work. Job submissions, retries and existing
+mutations still require administrator authentication. Existing synchronous quote endpoints remain
+compatible. Board and job summaries disable public caching. Backfill accepts 1–365 days.
+
 ## 4. Validation Procedure
 
 ```bash

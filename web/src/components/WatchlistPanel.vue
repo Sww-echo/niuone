@@ -1,11 +1,17 @@
 <script setup>
-import { computed, nextTick, onMounted, reactive, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useWatchlistData } from '../composables/useWatchlistData.js'
 import { authenticateAdmin } from '../utils/adminSession.js'
+import { formatPrice, formatSignedMoney, formatPct, formatMoney, toneClass, dateLabel,
+  isJobActive, jobStatusLabel, formatDuration } from '../utils/watchlistDisplay.js'
 
 const {
   state,
   loadBoard,
+  currentFilterKey,
+  startJobPolling,
+  stopJobPolling,
+  retryJob,
   setDays,
   setGroupId,
   setQuery,
@@ -21,10 +27,10 @@ const form = reactive({
   codes: '',
   groupId: '',
   note: '',
-  buyDate: todayLocal(),
+  buyDate: '',
   groupName: '',
   groupNote: '',
-  search: '',
+  search: state.q,
   backfillDays: 60,
   missingOnly: true,
 })
@@ -44,6 +50,7 @@ const adminAuth = reactive({ open: false, credential: '', error: '', submitting:
 const adminCredentialInput = ref(null)
 const pendingAdminAction = ref(null)
 let searchTimer = 0
+const buyDateEdited = ref(false)
 
 const vModal = {
   mounted(dialog) { dialog.showModal() },
@@ -71,68 +78,25 @@ const sections = computed(() => {
 })
 const stocks = computed(() => state.board.stocks || [])
 const pendingCount = computed(() => state.board.summary?.pending_count || 0)
-const ungroupedCount = computed(() =>
-  (state.board.stocks || []).filter(s => s.group_id == null || s.group_id === '').length
-)
+const ungroupedCount = computed(() => state.board.ungrouped_count || 0)
+const hasCurrentBoard = computed(() => state.loaded && state.boardFilterKey === currentFilterKey())
+const jobActive = computed(() => isJobActive(state.job))
+const filtered = computed(() => !!(state.groupId || state.q))
+const refreshedAt = computed(() => String(state.board.generated_at || '').replace('T', ' ').slice(0, 19))
+const jobTitle = computed(() => state.job?.kind === 'backfill' ? '历史行情回补' : '今日行情更新')
+const retryLabel = computed(() => state.job?.processed < state.job?.total ? '重试失败及未完成项' : '仅重试失败项')
 
-function todayLocal() {
-  const now = new Date()
-  const offset = now.getTimezoneOffset()
-  const local = new Date(now.getTime() - offset * 60_000)
-  return local.toISOString().slice(0, 10)
-}
-
-function numberOrNull(value) {
-  const number = Number(value)
-  return Number.isFinite(number) ? number : null
-}
-
-function formatPrice(value) {
-  const number = numberOrNull(value)
-  return number === null ? '—' : number.toFixed(2)
-}
-
-function formatSignedMoney(value) {
-  const number = numberOrNull(value)
-  if (number === null) return '—'
-  const sign = number > 0 ? '+' : ''
-  return sign + formatMoney(number)
-}
-
-function formatPct(value) {
-  const number = numberOrNull(value)
-  if (number === null) return '—'
-  const sign = number > 0 ? '+' : ''
-  return `${sign}${number.toFixed(2)}%`
-}
-
-function formatMoney(value) {
-  const number = numberOrNull(value)
-  if (number === null) return '—'
-  return number.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-}
-
-function toneClass(value) {
-  const number = numberOrNull(value)
-  if (number === null || number === 0) return ''
-  return number > 0 ? 'up' : 'down'
-}
-
-function dateLabel(value) {
-  if (!value) return '—'
-  const d = new Date(`${value}T00:00:00+08:00`)
-  if (Number.isNaN(d.getTime())) return value
-  const week = ['日','一','二','三','四','五','六'][d.getDay()]
-  return `${d.getMonth()+1}.${d.getDate()} 周${week}`
-}
+watch(() => state.board.default_buy_date, (value) => {
+  if (value && !buyDateEdited.value && !form.buyDate) form.buyDate = value
+}, { immediate: true })
 
 const buyDatePresets = computed(() => {
-  const dates = [...(state.board.trade_dates || [])]
+  const dates = (state.board.trade_dates || []).filter(date => date <= state.board.default_buy_date)
   return dates.slice().reverse().slice(0, 8)
 })
 
 function pickBuyDate(date, target = 'form') {
-  if (target === 'form') form.buyDate = date
+  if (target === 'form') { form.buyDate = date; buyDateEdited.value = true }
   else edit.buyDate = date
 }
 
@@ -142,6 +106,8 @@ function fillStatusLabel(status) {
     pending_fill: '待回补',
     no_buy_date: '未设置买入日',
     pending_quote: '暂无最新行情',
+    awaiting_close: '待收盘',
+    invalid_buy_date: '请调整买入日期',
   }
   return map[status] || status
 }
@@ -223,7 +189,8 @@ async function onUpdateToday() {
 }
 
 async function onBackfill() {
-  await withAdminRetry(() => backfill({ days: Number(form.backfillDays) || 60, missingOnly: form.missingOnly }))
+  const result = await withAdminRetry(() => backfill({ days: Number(form.backfillDays) || 60, missingOnly: form.missingOnly }))
+  if (result?.ok) closeActionDialog()
 }
 
 function onDaysChange(e) { setDays(e.target.value) }
@@ -262,7 +229,8 @@ async function onDelete(stock) {
   await withAdminRetry(() => deleteStock(stock.code))
 }
 
-onMounted(() => { loadBoard() })
+onMounted(() => { loadBoard(); startJobPolling() })
+onUnmounted(() => { window.clearTimeout(searchTimer); stopJobPolling() })
 </script>
 
 <template>
@@ -281,14 +249,14 @@ onMounted(() => { loadBoard() })
         <div class="watchlist-actions">
           <button type="button" class="primary" :disabled="state.busy" @click="openActionDialog('add')">添加自选</button>
           <button type="button" :disabled="state.busy" @click="openActionDialog('manage')">分组 / 回补</button>
-          <button type="button" class="accent" :disabled="state.busy" @click="onUpdateToday">更新今日行情</button>
+          <button type="button" class="accent" :disabled="state.busy || jobActive" @click="onUpdateToday">更新今日行情</button>
         </div>
       </div>
     </div>
 
-    <div class="watchlist-summary" v-if="state.loaded">
+    <div class="watchlist-summary" v-if="hasCurrentBoard">
       <div class="watchlist-metric">
-        <span class="label">自选数</span>
+        <span class="label">{{ filtered ? '筛选内自选数' : '自选数' }}</span>
         <strong>{{ state.board.total }}</strong>
       </div>
       <div class="watchlist-metric">
@@ -296,7 +264,7 @@ onMounted(() => { loadBoard() })
         <strong>{{ summary.filled_count || 0 }}</strong>
       </div>
       <div class="watchlist-metric">
-        <span class="label">待回补</span>
+        <span class="label">待补齐</span>
         <strong>{{ pendingCount }}</strong>
       </div>
       <div class="watchlist-metric">
@@ -318,6 +286,47 @@ onMounted(() => { loadBoard() })
       </div>
     </div>
 
+    <p v-if="hasCurrentBoard && summary.valuation_complete === false" class="watchlist-data-note">
+      {{ summary.missing_quote_count }} 只持仓缺少有效报价，市值与盈亏待补齐，成本已保留。
+    </p>
+    <p v-else-if="hasCurrentBoard && summary.stale_count" class="watchlist-data-note">
+      {{ summary.stale_count }} 只持仓按最近有效价估值，报价日期见下表。
+    </p>
+
+    <div v-if="state.loadError" class="watchlist-notice" role="alert">
+      <span>{{ state.loadError }}{{ hasCurrentBoard ? '，当前保留上次结果。' : '' }}</span>
+      <button type="button" :disabled="state.loading" @click="loadBoard()">重试刷新</button>
+    </div>
+    <details v-if="state.actionFailures.length" class="watchlist-notice" open>
+      <summary>{{ state.actionFailures.length }} 只股票处理未完成</summary>
+      <ul class="watchlist-failures">
+        <li v-for="item in state.actionFailures" :key="item.code">{{ item.code }} · {{ item.error }}</li>
+      </ul>
+    </details>
+
+    <section v-if="state.job" class="watchlist-job" aria-label="行情处理进度">
+      <div class="watchlist-job-header">
+        <strong>{{ jobTitle }} · {{ jobStatusLabel(state.job) }}</strong>
+        <span role="status">{{ state.job.processed }} / {{ state.job.total }} 只 · {{ formatDuration(state.job.elapsed_seconds) }}</span>
+      </div>
+      <progress v-if="jobActive" :value="state.job.processed" :max="Math.max(1, state.job.total)" aria-label="已处理股票数量" />
+      <div class="watchlist-job-header">
+        <span>成功 {{ state.job.succeeded }} · 跳过 {{ state.job.skipped }} · 失败 {{ state.job.failed.length }}<template v-if="state.job.current_code"> · 正在处理 {{ state.job.current_code }}</template></span>
+        <button v-if="state.job.retry_count > 0 && !jobActive" type="button" :disabled="state.busy" @click="withAdminRetry(() => retryJob())">
+          {{ retryLabel }} ({{ state.job.retry_count }})
+        </button>
+      </div>
+      <p v-if="state.job.skipped && state.job.kind === 'update-today'" class="watchlist-data-note">跳过项已保留原行情，可在需要时再次更新。</p>
+      <p v-if="state.job.error" class="watchlist-data-note">{{ state.job.error }}</p>
+      <details v-if="state.job.failed.length">
+        <summary>查看失败股票与原因</summary>
+        <ul class="watchlist-failures">
+          <li v-for="item in state.job.failed" :key="item.code">{{ item.code }} · {{ item.error }}</li>
+        </ul>
+      </details>
+    </section>
+    <p v-if="state.jobError" class="watchlist-data-note" role="status">{{ state.jobError }}</p>
+
     <div class="watchlist-control-panel" v-if="state.loaded">
       <div class="watchlist-filter-grid">
         <label class="watchlist-field grow">
@@ -328,6 +337,7 @@ onMounted(() => { loadBoard() })
           <span class="field-label">分组筛选</span>
           <select :value="state.groupId" @change="onGroupFilterChange">
             <option value="">全部组别</option>
+            <option value="ungrouped">未分组 ({{ ungroupedCount }})</option>
             <option v-for="group in groups" :key="group.id" :value="String(group.id)">
               {{ group.name }} ({{ group.stock_count || 0 }})
             </option>
@@ -340,7 +350,11 @@ onMounted(() => { loadBoard() })
           </select>
         </label>
       </div>
-      <span class="watchlist-meta">共 {{ state.board.total }} 只 · {{ tradeDates.length }} 个交易日</span>
+      <span class="watchlist-meta">
+        当前 {{ hasCurrentBoard ? state.board.total : '—' }} / 全部 {{ state.board.total_all }} 只 · 展示 {{ state.days }} 日
+        <br>行情截至 {{ hasCurrentBoard ? state.board.latest_trade_date || '暂无' : '—' }}
+        <br>页面刷新 {{ refreshedAt || '—' }}
+      </span>
     </div>
 
     <div class="watchlist-chip-row" v-if="state.loaded">
@@ -350,7 +364,7 @@ onMounted(() => { loadBoard() })
         :class="{ active: !state.groupId }"
         @click="setGroupId('')"
       >
-        全部 <span class="chip-pnl">{{ state.board.total }}</span>
+        全部 <span class="chip-pnl">{{ state.board.total_all }}</span>
       </button>
       <button
         v-for="group in groups"
@@ -363,20 +377,23 @@ onMounted(() => { loadBoard() })
         {{ group.name }}
         <span class="chip-pnl">{{ group.stock_count || 0 }}</span>
         <span class="chip-pnl" :class="toneClass(group.total_pnl)">
-          {{ formatSignedMoney(group.total_pnl ?? 0) }}
+          {{ formatSignedMoney(group.total_pnl) }}
         </span>
       </button>
       <button
-        v-if="ungroupedCount > 0"
+        v-if="ungroupedCount > 0 || state.groupId === 'ungrouped'"
         type="button"
         class="watchlist-chip"
-        @click="setGroupId('')"
+        :class="{ active: state.groupId === 'ungrouped' }"
+        @click="setGroupId('ungrouped')"
       >
         未分组 <span class="chip-pnl">{{ ungroupedCount }}</span>
       </button>
     </div>
 
-    <div v-if="state.loading && !state.loaded" class="loading">自选股加载中…</div>
+    <div v-if="state.loading && !hasCurrentBoard" class="loading">自选股加载中…</div>
+    <div v-else-if="!hasCurrentBoard" class="empty">当前筛选结果加载失败，请重试刷新。</div>
+    <div v-else-if="!stocks.length && state.board.total_all > 0" class="empty">没有符合当前分组或搜索条件的股票。</div>
     <div v-else-if="!stocks.length" class="empty">还没有自选股，请先点击“添加自选”录入股票代码。</div>
 
     <div v-else class="watchlist-grouped">
@@ -397,7 +414,7 @@ onMounted(() => { loadBoard() })
                 <th class="sticky-col sticky-2">名称</th>
                 <th>买入日期</th>
                 <th>模拟买入</th>
-                <th>现价</th>
+                <th>最近报价</th>
                 <th class="pnl-col">自买入盈亏</th>
                 <th
                   v-for="tradeDate in tradeDates"
@@ -432,7 +449,10 @@ onMounted(() => { loadBoard() })
                   <div class="price">{{ formatPrice(stock.buy_price) }}</div>
                   <div class="muted">{{ stock.buy_shares || 0 }} 股 · {{ formatMoney(stock.buy_amount) }}</div>
                 </td>
-                <td class="price">{{ formatPrice(stock.last_price) }}</td>
+                <td class="price">
+                  {{ formatPrice(stock.last_price) }}
+                  <span class="watchlist-quote-date">{{ stock.last_quote_date || '暂无报价' }}{{ stock.quote_final === false ? ' · 盘中' : stock.quote_stale ? ' · 较早' : '' }}</span>
+                </td>
                 <td :class="['pct', 'pnl-col', stock.fill_status === 'filled' ? toneClass(stock.pnl) : 'muted']">
                   <template v-if="stock.fill_status === 'filled'">
                     <div class="pnl-amount">{{ formatSignedMoney(stock.pnl) }}</div>
@@ -483,8 +503,8 @@ onMounted(() => { loadBoard() })
       </label>
       <div class="watchlist-field buy-date-field">
         <label class="field-label" for="watchlist-buy-date">模拟买入日</label>
-        <input id="watchlist-buy-date" v-model="form.buyDate" type="date">
-        <div class="buy-date-hint">按该日收盘价买入约 1 万，相对最新价算浮动盈亏</div>
+        <input id="watchlist-buy-date" v-model="form.buyDate" type="date" :max="state.board.generated_at?.slice(0, 10)" @input="buyDateEdited = true">
+        <div class="buy-date-hint">默认最近已收盘交易日；按收盘价买入约 1 万。已有股票会跳过，保留原买入信息。</div>
         <div class="buy-date-presets" v-if="buyDatePresets.length">
           <button
             v-for="d in buyDatePresets"
@@ -536,7 +556,7 @@ onMounted(() => { loadBoard() })
         <label class="watchlist-check">
           <input v-model="form.missingOnly" type="checkbox">只补缺失日
         </label>
-        <button type="button" :disabled="state.busy" @click="onBackfill">回补历史行情</button>
+        <button type="button" :disabled="state.busy || jobActive" @click="onBackfill">回补历史行情</button>
       </section>
       <div class="watchlist-dialog-actions">
         <button type="button" @click="closeActionDialog">关闭</button>
@@ -565,7 +585,7 @@ onMounted(() => { loadBoard() })
       </label>
       <div class="watchlist-field buy-date-field">
         <label class="field-label" for="watchlist-edit-buy-date">模拟买入日</label>
-        <input id="watchlist-edit-buy-date" v-model="edit.buyDate" type="date">
+        <input id="watchlist-edit-buy-date" v-model="edit.buyDate" type="date" :max="state.board.generated_at?.slice(0, 10)">
         <div class="buy-date-presets" v-if="buyDatePresets.length">
           <button
             v-for="d in buyDatePresets"

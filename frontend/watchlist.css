@@ -8,6 +8,8 @@
 .watchlist-status.error { color:var(--red-text); }
 .watchlist-actions { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:6px; }
 .watchlist-actions button,
+.watchlist-job button,
+.watchlist-notice button,
 .watchlist-dialog-actions button,
 .watchlist-dialog-section > button {
   min-height:34px;
@@ -104,6 +106,17 @@
 .watchlist-fill-hint { display:inline-block; margin-top:2px; color:var(--muted); font-size:11px; font-weight:500; }
 .watchlist-table .link { min-height:28px; border:0; padding:4px 6px; background:transparent; color:var(--accent-text); font:inherit; cursor:pointer; }
 .watchlist-table .link.danger { color:var(--red-text); }
+.watchlist-data-note { margin:0; color:var(--muted); font-size:12px; line-height:1.6; overflow-wrap:anywhere; }
+.watchlist-notice,
+.watchlist-job { display:grid; gap:8px; min-width:0; max-width:100%; padding:10px; border:1px solid var(--line); border-radius:8px; background:var(--panel2); font-size:12px; line-height:1.5; overflow-wrap:anywhere; }
+.watchlist-job-header { display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; gap:8px; min-width:0; }
+.watchlist-job-header > * { min-width:0; max-width:100%; }
+.watchlist-job progress { display:block; width:100%; max-width:100%; height:8px; accent-color:var(--accent); }
+.watchlist-job summary,
+.watchlist-notice summary { cursor:pointer; padding:4px 0; }
+.watchlist-failures { margin:6px 0 0; padding-left:20px; max-height:180px; overflow:auto; }
+.watchlist-failures li { padding:3px 0; overflow-wrap:anywhere; }
+.watchlist-quote-date { display:block; color:var(--muted); font-size:11px; margin-top:3px; }
 
 .watchlist-dialog {
   position:fixed;
@@ -154,6 +167,10 @@ html[data-theme="dark"] .watchlist-dialog::backdrop { background:rgba(0,0,0,.7);
   .watchlist-actions { width:100%; }
   .watchlist-actions button { flex:1 1 120px; }
   .watchlist-actions button,
+  .watchlist-job button,
+  .watchlist-job summary,
+  .watchlist-notice button,
+  .watchlist-notice summary,
   .watchlist-dialog-actions button,
   .watchlist-dialog-section > button,
   .watchlist-chip,
