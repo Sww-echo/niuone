@@ -45,6 +45,11 @@ const adminCredentialInput = ref(null)
 const pendingAdminAction = ref(null)
 let searchTimer = 0
 
+const vModal = {
+  mounted(dialog) { dialog.showModal() },
+  beforeUnmount(dialog) { dialog.close() },
+}
+
 const dayOptions = computed(() => state.board.allowed_days?.length ? state.board.allowed_days : [5,7,15,60])
 
 const summary = computed(() => state.board.summary || {})
@@ -261,10 +266,9 @@ onMounted(() => { loadBoard() })
 </script>
 
 <template>
-  <section class="card watchlist-panel watchlist-redesign">
+  <section class="card watchlist-panel">
     <div class="watchlist-hero">
       <div class="watchlist-title-block">
-        <div class="watchlist-kicker">WATCHLIST TRACKER</div>
         <h2>自选股走势</h2>
         <p class="watchlist-subtitle">
           按分组跟踪多日走势；可选买入日默认按 1 万元尽量买满，仅展示浮动盈亏。
@@ -458,10 +462,10 @@ onMounted(() => { loadBoard() })
     </div>
   </section>
 
-  <dialog v-if="actionDialog.open" class="watchlist-dialog watchlist-action-dialog" open @close="closeActionDialog">
+  <dialog v-if="actionDialog.open" v-modal class="watchlist-dialog watchlist-action-dialog" aria-labelledby="watchlist-action-title" @close="closeActionDialog">
     <form v-if="actionDialog.mode === 'add'" class="watchlist-dialog-form" @submit.prevent="onAddStocks">
       <div class="watchlist-dialog-headline">
-        <h3>添加自选并模拟买入</h3>
+        <h3 id="watchlist-action-title">添加自选并模拟买入</h3>
         <p class="watchlist-subtitle">输入一个或多个股票代码，系统会按买入日收盘价模拟买入。</p>
       </div>
       <label class="watchlist-field grow">
@@ -478,8 +482,8 @@ onMounted(() => { loadBoard() })
         </select>
       </label>
       <div class="watchlist-field buy-date-field">
-        <span class="field-label">模拟买入日</span>
-        <input v-model="form.buyDate" type="date">
+        <label class="field-label" for="watchlist-buy-date">模拟买入日</label>
+        <input id="watchlist-buy-date" v-model="form.buyDate" type="date">
         <div class="buy-date-hint">按该日收盘价买入约 1 万，相对最新价算浮动盈亏</div>
         <div class="buy-date-presets" v-if="buyDatePresets.length">
           <button
@@ -504,14 +508,14 @@ onMounted(() => { loadBoard() })
 
     <form v-else class="watchlist-dialog-form" @submit.prevent>
       <div class="watchlist-dialog-headline">
-        <h3>分组与数据维护</h3>
+        <h3 id="watchlist-action-title">分组与数据维护</h3>
         <p class="watchlist-subtitle">创建新分组，或回补历史行情数据。</p>
       </div>
       <section class="watchlist-dialog-section">
         <h4>创建分组</h4>
         <label class="watchlist-field">
           <span class="field-label">新分组</span>
-          <input v-model="form.groupName" type="text" placeholder="例如：半导体">
+          <input v-model="form.groupName" type="text" placeholder="例如：半导体" autofocus>
         </label>
         <label class="watchlist-field grow">
           <span class="field-label">分组备注</span>
@@ -540,9 +544,9 @@ onMounted(() => { loadBoard() })
     </form>
   </dialog>
 
-  <dialog v-if="edit.open" class="watchlist-dialog" open>
+  <dialog v-if="edit.open" v-modal class="watchlist-dialog" aria-labelledby="watchlist-edit-title" @close="closeEdit">
     <form class="watchlist-dialog-form" @submit.prevent="saveEdit">
-      <h3>调整自选 · {{ edit.code }}</h3>
+      <h3 id="watchlist-edit-title">调整自选 · {{ edit.code }}</h3>
       <p class="watchlist-subtitle">
         选择买入日（例如周一），系统按该日收盘价买入约 1 万元，相对最新价计算浮动盈亏。
       </p>
@@ -560,8 +564,8 @@ onMounted(() => { loadBoard() })
         </select>
       </label>
       <div class="watchlist-field buy-date-field">
-        <span class="field-label">模拟买入日</span>
-        <input v-model="edit.buyDate" type="date">
+        <label class="field-label" for="watchlist-edit-buy-date">模拟买入日</label>
+        <input id="watchlist-edit-buy-date" v-model="edit.buyDate" type="date">
         <div class="buy-date-presets" v-if="buyDatePresets.length">
           <button
             v-for="d in buyDatePresets"
@@ -587,9 +591,9 @@ onMounted(() => { loadBoard() })
     </form>
   </dialog>
 
-  <dialog v-if="adminAuth.open" class="watchlist-dialog" open @close="cancelAdminAuthentication">
+  <dialog v-if="adminAuth.open" v-modal class="watchlist-dialog" aria-labelledby="watchlist-admin-title" @close="cancelAdminAuthentication">
     <form class="watchlist-dialog-form" @submit.prevent="submitAdminAuthentication">
-      <h3>管理员验证</h3>
+      <h3 id="watchlist-admin-title">管理员验证</h3>
       <p class="watchlist-subtitle">修改自选股、更新行情需要管理员身份。</p>
       <label class="watchlist-field">
         <span class="field-label">管理员密码 / Token</span>
@@ -605,3 +609,5 @@ onMounted(() => { loadBoard() })
     </form>
   </dialog>
 </template>
+
+<style src="../../../frontend/watchlist.css"></style>

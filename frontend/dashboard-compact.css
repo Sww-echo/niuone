@@ -5,7 +5,7 @@
     font-size:12px;
   }
 
-  html:not([data-theme="tongdaxin"]) :is(.feed,.indices-page,.industry-flow-page,.mainline-page) { gap:6px; }
+  html:not([data-theme="tongdaxin"]) :is(.feed,.indices-page,.industry-flow-page,.mainline-page,.technical-page) { gap:6px; }
   html:not([data-theme="tongdaxin"]) :is(.card,.sector-cloud) {
     border-radius:8px;
     padding:9px;
@@ -31,12 +31,16 @@
     .indices-part-title,
     .industry-flow-heading h2,
     .dragon-tiger-head h2,
+    .technical-heading h2,
+    .watchlist-title-block h2,
     .rating-table-title
   ) { font-size:14px; line-height:1.25; }
   html:not([data-theme="tongdaxin"]) :is(
     .mainline-heading p,
     .industry-flow-heading p,
     .dragon-tiger-sub,
+    .technical-heading p,
+    .watchlist-subtitle,
     .rating-table-title small
   ) { margin-top:2px; font-size:10px; line-height:1.35; }
 
@@ -48,8 +52,21 @@
     .practice-rule-btn,
     .mainline-actions button,
     .market-day-btn,
+    .watchlist-actions button,
+    .watchlist-chip,
     .dragon-tiger-date-controls button
   ) { min-height:26px; padding:3px 7px; font-size:11px; }
+
+  /* Research pages use the same density as the main dashboard. */
+  html:not([data-theme="tongdaxin"]) .watchlist-panel { gap:8px; }
+  html:not([data-theme="tongdaxin"]) .watchlist-metric { gap:3px; padding:7px 8px; }
+  html:not([data-theme="tongdaxin"]) .watchlist-metric strong { font-size:14px; }
+  html:not([data-theme="tongdaxin"]) .watchlist-control-panel { padding:8px; }
+  html:not([data-theme="tongdaxin"]) .watchlist-filter-grid :is(input,select) { min-height:28px; padding:4px 7px; font-size:11px; }
+  html:not([data-theme="tongdaxin"]) .watchlist-table :is(th,td) { padding:6px 8px; }
+  html:not([data-theme="tongdaxin"]) .technical-toolbar { margin-top:8px; }
+  html:not([data-theme="tongdaxin"]) .technical-toolbar :is(input,.technical-primary-btn,.technical-scan-btn) { min-height:28px; padding:4px 8px; font-size:11px; }
+  html:not([data-theme="tongdaxin"]) :is(.technical-mode-tabs,.technical-period-options) button { min-height:22px; padding:3px 8px; font-size:11px; }
 
   /* Simulated trading */
   html:not([data-theme="tongdaxin"]) .practice-account-head { gap:7px; }

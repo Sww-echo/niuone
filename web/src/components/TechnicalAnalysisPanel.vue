@@ -181,7 +181,6 @@ function toggleScanRow(index) {
     <section class="technical-hero card">
       <div class="technical-heading">
         <div>
-          <span class="technical-eyebrow">MULTI-SYSTEM RESEARCH</span>
           <h2>个股技术分析</h2>
           <p>六维结合趋势、量价、形态、突破、CAN SLIM 与缠论结构，仅供研究参考。</p>
         </div>
@@ -198,8 +197,10 @@ function toggleScanRow(index) {
         </label>
         <fieldset class="technical-period-control">
           <legend>分析周期</legend>
-          <button type="button" :class="{ active: period === 'day' }" :aria-pressed="period === 'day'" @click="period = 'day'">日线</button>
-          <button type="button" :class="{ active: period === 'week' }" :aria-pressed="period === 'week'" @click="period = 'week'">周线</button>
+          <div class="technical-period-options">
+            <button type="button" :class="{ active: period === 'day' }" :aria-pressed="period === 'day'" @click="period = 'day'">日线</button>
+            <button type="button" :class="{ active: period === 'week' }" :aria-pressed="period === 'week'" @click="period = 'week'">周线</button>
+          </div>
         </fieldset>
         <button class="technical-primary-btn" type="submit" :disabled="analysisState.loading">
           <span v-if="analysisState.loading" class="technical-spinner" aria-hidden="true"></span>
